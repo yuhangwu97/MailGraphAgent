@@ -1,0 +1,41 @@
+# Core
+openai>=1.50.0
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Mail
+mail-parser>=3.15.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Attachment parsing (fallback)
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+
+# Graph (viz only — graph storage handled by RAGFlow GraphRAG)
+pyvis>=0.3.0
+
+# Web
+streamlit>=1.30.0
+
+# HTTP retry
+tenacity>=8.0.0
+
+# CLI
+typer>=0.9.0
+rich>=13.0.0
+
+# Data processing
+pandas>=2.0.0
+plotly>=5.17.0
+networkx>=3.2.0
+
+# Utils
+python-dateutil>=2.8.0
+
+# Dev
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+redis>=5.0

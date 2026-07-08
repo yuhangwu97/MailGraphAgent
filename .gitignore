@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Data & runtime
+data/
+mailgraph.log
+*.db
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+data/neo4j/
+data/es/
+data/mysql/
+data/redis/
+data/minio/
+data/ragflow/
+data/logs/
