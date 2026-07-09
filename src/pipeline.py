@@ -114,8 +114,12 @@ class Pipeline:
 
             cleaned = cleaner.clean(parsed.body_text, parsed.body_html)
 
-            cache.mark_processing(parsed.message_id, uid, folder,
-                                  parsed.subject, parsed.from_addr, parsed.date)
+            cache.mark_processing(
+                parsed.message_id, uid, folder,
+                parsed.subject, parsed.from_addr, parsed.date,
+                from_name=parsed.from_name,
+                attachment_count=len(parsed.attachments or []),
+            )
 
             if self.cfg.enable_noise_filter and \
                     cleaner.is_noise_email(parsed.subject, parsed.from_addr, cleaned):
@@ -183,6 +187,8 @@ class Pipeline:
                     doc_id = rf.upload_email(mail)
                     if not doc_id:
                         stats["failed"] += 1
+                        if mid:
+                            cache.mark_ingest_failed(mid, "RAGFlow 邮件正文上传失败")
                         log(f"  [{i+1}] ✗ {subj}")
                         continue
                     doc_ids.append(doc_id)
@@ -210,6 +216,8 @@ class Pipeline:
                     log(f"  [{i+1}] ✓ {subj} → {doc_id}")
                 except Exception as e:
                     stats["failed"] += 1
+                    if mid:
+                        cache.mark_ingest_failed(mid, str(e))
                     logger.error(f"  [{i+1}] ✗ {subj}: {e}")
 
             # 3) 触发解析（向量化 + GraphRAG 实体提取同步完成）

@@ -21,6 +21,11 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _safe_doc_token(s: str) -> str:
+    s = re.sub(r"[^0-9A-Za-z一-鿿]+", "_", (s or "").strip("<>"))
+    return s.strip("_")[:40]
+
+
 # ═══════════════════════════════════════════════════════════════
 # 查询计划
 # ═══════════════════════════════════════════════════════════════
@@ -242,8 +247,8 @@ QUERY_PLAN_SCHEMA = {
                     "topic": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                 },
             },
-            "limit": {"type": "integer", "minimum": 0, "maximum": 100},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "limit": {"type": "integer"},
+            "confidence": {"type": "number"},
             "clarifying_question": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "reason": {"type": "string"},
         },
@@ -277,6 +282,7 @@ class QueryEngine:
         self.rf = ragflow_client
         self._account_id = account_id
         self._cache = None
+        self._query_graph = None
 
     # ═══════════════════════════════════════════
     # 辅助
@@ -323,6 +329,25 @@ class QueryEngine:
             response_format={"type": "json_schema", "json_schema": schema},
         )
         return resp.choices[0].message.content or ""
+
+    def _context_prompt(self, context: dict | None) -> str:
+        if not context:
+            return ""
+        parts = []
+        memory = context.get("memory")
+        if memory:
+            parts.append(f"Agent memory:\n{str(memory)[:1200]}")
+        history = context.get("history") or []
+        if history:
+            lines = []
+            for m in history[-6:]:
+                role = m.get("role", "")
+                content = (m.get("content") or "")[:400]
+                if role and content:
+                    lines.append(f"{role}: {content}")
+            if lines:
+                parts.append("Recent chat:\n" + "\n".join(lines))
+        return "\n\n".join(parts)
 
     def _parse_json(self, raw: str) -> dict:
         text = raw.strip()
@@ -371,19 +396,24 @@ class QueryEngine:
             return "content"
         return None
 
-    def _build_query_plan(self, question: str) -> QueryPlan:
+    def _build_query_plan(self, question: str, context: dict | None = None) -> QueryPlan:
         now = datetime.now()
         weekday = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
         system = QUERY_PLAN_SYSTEM_PROMPT.format(
             current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
             weekday=weekday,
         )
+        context_text = self._context_prompt(context)
+        prompt = question if not context_text else (
+            f"{context_text}\n\n当前用户问题：{question}\n"
+            "只根据当前用户问题规划查询；历史和 memory 仅用于补全省略指代。"
+        )
         try:
             raw = self._call_llm_json_schema(
-                question, system=system, schema=QUERY_PLAN_SCHEMA, max_tokens=600)
+                prompt, system=system, schema=QUERY_PLAN_SCHEMA, max_tokens=600)
         except Exception as e:
             logger.warning("结构化查询规划失败，降级普通 JSON: %s", e)
-            raw = self._call_llm(question, max_tokens=600, system=system)
+            raw = self._call_llm(prompt, max_tokens=600, system=system)
         parsed = self._parse_json(raw)
 
         try:
@@ -461,7 +491,8 @@ class QueryEngine:
             return None, None
 
     def _execute_stat_query(self, question: str, plan: QueryPlan,
-                            start_time: float, hybrid: bool = False) -> dict:
+                            start_time: float, hybrid: bool = False,
+                            context: dict | None = None) -> dict:
         """执行统计查询：槽位 → MailCache.query_stats → LLM 格式化。"""
         plan = self._sanitize_plan(plan)
         tr = plan.time_range
@@ -498,7 +529,7 @@ class QueryEngine:
             result = self._filter_by_sender(result, plan.filters.sender)
 
         # 按聚合类型生成回答
-        answer = self._format_stat_answer(question, result, tr, plan)
+        answer = self._format_stat_answer(question, result, tr, plan, context)
 
         total_dur = int((time.time() - start_time) * 1000)
         trace_name = "混合查询过滤（QueryPlan → MailCache）" if hybrid else "统计查询（QueryPlan → MailCache）"
@@ -510,14 +541,15 @@ class QueryEngine:
             "duration_ms": total_dur,
         }]
 
+        rows = self._stat_rows(result, plan)
         return {
             "question": question,
             "answer": answer,
             "entities": [], "relationships": [], "chunks": [],
             "trace": trace,
-            "rows": self._stat_rows(result, plan),
-            "columns": list(self._stat_rows(result, plan)[0].keys()) if self._stat_rows(result, plan) else [],
-            "total_rows": len(self._stat_rows(result, plan)),
+            "rows": rows,
+            "columns": list(rows[0].keys()) if rows else [],
+            "total_rows": len(rows),
             "total_duration_ms": total_dur,
             "error": "",
             "matched_ids": result.get("matched_ids", []),
@@ -600,7 +632,7 @@ class QueryEngine:
 
     def _format_stat_answer(self, question: str, result: dict,
                             time_range: TimeRangePlan | None,
-                            plan: QueryPlan) -> str:
+                            plan: QueryPlan, context: dict | None = None) -> str:
         """用 LLM 将统计结果格式化为自然语言。"""
         total = result["total"]
         by_status = result.get("by_status", {})
@@ -641,6 +673,8 @@ class QueryEngine:
         }
 
         prompt = f"""根据统计数据回答用户问题（中文，简洁，<200字）。
+
+{self._context_prompt(context)}
 
 用户问题：{question}
 
@@ -726,22 +760,180 @@ class QueryEngine:
             "total_rows": 0, "total_duration_ms": total_dur, "error": error,
         }
 
+    def _clarify_response(self, question: str, plan: QueryPlan,
+                          start_time: float) -> dict:
+        total_dur = int((time.time() - start_time) * 1000)
+        answer = plan.clarifying_question or "你想查邮件数量/列表，还是邮件内容？"
+        return {
+            "question": question,
+            "answer": answer,
+            "entities": [], "relationships": [], "chunks": [],
+            "trace": [{
+                "name": "查询需要澄清", "icon": "❔",
+                "content": self._trace_summary(plan, {"total": 0}),
+                "detail": plan.reason,
+                "status": "warning", "color": "#F59E0B",
+                "duration_ms": total_dur,
+            }],
+            "rows": [], "columns": [],
+            "total_rows": 0,
+            "total_duration_ms": total_dur,
+            "error": "",
+            "query_plan": plan.model_dump(),
+        }
+
+    def _execute_hybrid_query(self, question: str, plan: QueryPlan,
+                              start_time: float,
+                              context: dict | None = None) -> dict:
+        """Filter by structured metadata, then retrieve topical chunks."""
+        stat_result = self._execute_stat_query(
+            question, plan, start_time, hybrid=True, context=context)
+        if stat_result.get("error"):
+            return stat_result
+
+        topic = plan.filters.topic or question
+        items = stat_result.get("rows", [])
+        matched_ids = stat_result.get("matched_ids", [])
+        chunks = self._retrieve_hybrid_chunks(topic, matched_ids)
+        answer = self._format_hybrid_answer(question, topic, stat_result, chunks, context)
+
+        total_dur = int((time.time() - start_time) * 1000)
+        trace = list(stat_result.get("trace", []))
+        trace.append({
+            "name": "混合查询检索（候选邮件 → RAGFlow chunks）",
+            "icon": "✨",
+            "content": f"候选 {len(matched_ids)} 封，检索命中 {len(chunks)} 段，主题：{topic}",
+            "status": "ok" if chunks else "warning",
+            "color": "#8B5CF6",
+            "duration_ms": total_dur,
+        })
+
+        stat_result.update({
+            "answer": answer,
+            "trace": trace,
+            "chunks": chunks,
+            "total_duration_ms": total_dur,
+            "rows": items,
+            "columns": list(items[0].keys()) if items else [],
+        })
+        return stat_result
+
+    def _retrieve_hybrid_chunks(self, topic: str, matched_ids: list[str]) -> list[dict]:
+        if not self.rf or not matched_ids:
+            return []
+
+        chunks = self.rf.retrieve_chunks(topic, top_k=30)
+        if not chunks:
+            return []
+
+        wanted = set()
+        for mid in matched_ids:
+            wanted.add(mid)
+            wanted.add(_safe_doc_token(mid))
+
+        filtered = []
+        for c in chunks:
+            haystack = " ".join([
+                str(c.get("doc_id", "")),
+                str(c.get("document_id", "")),
+                str(c.get("doc_name", "")),
+                str(c.get("content", ""))[:500],
+            ])
+            if any(token and token in haystack for token in wanted):
+                filtered.append(c)
+
+        # If RAGFlow did not expose enough document identity, keep top chunks but
+        # the answer prompt will state the weaker evidence boundary.
+        return filtered or chunks[:10]
+
+    def _format_hybrid_answer(self, question: str, topic: str,
+                              stat_result: dict, chunks: list[dict],
+                              context: dict | None = None) -> str:
+        rows = stat_result.get("rows", [])[:10]
+        if not rows:
+            return f"没有找到同时满足过滤条件并与“{topic}”相关的邮件。"
+
+        preview = "\n".join(
+            f"- {r.get('日期','')} | {r.get('主题','')} | {r.get('发件人','')}"
+            for r in rows
+        )
+        evidence = "\n---\n".join(
+            (c.get("content", "") or "")[:600] for c in chunks[:5]
+        )
+        prompt = f"""根据已过滤出的邮件候选回答用户问题（中文，简洁，<220字）。
+
+{self._context_prompt(context)}
+
+用户问题：{question}
+主题：{topic}
+候选邮件总数：{len(stat_result.get('matched_ids', []))}
+候选邮件预览：
+{preview}
+
+RAGFlow chunk 证据：
+{evidence or "无"}
+
+如果 chunk 证据为空或无法确认来自候选邮件，请明确说这是基于候选邮件元数据的判断；不要编造正文细节。"""
+        answer = self._call_llm(prompt, max_tokens=420)
+        if answer and answer != "{}":
+            return answer
+        suffix = "，并检索到相关正文片段。" if chunks else "，但没有检索到可引用的正文片段。"
+        return f"找到 {len(stat_result.get('matched_ids', []))} 封候选邮件与“{topic}”相关{suffix}"
+
     # ═══════════════════════════════════════════
     # 主入口：路由分发
     # ═══════════════════════════════════════════
 
-    def query(self, question: str) -> dict:
-        """主查询入口：LLM 意图分类 → 路由分发。"""
+    def query(self, question: str, context: dict | None = None) -> dict:
+        """主查询入口：查询规划 → 校验 → 路由分发。"""
+        graph_result = self._try_query_graph(question, context)
+        if graph_result is not None:
+            return graph_result
+
         start_time = time.time()
 
-        intent = self._classify_intent(question)
+        plan = self._build_query_plan(question, context)
 
-        if intent.get("intent") == "stat_query":
-            return self._execute_stat_query(question, intent, start_time)
+        if plan.route == "clarify":
+            return self._clarify_response(question, plan, start_time)
 
+        if plan.route == "stat":
+            return self._execute_stat_query(question, plan, start_time, context=context)
+
+        if plan.route == "hybrid":
+            return self._execute_hybrid_query(question, plan, start_time, context=context)
+
+        return self._execute_content_query(question, plan, start_time, context=context)
+
+    def _try_query_graph(self, question: str, context: dict | None = None) -> dict | None:
+        try:
+            from src.ai.query_graph import build_query_graph
+        except Exception:
+            return None
+        try:
+            if self._query_graph is None:
+                self._query_graph = build_query_graph()
+            state = self._query_graph.invoke({
+                "engine": self,
+                "question": question,
+                "context": context or {},
+                "start_time": time.time(),
+            })
+            return state["result"]
+        except Exception as e:
+            logger.warning("LangGraph 编排失败，回落顺序执行: %s", e)
+            return None
+
+    def _execute_content_query(self, question: str, plan: QueryPlan,
+                               start_time: float,
+                               context: dict | None = None) -> dict:
         # content_query → RAGFlow
+        enriched_question = question
+        context_text = self._context_prompt(context)
+        if context_text:
+            enriched_question = f"{context_text}\n\n当前用户问题：{question}"
         answer, trace, entities, relationships, chunks = \
-            self._native_query(question)
+            self._native_query(enriched_question)
         total_dur = int((time.time() - start_time) * 1000)
         rows = self._to_rows(entities, relationships)
         return {
@@ -756,6 +948,7 @@ class QueryEngine:
             "total_rows": len(rows),
             "total_duration_ms": total_dur,
             "error": "",
+            "query_plan": plan.model_dump(),
         }
 
     # ═══════════════════════════════════════════

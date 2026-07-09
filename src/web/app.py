@@ -11,6 +11,7 @@ import streamlit as st
 import pandas as pd
 
 from config.settings import get_settings
+from src.storage.conversation_store import ConversationStore
 from src.storage.redis_cache import MailCache
 from src.web.graph_viz import build_pyvis_network_from_ragflow, NODE_COLORS
 
@@ -324,6 +325,32 @@ ragflow = init_ragflow(active_account_id) if active_account_id else None
 cache = init_cache(active_account_id) if active_account_id else None
 query_engine = init_query_engine(ragflow, active_account_id) if ragflow else None
 
+
+def _conversation_store():
+    if not active_account_id:
+        return None
+    try:
+        return ConversationStore(active_account_id)
+    except Exception:
+        return None
+
+
+def _ensure_active_chat_session():
+    store = _conversation_store()
+    if store is None:
+        return None, [], None
+    try:
+        session = store.ensure_session(st.session_state.get("active_chat_session"))
+        st.session_state["active_chat_session"] = session["id"]
+        sessions = store.list_sessions()
+        memory = store.get_memory()
+        return session, sessions, memory
+    finally:
+        store.close()
+
+
+active_chat_session, chat_sessions, agent_memory = _ensure_active_chat_session()
+
 # ═══════════════════════════════════════════════════════════════
 # 侧边栏 — 深色主题
 # ═══════════════════════════════════════════════════════════════
@@ -574,37 +601,71 @@ def _render_reasoning(trace: list):
                 st.caption(s["detail"])
 
 
-def _render_results(result: dict):
+def _result_sections(result: dict) -> list[tuple[str, str]]:
+    sections = []
+    if result.get("entities") or result.get("relationships"):
+        sections.append(("graph", "🔗 关系图谱"))
+    if result.get("rows"):
+        sections.append(("table", "📋 数据表"))
+    if result.get("chunks"):
+        sections.append(("sources", "📎 来源"))
+    return sections
+
+
+def _render_graph_section(result: dict, height: int = 440):
+    try:
+        html = build_result_subgraph(result)
+        encoded = __import__("base64").b64encode(html.encode()).decode()
+        st.iframe(src=f"data:text/html;charset=utf-8;base64,{encoded}", height=height)
+    except Exception as e:
+        st.caption(f"图谱渲染失败: {e}")
+
+
+def _render_table_section(rows: list[dict], height: int = 420):
+    st.dataframe(pd.DataFrame(rows), width="stretch", height=height, hide_index=True)
+
+
+def _render_sources_section(chunks: list[dict], limit: int = 12):
+    with st.container(height=460):
+        for c in chunks[:limit]:
+            doc = c.get("doc_name", "")
+            score = c.get("score")
+            label = f"📄 {doc or '邮件'}"
+            if score:
+                label += f" · {float(score):.2f}" if isinstance(score, (int, float)) else f" · {score}"
+            st.markdown(f'<span class="src-chip">{label}</span>', unsafe_allow_html=True)
+            st.caption((c.get("content", "") or "")[:900])
+
+
+@st.dialog("图谱与数据")
+def _results_modal(result: dict, section: str):
+    if section == "graph":
+        _render_graph_section(result, height=620)
+    elif section == "table":
+        _render_table_section(result.get("rows") or [], height=620)
+    elif section == "sources":
+        _render_sources_section(result.get("chunks") or [], limit=30)
+
+
+def _render_results(result: dict, key_prefix: str | None = None):
     """结果的图谱 / 数据表 / 来源，收进折叠区，保持对话清爽"""
-    entities = result.get("entities") or []
-    rows = result.get("rows") or []
-    chunks = result.get("chunks") or []
-    if not (entities or rows or chunks):
+    sections = _result_sections(result)
+    if not sections:
         return
 
     with st.expander("📊 图谱与数据", expanded=False):
-        tabs = st.tabs(["🔗 关系图谱", "📋 数据表", "📎 来源"])
-        with tabs[0]:
-            if entities:
-                try:
-                    st.iframe(src=f"data:text/html;charset=utf-8;base64,{__import__('base64').b64encode(build_result_subgraph(result).encode()).decode()}", height=440)
-                except Exception as e:
-                    st.caption(f"图谱渲染失败: {e}")
-            else:
-                st.caption("本次未命中图谱实体")
-        with tabs[1]:
-            if rows:
-                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-            else:
-                st.caption("无结构化结果")
-        with tabs[2]:
-            if chunks:
-                for c in chunks[:6]:
-                    doc = c.get("doc_name", "")
-                    st.markdown(f'<span class="src-chip">📄 {doc or "邮件"}</span>', unsafe_allow_html=True)
-                    st.caption((c.get("content", "") or "")[:280])
-            else:
-                st.caption("无引用来源")
+        tabs = st.tabs([label for _, label in sections])
+        result_key = key_prefix or str(abs(hash(json.dumps(result, ensure_ascii=False, default=str))))
+        for tab, (section, _) in zip(tabs, sections):
+            with tab:
+                if st.button("展开查看", key=f"open_{section}_{result_key}"):
+                    _results_modal(result, section)
+                if section == "graph":
+                    _render_graph_section(result, height=440)
+                elif section == "table":
+                    _render_table_section(result.get("rows") or [], height=360)
+                elif section == "sources":
+                    _render_sources_section(result.get("chunks") or [], limit=8)
 
 
 def _render_history_message(msg: dict):
@@ -617,30 +678,93 @@ def _render_history_message(msg: dict):
             result = msg.get("result") or {}
             _render_reasoning(result.get("trace"))
             st.markdown(msg["content"])
-            _render_results(result)
+            _render_results(result, key_prefix=msg.get("id"))
+
+
+def _render_chat_session_toolbar(memory_prompt: str = ""):
+    if not active_account_id:
+        return
+
+    sessions = chat_sessions or []
+    left, new_col, del_col = st.columns([5, 1, 1])
+    with left:
+        if sessions:
+            session_ids = [s["id"] for s in sessions]
+            current_sid = st.session_state.get("active_chat_session")
+            idx = session_ids.index(current_sid) if current_sid in session_ids else 0
+            chosen_sid = st.selectbox(
+                "对话会话",
+                session_ids,
+                index=idx,
+                format_func=lambda sid: next(
+                    (s["title"] for s in sessions if s["id"] == sid), sid),
+                key="chat_session_select_main",
+            )
+            if chosen_sid != current_sid:
+                st.session_state["active_chat_session"] = chosen_sid
+                st.rerun()
+        else:
+            st.caption("暂无对话会话")
+
+    with new_col:
+        st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+        if st.button("＋ 新建", key="main_new_chat", width="stretch"):
+            store = _conversation_store()
+            if store:
+                try:
+                    session = store.create_session()
+                    st.session_state["active_chat_session"] = session["id"]
+                finally:
+                    store.close()
+            st.rerun()
+
+    with del_col:
+        st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+        if st.button("删除", key="main_delete_chat", width="stretch", disabled=not sessions):
+            current_sid = st.session_state.get("active_chat_session")
+            store = _conversation_store()
+            if store and current_sid:
+                try:
+                    store.delete_session(current_sid)
+                    next_session = store.ensure_session()
+                    st.session_state["active_chat_session"] = next_session["id"]
+                finally:
+                    store.close()
+            st.rerun()
+
+    if memory_prompt:
+        with st.expander("Agent memory", expanded=False):
+            st.caption(memory_prompt[:1200])
 
 
 def render_chat_page():
     st.markdown(CHAT_CSS, unsafe_allow_html=True)
 
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
+    store = _conversation_store()
+    session = active_chat_session
+    messages = []
+    memory_prompt = ""
+    if store:
+        try:
+            ensured = store.ensure_session(st.session_state.get("active_chat_session"))
+            session = ensured["id"]
+            st.session_state["active_chat_session"] = session
+            messages = store.list_messages(session)
+            memory_prompt = store.get_memory().to_prompt()
+        finally:
+            store.close()
+    elif "chat" in st.session_state:
+        messages = st.session_state.chat
+
+    _render_chat_session_toolbar(memory_prompt)
 
     # 底部输入（始终固定在底部，先取值以便决定是否显示空态）
     prompt = st.chat_input("给 MailGraph 发消息…问客户、项目、人物关系")
     if not prompt and st.session_state.get("pending_prompt"):
         prompt = st.session_state.pop("pending_prompt")
 
-    # 顶部工具条：新对话
-    if st.session_state.chat:
-        _, tcol = st.columns([6, 1])
-        with tcol:
-            if st.button("＋ 新对话", key="new_chat", width="stretch"):
-                st.session_state.chat = []
-                st.rerun()
-
     # 空态：欢迎 + 建议 + 概览（仅当无历史且本轮无新问题）
-    if not st.session_state.chat and not prompt:
+    if not messages and not prompt:
         st.markdown("""
         <div class="chat-hero">
             <div class="ch-logo">M</div>
@@ -657,11 +781,19 @@ def render_chat_page():
                     st.rerun()
 
     # 历史消息
-    for msg in st.session_state.chat:
+    for msg in messages:
         _render_history_message(msg)
 
     if prompt:
-        st.session_state.chat.append({"role": "user", "content": prompt})
+        if session:
+            store = _conversation_store()
+            if store:
+                try:
+                    store.add_message(session, "user", prompt)
+                finally:
+                    store.close()
+        else:
+            st.session_state.setdefault("chat", []).append({"role": "user", "content": prompt})
         with st.chat_message("user", avatar=AVATAR_USER):
             st.markdown(prompt)
 
@@ -669,15 +801,40 @@ def render_chat_page():
             if query_engine is None:
                 answer = "⚠️ RAGFlow 未连接，无法查询。请先在「系统设置」确认服务状态，并在「邮件工作台」导入邮件。"
                 st.markdown(answer)
-                st.session_state.chat.append({"role": "assistant", "content": answer, "result": {}})
+                if session:
+                    store = _conversation_store()
+                    if store:
+                        try:
+                            store.add_message(session, "assistant", answer, {})
+                        finally:
+                            store.close()
+                else:
+                    st.session_state.setdefault("chat", []).append({"role": "assistant", "content": answer, "result": {}})
             else:
                 with st.spinner("检索图谱与语义…"):
-                    result = query_engine.query(prompt)
+                    store = _conversation_store()
+                    history = []
+                    if store and session:
+                        try:
+                            history = store.recent_context(session, limit=8)
+                        finally:
+                            store.close()
+                    context = {"memory": memory_prompt, "history": history}
+                    result = query_engine.query(prompt, context=context)
                 _render_reasoning(result.get("trace"))
                 answer = result.get("answer") or "没找到相关信息。可以换个问法，或先在「邮件工作台」导入更多邮件。"
                 st.write_stream(_stream_text(answer))
-                _render_results(result)
-                st.session_state.chat.append({"role": "assistant", "content": answer, "result": result})
+                _render_results(result, key_prefix=f"live_{time.time_ns()}")
+                if session:
+                    store = _conversation_store()
+                    if store:
+                        try:
+                            store.add_message(session, "assistant", answer, result)
+                            store.update_memory_from_turn(prompt, answer)
+                        finally:
+                            store.close()
+                else:
+                    st.session_state.setdefault("chat", []).append({"role": "assistant", "content": answer, "result": result})
 
 
 if page == "query":
