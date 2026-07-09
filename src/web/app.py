@@ -3,7 +3,7 @@ MailGraphAgent — 企业邮件关系分析平台 v3.0
 ============================================
 现代 SaaS 风格 Streamlit 前端。RAGFlow GraphRAG 为核心引擎。
 """
-import sys, json, time, re, logging, subprocess
+import sys, json, time, re, logging, subprocess, html as _html
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -16,6 +16,12 @@ from src.storage.redis_cache import MailCache
 from src.web.graph_viz import build_pyvis_network_from_ragflow, NODE_COLORS
 
 logger = logging.getLogger(__name__)
+
+# HTML 转义辅助：防止数据中的 < > & 等字符破坏 HTML 布局
+def h(s):
+    if s is None:
+        return ""
+    return _html.escape(str(s))
 
 st.set_page_config(
     page_title="MailGraph — 企业邮件关系分析",
@@ -630,9 +636,9 @@ def _render_sources_section(chunks: list[dict], limit: int = 12):
         for c in chunks[:limit]:
             doc = c.get("doc_name", "")
             score = c.get("score")
-            label = f"📄 {doc or '邮件'}"
+            label = f"📄 {h(doc or '邮件')}"
             if score:
-                label += f" · {float(score):.2f}" if isinstance(score, (int, float)) else f" · {score}"
+                label += f" · {float(score):.2f}" if isinstance(score, (int, float)) else f" · {h(score)}"
             st.markdown(f'<span class="src-chip">{label}</span>', unsafe_allow_html=True)
             st.caption((c.get("content", "") or "")[:900])
 
@@ -907,14 +913,14 @@ elif page == "dashboard":
             for p in proj_data:
                 people_str = "、".join(q.get("name", "") for q in p["people"][:5]) or "暂无关联人员"
                 comp_str = "、".join(q.get("name", "") for q in p["companies"][:3])
-                comp_line = f'<div class="pc-meta-item">🏢 {comp_str[:40]}</div>' if comp_str else ""
+                comp_line = f'<div class="pc-meta-item">🏢 {h(comp_str[:40])}</div>' if comp_str else ""
                 st.markdown(f"""
                 <div class="project-card">
                     <div class="pc-accent" style="background:#1F6F5C;"></div>
-                    <div class="pc-name">{p['name']}</div>
-                    <div class="pc-desc">{p['description'] or '（图谱暂无描述）'}</div>
+                    <div class="pc-name">{h(p['name'])}</div>
+                    <div class="pc-desc">{h(p.get('description') or '（图谱暂无描述）')}</div>
                     <div class="pc-meta">
-                        <div class="pc-meta-item">👥 {people_str[:40]}{'…' if len(people_str) > 40 else ''}</div>
+                        <div class="pc-meta-item">👥 {h(people_str[:40])}{'…' if len(people_str) > 40 else ''}</div>
                         {comp_line}
                     </div>
                 </div>""", unsafe_allow_html=True)
@@ -1036,7 +1042,7 @@ elif page == "workbench":
             logs = []
 
             def flog(msg):
-                logs.append(msg)
+                logs.append(h(msg))
                 log_box.markdown(
                     '<div style="font-family:monospace;font-size:0.75rem;max-height:300px;overflow-y:auto;'
                     'background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'
@@ -1061,7 +1067,7 @@ elif page == "workbench":
             logs = []
 
             def ilog(msg):
-                logs.append(msg)
+                logs.append(h(msg))
                 log_container.markdown(
                     '<div style="font-family:monospace;font-size:0.75rem;max-height:400px;overflow-y:auto;'
                     'background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'
@@ -1128,7 +1134,7 @@ elif page == "workbench":
                 rlogs = []
 
                 def rlog(msg):
-                    rlogs.append(msg)
+                    rlogs.append(h(msg))
                     rp_box.markdown(
                         '<div style="font-family:monospace;font-size:0.75rem;max-height:400px;overflow-y:auto;'
                         'background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'

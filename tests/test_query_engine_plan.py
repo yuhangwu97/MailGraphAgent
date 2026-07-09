@@ -24,13 +24,34 @@ class FakeQueryEngine(QueryEngine):
 
 
 class FakeCache:
+    def __init__(self):
+        self.doc_map = {"doc-m1": "m1", "doc-m2": "m2", "doc-m3": "m3"}
+
+    def message_ids_for_docs(self, doc_ids):
+        return {self.doc_map[d] for d in doc_ids if d in self.doc_map}
+
     def query_stats(self, **kwargs):
         self.last_kwargs = kwargs
+        allowed = set(kwargs.get("message_ids") or ["m1", "m2"])
         return {
-            "total": 2,
-            "by_status": {"done": 1, "failed": 1, "skipped": 0, "processing": 0, "pending": 0},
+            "total": len(allowed & {"m1", "m2"}),
+            "by_status": {
+                "done": 1 if "m1" in allowed else 0,
+                "failed": 1 if "m2" in allowed else 0,
+                "skipped": 0, "processing": 0, "pending": 0,
+            },
             "by_sender": [],
             "items": [
+                {
+                    "message_id": "m1",
+                    "subject": "合同预算",
+                    "from_addr": "alice@example.com",
+                    "from_name": "张三",
+                    "date": "2026-07-08T10:00:00",
+                    "status": "done",
+                    "has_attachment": True,
+                },
+            ] if allowed == {"m1"} else [
                 {
                     "message_id": "m1",
                     "subject": "合同预算",
@@ -50,7 +71,7 @@ class FakeCache:
                     "has_attachment": False,
                 },
             ],
-            "matched_ids": ["m1", "m2"],
+            "matched_ids": [mid for mid in ["m1", "m2"] if mid in allowed],
         }
 
 
@@ -135,16 +156,37 @@ def test_query_uses_langgraph_when_available_and_keeps_contract():
 class FakeRAGFlow:
     def retrieve_chunks(self, query: str, top_k: int = 10):
         return [
-            {"doc_name": "mail_m1.md", "content": "合同预算正文", "score": 0.9},
-            {"doc_name": "mail_other.md", "content": "无关正文", "score": 0.8},
+            {"doc_id": "doc-m1", "doc_name": "mail_m1.md", "content": "合同预算正文", "score": 0.9},
+            {"doc_id": "doc-other", "doc_name": "mail_other.md", "content": "无关正文", "score": 0.8},
         ]
 
 
 def test_hybrid_retrieval_filters_chunks_by_matched_message_id():
     engine = FakeQueryEngine()
     engine.rf = FakeRAGFlow()
+    engine._cache = FakeCache()
 
     chunks = engine._retrieve_hybrid_chunks("合同", ["m1"])
 
     assert len(chunks) == 1
     assert chunks[0]["doc_name"] == "mail_m1.md"
+
+
+def test_hybrid_count_uses_topic_message_id_intersection():
+    engine = FakeQueryEngine()
+    engine.rf = FakeRAGFlow()
+    cache = FakeCache()
+    engine._cache = cache
+    plan = QueryPlan(
+        route="hybrid",
+        aggregation="count",
+        filters=QueryFilters(topic="合同"),
+        confidence=0.9,
+        reason="hybrid count",
+    )
+
+    result = engine._execute_hybrid_query("合同邮件数量", plan, 0)
+
+    assert cache.last_kwargs["message_ids"] == {"m1"}
+    assert result["matched_ids"] == ["m1"]
+    assert result["chunks"][0]["doc_name"] == "mail_m1.md"

@@ -312,8 +312,11 @@ class RAGFlowClient:
                     "content": c.get("content", c.get("content_with_weight", "")),
                     # 文档名字段在 retrieval 里是 document_keyword
                     "doc_name": c.get("document_keyword", c.get("doc_name", "")),
+                    "doc_id": c.get("doc_id", c.get("document_id", "")),
+                    "document_id": c.get("document_id", c.get("doc_id", "")),
                     "score": c.get("similarity", 0),
                     "positions": c.get("positions", []),
+                    "metadata": c.get("metadata", {}),
                 })
             logger.info("RAGFlow 检索: '%s' → %d 结果", query[:50], len(chunks))
             return chunks

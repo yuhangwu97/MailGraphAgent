@@ -14,6 +14,16 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _sender_matches(data: dict, sender: str) -> bool:
+    s_lower = (sender or "").lower().strip()
+    if not s_lower:
+        return True
+    return (
+        s_lower in (data.get("from_addr", "") or "").lower()
+        or s_lower in (data.get("from_name", "") or "").lower()
+    )
+
+
 class MailCache:
     """邮件处理进度缓存 (Redis 后端)"""
 
@@ -137,6 +147,7 @@ class MailCache:
                         subject: str, from_addr: str, date: str,
                         from_name: str = "", attachment_count: int = 0):
         key = self._k("mail", message_id)
+        old = self.get_mail_state(message_id)
         data = {
             "message_id": message_id,
             "uid": uid, "folder": folder,
@@ -145,8 +156,12 @@ class MailCache:
             "attachment_count": str(max(0, int(attachment_count or 0))),
             "status": "processing", "updated_at": str(time.time()),
         }
-        self.r.hset(key, mapping=data)
-        self._replace_indexes(message_id, data)
+        pipe = self.r.pipeline()
+        if old:
+            self._remove_indexes_for_state(pipe, message_id, old)
+        pipe.hset(key, mapping=data)
+        self._index_state(pipe, message_id, data)
+        pipe.execute()
 
     def mark_done(self, message_id: str):
         key = self._k("mail", message_id)

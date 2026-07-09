@@ -519,13 +519,14 @@ class QueryEngine:
                 group_by=group_by,
                 has_attachment=plan.filters.has_attachment,
                 limit=plan.limit,
+                sender=plan.filters.sender,
             )
         except Exception as e:
             logger.error("统计查询失败: %s", e)
             return self._error_response(question, start_time, str(e))
 
         # sender 精确过滤（LLM 给出发件人地址或姓名）
-        if plan.filters.sender and group_by is None:
+        if plan.filters.sender and group_by is None and not result.get("_sender_filtered"):
             result = self._filter_by_sender(result, plan.filters.sender)
 
         # 按聚合类型生成回答
@@ -785,25 +786,43 @@ class QueryEngine:
     def _execute_hybrid_query(self, question: str, plan: QueryPlan,
                               start_time: float,
                               context: dict | None = None) -> dict:
-        """Filter by structured metadata, then retrieve topical chunks."""
-        stat_result = self._execute_stat_query(
-            question, plan, start_time, hybrid=True, context=context)
+        """Resolve topic evidence to message ids, then run metadata stats on the intersection."""
+        topic = plan.filters.topic or question
+        chunks, topic_ids = self._retrieve_topic_message_ids(topic)
+        if not topic_ids:
+            stat_result = self._execute_stat_query_with_message_ids(
+                question, plan, start_time, message_ids=set(),
+                hybrid=True, context=context)
+            stat_result["chunks"] = chunks
+            stat_result["answer"] = self._format_hybrid_answer(
+                question, topic, stat_result, chunks, context)
+            stat_result["trace"].append({
+                "name": "混合查询主题命中（RAGFlow chunks → message_id）",
+                "icon": "✨",
+                "content": f"主题：{topic}，未能归属到候选邮件",
+                "status": "warning", "color": "#F59E0B",
+                "duration_ms": int((time.time() - start_time) * 1000),
+            })
+            return stat_result
+
+        stat_result = self._execute_stat_query_with_message_ids(
+            question, plan, start_time, message_ids=topic_ids,
+            hybrid=True, context=context)
         if stat_result.get("error"):
             return stat_result
 
-        topic = plan.filters.topic or question
+        matched_ids = set(stat_result.get("matched_ids", []))
+        chunks = self._filter_chunks_by_message_ids(chunks, matched_ids)
         items = stat_result.get("rows", [])
-        matched_ids = stat_result.get("matched_ids", [])
-        chunks = self._retrieve_hybrid_chunks(topic, matched_ids)
         answer = self._format_hybrid_answer(question, topic, stat_result, chunks, context)
 
         total_dur = int((time.time() - start_time) * 1000)
         trace = list(stat_result.get("trace", []))
         trace.append({
-            "name": "混合查询检索（候选邮件 → RAGFlow chunks）",
+            "name": "混合查询主题命中（RAGFlow chunks → message_id）",
             "icon": "✨",
-            "content": f"候选 {len(matched_ids)} 封，检索命中 {len(chunks)} 段，主题：{topic}",
-            "status": "ok" if chunks else "warning",
+            "content": f"主题命中 {len(topic_ids)} 封，元数据交集 {len(matched_ids)} 封，证据 {len(chunks)} 段",
+            "status": "ok" if matched_ids else "warning",
             "color": "#8B5CF6",
             "duration_ms": total_dur,
         })
@@ -818,14 +837,94 @@ class QueryEngine:
         })
         return stat_result
 
-    def _retrieve_hybrid_chunks(self, topic: str, matched_ids: list[str]) -> list[dict]:
-        if not self.rf or not matched_ids:
-            return []
+    def _execute_stat_query_with_message_ids(self, question: str, plan: QueryPlan,
+                                             start_time: float, message_ids: set[str],
+                                             hybrid: bool = False,
+                                             context: dict | None = None) -> dict:
+        plan = self._sanitize_plan(plan)
+        tr = plan.time_range
+        start_dt, end_dt = self._parse_time_slot(tr)
+        cache = self._get_cache()
+        if cache is None:
+            return self._error_response(question, start_time, "Redis 不可用")
+
+        group_by = None
+        if plan.aggregation == "top_senders":
+            group_by = "sender"
+            if plan.limit == 0:
+                plan.limit = 5
+        elif plan.aggregation == "list" and plan.limit == 0:
+            plan.limit = 10
+
+        try:
+            result = cache.query_stats(
+                start_time=start_dt if start_dt else None,
+                end_time=end_dt if end_dt else None,
+                statuses=plan.filters.statuses or None,
+                group_by=group_by,
+                has_attachment=plan.filters.has_attachment,
+                limit=plan.limit,
+                message_ids=message_ids,
+                sender=plan.filters.sender,
+            )
+        except Exception as e:
+            logger.error("混合统计查询失败: %s", e)
+            return self._error_response(question, start_time, str(e))
+
+        answer = self._format_stat_answer(question, result, tr, plan, context)
+        total_dur = int((time.time() - start_time) * 1000)
+        trace = [{
+            "name": "混合查询过滤（topic message_id ∩ QueryPlan → MailCache）" if hybrid else "统计查询（QueryPlan → MailCache）",
+            "icon": "📊",
+            "content": self._trace_summary(plan, result),
+            "detail": f"匹配 {result['total']} 封",
+            "status": "ok", "color": "#10B981",
+            "duration_ms": total_dur,
+        }]
+        rows = self._stat_rows(result, plan)
+        return {
+            "question": question,
+            "answer": answer,
+            "entities": [], "relationships": [], "chunks": [],
+            "trace": trace,
+            "rows": rows,
+            "columns": list(rows[0].keys()) if rows else [],
+            "total_rows": len(rows),
+            "total_duration_ms": total_dur,
+            "error": "",
+            "matched_ids": result.get("matched_ids", []),
+            "query_plan": plan.model_dump(),
+        }
+
+    def _retrieve_topic_message_ids(self, topic: str) -> tuple[list[dict], set[str]]:
+        if not self.rf:
+            return [], set()
 
         chunks = self.rf.retrieve_chunks(topic, top_k=30)
         if not chunks:
-            return []
+            return [], set()
 
+        cache = self._get_cache()
+        doc_ids = set()
+        mids = set()
+        for chunk in chunks:
+            doc_id = self._chunk_doc_id(chunk)
+            if doc_id:
+                doc_ids.add(doc_id)
+            mid = self._chunk_message_id(chunk)
+            if mid:
+                mids.add(mid)
+        if cache is not None and doc_ids:
+            mids.update(cache.message_ids_for_docs(list(doc_ids)))
+        return chunks, mids
+
+    def _retrieve_hybrid_chunks(self, topic: str, matched_ids: list[str]) -> list[dict]:
+        chunks, _ = self._retrieve_topic_message_ids(topic)
+        return self._filter_chunks_by_message_ids(chunks, set(matched_ids))
+
+    def _filter_chunks_by_message_ids(self, chunks: list[dict], matched_ids: set[str]) -> list[dict]:
+        if not chunks or not matched_ids:
+            return []
         wanted = set()
         for mid in matched_ids:
             wanted.add(mid)
@@ -841,10 +940,20 @@ class QueryEngine:
             ])
             if any(token and token in haystack for token in wanted):
                 filtered.append(c)
+        return filtered
 
-        # If RAGFlow did not expose enough document identity, keep top chunks but
-        # the answer prompt will state the weaker evidence boundary.
-        return filtered or chunks[:10]
+    def _chunk_doc_id(self, chunk: dict) -> str:
+        for key in ("doc_id", "document_id", "document_id_id"):
+            value = chunk.get(key)
+            if value:
+                return str(value)
+        return ""
+
+    def _chunk_message_id(self, chunk: dict) -> str:
+        metadata = chunk.get("metadata") or {}
+        if isinstance(metadata, dict) and metadata.get("message_id"):
+            return str(metadata["message_id"])
+        return ""
 
     def _format_hybrid_answer(self, question: str, topic: str,
                               stat_result: dict, chunks: list[dict],
