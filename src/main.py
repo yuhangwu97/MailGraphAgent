@@ -55,12 +55,13 @@ def fetch_emails(
     limit: int = typer.Option(100, help="拉取邮件数量上限"),
     folder: str = typer.Option("INBOX", help="邮件夹名称"),
     since: Optional[str] = typer.Option(None, help="只拉取该日期之后 (YYYY-MM-DD)"),
+    account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
 ):
     """拉取邮箱邮件，清洗后暂存到 Redis（待 ingest）"""
     log_section("📧 邮件拉取")
     try:
-        n = Pipeline().run_fetch(folder=folder, limit=limit, since=since,
-                                 on_log=lambda m: console.print(f"  {m}"))
+        n = Pipeline(account).run_fetch(folder=folder, limit=limit, since=since,
+                                        on_log=lambda m: console.print(f"  {m}"))
         log_success(f"已入队 {n} 封邮件，运行 `ingest` 导入知识图谱")
     except Exception as e:
         logger.error("邮件拉取失败: %s", e, exc_info=True)
@@ -76,12 +77,13 @@ def fetch_emails(
 @app.command("ingest")
 def ingest_emails(
     limit: Optional[int] = typer.Option(None, help="限制本次导入数量"),
+    account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
 ):
     """把暂存的邮件（原文 + 附件）导入 RAGFlow，GraphRAG 跨文档建图"""
     log_section("📚 知识图谱导入 (GraphRAG)")
     try:
-        stats = Pipeline().run_ingest(limit=limit,
-                                      on_log=lambda m: console.print(f"  {m}"))
+        stats = Pipeline(account).run_ingest(limit=limit,
+                                             on_log=lambda m: console.print(f"  {m}"))
         log_success(f"导入完成：{stats['uploaded']}/{stats['total']} 封"
                     f"（附件 {stats['attachments']}，失败 {stats['failed']}）")
     except Exception as e:
@@ -101,17 +103,18 @@ def full_pipeline(
     folder: str = typer.Option("INBOX", help="邮件夹名称"),
     since: Optional[str] = typer.Option(None, help="只处理该日期之后 (YYYY-MM-DD)"),
     skip_fetch: bool = typer.Option(False, help="跳过拉取，直接 ingest 队列"),
+    account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
 ):
     """完整流程：拉取 → 清洗 → GraphRAG 建图"""
     log_section("🚀 完整流程")
     try:
-        pipe = Pipeline()
+        pipe = Pipeline(account)
         emit = lambda m: console.print(f"  {m}")
         if not skip_fetch:
             pipe.run_fetch(folder=folder, limit=limit, since=since, on_log=emit)
         stats = pipe.run_ingest(on_log=emit)
 
-        cache = MailCache()
+        cache = MailCache(pipe.account_id)
         s = cache.get_statistics()
         cache.close()
 

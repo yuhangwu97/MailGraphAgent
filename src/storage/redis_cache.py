@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class MailCache:
     """邮件处理进度缓存 (Redis 后端)"""
 
-    def __init__(self):
+    def __init__(self, account_id: str | None = None):
         cfg = get_settings()
         self._cfg = cfg
         self._r = redis.Redis(
@@ -28,7 +28,9 @@ class MailCache:
             decode_responses=True,
             socket_connect_timeout=5,
         )
-        self._prefix = "mailgraph:"
+        # 按账号隔离命名空间：mail/body/ingest_queue/done_uids/progress/usage 全部自动分账号
+        self._account_id = account_id
+        self._prefix = f"mailgraph:{account_id}:" if account_id else "mailgraph:"
         self._body_ttl = int(cfg.fetched_body_ttl_days) * 86400
 
     @property
@@ -57,6 +59,14 @@ class MailCache:
         self.r.hset(key, "status", "done")
         self.r.hset(key, "updated_at", str(time.time()))
         self.r.setex(self._k("mail", message_id, "done"), 30 * 86400, "1")
+        self._index_done_uid(key)
+
+    def _index_done_uid(self, mail_key: str):
+        """把已完成邮件的 uid 加入 per-folder done_uids 集合（供快速去重）"""
+        uid = self.r.hget(mail_key, "uid")
+        folder = self.r.hget(mail_key, "folder")
+        if uid and folder:
+            self.r.sadd(self._k("done_uids", folder), uid)
 
     def mark_failed(self, message_id: str, error: str):
         key = self._k("mail", message_id)
@@ -73,7 +83,16 @@ class MailCache:
         })
 
     def get_processed_uids(self, folder: str) -> set[str]:
-        # scan all mail keys for done status
+        """返回该 folder 下已入库的 UID 集合（去重用）。
+
+        优先读 per-folder done_uids 集合（O(1) 一次 SMEMBERS）；
+        集合不存在（老数据）时回退全量扫描一次并回填，之后即走快路径。
+        """
+        set_key = self._k("done_uids", folder)
+        if self.r.exists(set_key):
+            return set(self.r.smembers(set_key))
+
+        # 回退 + 回填
         uids = set()
         for key in self.r.scan_iter(match=self._k("mail", "*")):
             status = self.r.hget(key, "status")
@@ -82,6 +101,8 @@ class MailCache:
                 uid = self.r.hget(key, "uid")
                 if uid:
                     uids.add(uid)
+        if uids:
+            self.r.sadd(set_key, *uids)
         return uids
 
     def get_unprocessed_count(self) -> int:
@@ -141,17 +162,46 @@ class MailCache:
                 continue
             yield mail
 
-    def mark_ingested(self, message_id: str, doc_id: str = "", drop_body: bool = True):
-        """标记已入库：出队、记录 doc_id、可选删除正文（即用即删）"""
+    def mark_ingested(self, message_id: str, doc_id: str = "", drop_body: bool = True,
+                      att_doc_ids: list[str] | None = None):
+        """标记已入库：出队、记录正文/附件 doc_id、可选删除正文（即用即删）"""
         self.r.srem(self._k("ingest_queue"), message_id)
         key = self._k("mail", message_id)
         self.r.hset(key, mapping={
             "status": "done", "ragflow_doc_id": doc_id,
+            "ragflow_att_doc_ids": ",".join(att_doc_ids or []),
             "updated_at": str(time.time()),
         })
         self.r.setex(self._k("mail", message_id, "done"), 30 * 86400, "1")
+        self._index_done_uid(key)
         if drop_body:
             self.r.delete(self._k("body", message_id))
+
+    def get_mail_state(self, message_id: str) -> dict:
+        """取一封邮件的处理状态哈希（uid/folder/status/ragflow_doc_id 等）"""
+        return self.r.hgetall(self._k("mail", message_id))
+
+    def list_done_mails(self, limit: int = 100) -> list[dict]:
+        """列出已入库(done)邮件的元数据（正文已释放，用于强制重新处理）。
+
+        返回含 message_id / subject / from_addr / date / uid / folder /
+        ragflow_doc_id。按 updated_at 倒序。
+        """
+        prefix_len = len(self._prefix) + len("mail:")
+        mails = []
+        for key in self.r.scan_iter(match=self._k("mail", "*")):
+            # 跳过 mail:<id>:done 这类字符串标记键，只处理哈希
+            if self.r.type(key) != "hash":
+                continue
+            data = self.r.hgetall(key)
+            if data.get("status") != "done":
+                continue
+            data["message_id"] = key[prefix_len:]
+            mails.append(data)
+            if len(mails) >= limit:
+                break
+        mails.sort(key=lambda m: m.get("updated_at", ""), reverse=True)
+        return mails
 
     def list_recent_mails(self, limit: int = 50) -> list[dict]:
         """列出最近暂存的邮件正文（供前端工作台展示）"""
@@ -217,6 +267,11 @@ class MailCache:
 
     def reset_email(self, message_id: str):
         key = self._k("mail", message_id)
+        # 从 done_uids 集合移除，重置后才能被重新拉取
+        uid = self.r.hget(key, "uid")
+        folder = self.r.hget(key, "folder")
+        if uid and folder:
+            self.r.srem(self._k("done_uids", folder), uid)
         self.r.hset(key, mapping={
             "status": "pending", "error_msg": "",
             "updated_at": str(time.time()),
