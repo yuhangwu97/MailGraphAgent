@@ -1,4 +1,4 @@
-from src.ai.query_engine import QueryEngine, QueryFilters, QueryPlan
+from src.backend.ai.query_engine import QueryEngine, QueryFilters, QueryPlan
 
 
 class FakeQueryEngine(QueryEngine):

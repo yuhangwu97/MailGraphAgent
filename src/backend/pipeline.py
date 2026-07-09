@@ -25,7 +25,7 @@ class Pipeline:
     def __init__(self, account_id: str | None = None):
         self.cfg = get_settings()
         # 解析当前账号：未指定则迁移 env 邮箱并取默认账号
-        from src.storage.account_store import AccountStore
+        from src.backend.storage.account_store import AccountStore
         store = AccountStore()
         try:
             if account_id:
@@ -50,9 +50,9 @@ class Pipeline:
     def run_fetch(self, folder: str = "INBOX", limit: int = 20,
                   since: str | None = None, on_log=None) -> int:
         """拉取邮件，清洗后暂存到 Redis（并入 ingest 队列）。返回入队邮件数。"""
-        from src.mail.imap_client import IMAPClient
-        from src.mail.cleaner import MailCleaner
-        from src.storage.redis_cache import MailCache
+        from src.backend.mail.imap_client import IMAPClient
+        from src.backend.mail.cleaner import MailCleaner
+        from src.backend.storage.redis_cache import MailCache
 
         log = on_log or (lambda m: logger.info(m))
         if not self.account:
@@ -100,7 +100,7 @@ class Pipeline:
         入队成功返回 parsed 对象；被去重/噪音跳过或失败返回 None。
         run_fetch 与 reprocess 共用此逻辑。
         """
-        from src.mail.parser import parse_email
+        from src.backend.mail.parser import parse_email
 
         parsed = None
         try:
@@ -157,8 +157,8 @@ class Pipeline:
 
     def run_ingest(self, limit: int | None = None, on_log=None) -> dict:
         """把 Redis 队列里的邮件（原文 + 附件）上传到 RAGFlow，GraphRAG 建图。"""
-        from src.attachment.ragflow_client import get_ragflow_client
-        from src.storage.redis_cache import MailCache
+        from src.backend.attachment.ragflow_client import get_ragflow_client
+        from src.backend.storage.redis_cache import MailCache
 
         log = on_log or (lambda m: logger.info(m))
         rf = get_ragflow_client(self.account_id)
@@ -255,10 +255,10 @@ class Pipeline:
         步骤：删旧 RAGFlow 文档 → 重置状态（移出 done_uids）→ 重新从 IMAP
         拉正文入队 → run_ingest 重新建图。先删后传，避免图谱里重复实体。
         """
-        from src.attachment.ragflow_client import get_ragflow_client
-        from src.storage.redis_cache import MailCache
-        from src.mail.imap_client import IMAPClient
-        from src.mail.cleaner import MailCleaner
+        from src.backend.attachment.ragflow_client import get_ragflow_client
+        from src.backend.storage.redis_cache import MailCache
+        from src.backend.mail.imap_client import IMAPClient
+        from src.backend.mail.cleaner import MailCleaner
 
         log = on_log or (lambda m: logger.info(m))
         if not self.account:

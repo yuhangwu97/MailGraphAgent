@@ -1,0 +1,66 @@
+/* ═══════════════════════════════════════════════════════════════
+   Design System — migrated from Streamlit CSS (app.py)
+   Linear/Notion-inspired SaaS palette
+   ═══════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Primary — deep teal-green */
+  --p: #1F6F5C;
+  --p-hover: #1A5C4C;
+  --p-light: #EAF3F0;
+  --p-ring: #C4E0D7;
+
+  /* Neutrals — warm white/stone base */
+  --bg: #FAFAF9;
+  --surface: #FFFFFF;
+  --surface-2: #F5F4F2;
+  --border: #E7E5E1;
+  --border-light: #F0EFEC;
+
+  /* Text */
+  --t1: #14110F;
+  --t2: #3D3A36;
+  --t3: #57534E;
+  --t4: #A8A29E;
+  --t5: #D6D3CE;
+
+  /* Semantic */
+  --green: #2E9E6E;
+  --green-bg: #E7F4EE;
+  --green-t: #1A5C4C;
+  --amber: #B4791F;
+  --amber-bg: #F7EFE0;
+  --amber-t: #7A4E12;
+  --red: #9A3B2E;
+  --red-bg: #F4E9E6;
+  --red-t: #6E2A20;
+  --purple: #4A5568;
+  --purple-bg: #EEF0F2;
+  --purple-t: #2D3748;
+  --cyan: #4A7C8A;
+  --cyan-bg: #E9F0F2;
+  --cyan-t: #2C4A52;
+
+  /* Graph nodes — muted earth tones */
+  --node-company: #1F6F5C;
+  --node-contact: #C08A3E;
+  --node-project: #9A3B2E;
+  --node-emp: #4A5568;
+
+  /* Sidebar */
+  --side: #1A1613;
+
+  /* Radii */
+  --r: 10px;
+  --r-sm: 6px;
+  --r-lg: 14px;
+
+  /* Shadows */
+  --sh-sm: 0 1px 2px rgba(20, 17, 15, 0.05);
+  --sh: 0 1px 3px rgba(20, 17, 15, 0.07), 0 1px 2px rgba(20, 17, 15, 0.04);
+  --sh-md: 0 6px 16px rgba(20, 17, 15, 0.08), 0 2px 6px rgba(20, 17, 15, 0.04);
+  --sh-lg: 0 14px 34px rgba(20, 17, 15, 0.10), 0 5px 10px rgba(20, 17, 15, 0.05);
+
+  /* Layout */
+  --sidebar-w: 260px;
+}

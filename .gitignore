@@ -31,3 +31,4 @@ data/redis/
 data/minio/
 data/ragflow/
 data/logs/
+/src/web/node_modules

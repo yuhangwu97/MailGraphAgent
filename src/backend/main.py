@@ -14,8 +14,8 @@ from rich.table import Table
 from rich.panel import Panel
 
 from config.settings import get_settings
-from src.pipeline import Pipeline
-from src.storage.redis_cache import MailCache
+from src.backend.pipeline import Pipeline
+from src.backend.storage.redis_cache import MailCache
 
 # ── 日志配置 ──
 logging.basicConfig(
@@ -133,34 +133,36 @@ def full_pipeline(
 
 
 # ════════════════════════════════════════════════════════════════════
-# web：启动 Streamlit 前端
+# web：启动 FastAPI 后端 + 生产模式下托管 Vue SPA
 # ════════════════════════════════════════════════════════════════════
 
 
 @app.command("web")
 def start_web(
     host: str = typer.Option("localhost", help="服务器地址"),
-    port: int = typer.Option(8501, help="服务器端口"),
+    port: int = typer.Option(8000, help="服务器端口"),
+    reload: bool = typer.Option(True, help="开发模式自动重载"),
 ):
-    """启动 Streamlit Web 前端"""
+    """启动 FastAPI Web 服务"""
     import subprocess
-    from pathlib import Path
+    import uvicorn
 
-    log_section("🌐 启动 Web 前端")
-    console.print(f"访问地址: http://{host}:{port}")
+    log_section("🌐 启动 Web 服务 (FastAPI + Vue SPA)")
+    console.print(f"API 地址: http://{host}:{port}/api/health")
+    console.print(f"API 文档: http://{host}:{port}/docs")
     try:
-        subprocess.run([
-            "streamlit", "run",
-            str(Path(__file__).parent / "web" / "app.py"),
-            "--server.address", host,
-            "--server.port", str(port),
-            "--logger.level=info",
-        ], check=True)
+        uvicorn.run(
+            "src.backend.app:app",
+            host=host,
+            port=port,
+            reload=reload,
+            log_level="info",
+        )
     except KeyboardInterrupt:
         console.print("\n[yellow]服务器已停止[/yellow]")
     except Exception as e:
-        logger.error("启动 Web 前端失败: %s", e, exc_info=True)
-        log_error(f"启动 Web 前端失败: {e}")
+        logger.error("启动 Web 服务失败: %s", e, exc_info=True)
+        log_error(f"启动 Web 服务失败: {e}")
         raise typer.Exit(code=1)
 
 
@@ -186,7 +188,7 @@ def system_check():
 
     console.print("\n[bold]连接检查:[/bold]")
     try:
-        from src.mail.imap_client import IMAPClient
+        from src.backend.mail.imap_client import IMAPClient
         c = IMAPClient()
         c.connect()
         c.close()
@@ -203,7 +205,7 @@ def system_check():
         console.print(f"  [red]✗[/red] Redis 连接 ({e})")
 
     try:
-        from src.attachment.ragflow_client import get_ragflow_client
+        from src.backend.attachment.ragflow_client import get_ragflow_client
         rf = get_ragflow_client()
         ds = rf.get_or_create_dataset(settings.ragflow_dataset_name)
         console.print("  [green]✓[/green] RAGFlow 连接" if ds

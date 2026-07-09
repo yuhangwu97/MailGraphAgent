@@ -1,0 +1,156 @@
+"""Natural-language query with SSE streaming answer."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+
+from src.backend.deps import get_account_id, get_cache, get_conversation_store, get_query_engine
+from src.backend.schemas import QueryRequest
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api", tags=["query"])
+
+
+@router.post("/query")
+async def run_query(
+    body: QueryRequest,
+    account_id: str = Depends(get_account_id),
+):
+    """Run a natural-language query and stream the answer via SSE.
+
+    Events:
+      - progress: token chunks
+      - trace: query pipeline steps
+      - result: structured data (entities, relationships, chunks, rows)
+      - done: final complete signal
+      - error: error message
+    """
+    engine = await get_query_engine(account_id=account_id)
+
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Query engine unavailable — check RAGFlow connection")
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        # Resolve conversation context
+        store = get_conversation_store(account_id=account_id)
+        memory_prompt = ""
+        history = []
+        if store:
+            try:
+                if body.session_id:
+                    history = store.recent_context(body.session_id, limit=8)
+                mem = store.get_memory()
+                memory_prompt = mem.to_prompt() if mem else ""
+            finally:
+                store.close()
+
+        context = {"memory": memory_prompt, "history": history}
+
+        # Run query in thread
+        loop = asyncio.get_running_loop()
+
+        def _emit(event: str, data: dict):
+            loop.call_soon_threadsafe(queue.put_nowait, {"event": event, "data": data})
+
+        def _run():
+            try:
+                _emit("progress", {"msg": "🔍 正在分析问题…"})
+                result = engine.query(body.question, context=context)
+
+                # Emit query plan as a progress step
+                plan = result.get("query_plan")
+                if plan:
+                    route = plan.get("route", "")
+                    route_labels = {"stat": "📊 统计查询", "content": "✨ 内容检索", "hybrid": "🔀 混合查询", "clarify": "❔ 澄清"}
+                    _emit("progress", {"msg": f"{route_labels.get(route, route)} — {plan.get('reason', '')[:80]}"})
+
+                # Emit trace steps as progress
+                for step in result.get("trace") or []:
+                    icon = step.get("icon", "")
+                    name = step.get("name", "")
+                    detail = step.get("detail", "")
+                    status = step.get("status", "ok")
+                    msg = f"{icon} {name}"
+                    if detail:
+                        msg += f"：{detail}"
+                    _emit("progress", {"msg": msg})
+
+                # Stream tokens one by one
+                answer = result.get("answer") or "未找到相关信息。"
+                import re, time
+
+                for tok in re.findall(r"\S+\s*|\s+", answer):
+                    _emit("progress", {"token": tok})
+                    time.sleep(0.006)
+
+                # Send structured result (includes chunks → source references)
+                _emit("result", result)
+            except Exception as exc:
+                logger.exception("Query failed")
+                _emit("error", {"msg": str(exc)})
+            finally:
+                _emit("done", {})
+                loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+        import asyncio as _asyncio
+
+        # ensure_future works with both coroutines (Python <3.12) and
+        # Futures (Python ≥3.12/3.14) returned by run_in_executor.
+        task = _asyncio.ensure_future(
+            _asyncio.get_running_loop().run_in_executor(None, _run)
+        )
+
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            event_type = item.get("event", "progress")
+            data = item.get("data", item)
+            yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+        await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/ragflow/retrieve")
+async def ragflow_retrieve(
+    body: dict,
+    account_id: str = Depends(get_account_id),
+):
+    """Direct RAGFlow semantic retrieval."""
+    from src.backend.deps import get_ragflow
+
+    rf = await get_ragflow(account_id=account_id)
+    if rf is None:
+        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
+    top_k = body.get("top_k", 10)
+    query = body.get("query", "")
+    loop = asyncio.get_running_loop()
+    chunks = await loop.run_in_executor(None, lambda: rf.retrieve_chunks(query, top_k=top_k))
+    return {"chunks": chunks}
+
+
+@router.post("/ragflow/chat")
+async def ragflow_chat(
+    body: dict,
+    account_id: str = Depends(get_account_id),
+):
+    """Direct RAGFlow native chat completion."""
+    from src.backend.deps import get_ragflow
+
+    rf = await get_ragflow(account_id=account_id)
+    if rf is None:
+        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
+    question = body.get("question", "")
+    loop = asyncio.get_running_loop()
+    answer = await loop.run_in_executor(None, lambda: rf.chat_answer(question))
+    return answer

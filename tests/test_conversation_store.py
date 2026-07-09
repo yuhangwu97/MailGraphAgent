@@ -1,6 +1,6 @@
 import json
 
-from src.storage import conversation_store as cs
+from src.backend.storage import conversation_store as cs
 
 
 class FakeRedis:

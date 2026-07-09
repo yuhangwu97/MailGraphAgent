@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from src.storage import redis_cache as rc
+from src.backend.storage import redis_cache as rc
 
 
 class FakePipeline:

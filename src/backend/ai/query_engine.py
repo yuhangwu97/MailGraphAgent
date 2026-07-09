@@ -290,7 +290,7 @@ class QueryEngine:
 
     def _get_cache(self):
         if self._cache is None:
-            from src.storage.redis_cache import MailCache
+            from src.backend.storage.redis_cache import MailCache
             try:
                 self._cache = MailCache(self._account_id)
             except Exception as e:
@@ -790,17 +790,26 @@ class QueryEngine:
         topic = plan.filters.topic or question
         chunks, topic_ids = self._retrieve_topic_message_ids(topic)
         if not topic_ids:
+            # 即使 topic_ids 为空，也不要传空集合（会导致交集恒为 0）。
+            # 传 None 保留其他过滤条件（时间、附件等），让 chunks 提供主题证据。
             stat_result = self._execute_stat_query_with_message_ids(
-                question, plan, start_time, message_ids=set(),
+                question, plan, start_time, message_ids=None,
                 hybrid=True, context=context)
             stat_result["chunks"] = chunks
             stat_result["answer"] = self._format_hybrid_answer(
                 question, topic, stat_result, chunks, context)
+            chunk_count = len(chunks)
+            trace_content = (
+                f"主题：{topic}，检索到 {chunk_count} 段证据但未能归属到 message_id"
+                if chunk_count else
+                f"主题：{topic}，未检索到相关证据"
+            )
             stat_result["trace"].append({
                 "name": "混合查询主题命中（RAGFlow chunks → message_id）",
                 "icon": "✨",
-                "content": f"主题：{topic}，未能归属到候选邮件",
-                "status": "warning", "color": "#F59E0B",
+                "content": trace_content,
+                "status": "warning" if chunk_count else "fail",
+                "color": "#F59E0B" if chunk_count else "#EF4444",
                 "duration_ms": int((time.time() - start_time) * 1000),
             })
             return stat_result
@@ -959,8 +968,37 @@ class QueryEngine:
                               stat_result: dict, chunks: list[dict],
                               context: dict | None = None) -> str:
         rows = stat_result.get("rows", [])[:10]
+        matched_count = len(stat_result.get("matched_ids", []))
+
+        # 有 chunks 但 rows 为空：主题检索命中了正文，但未能映射到具体邮件元数据
+        # 直接用 chunk 内容生成回答，不要丢弃已有的检索证据
+        if not rows and chunks:
+            evidence = "\n---\n".join(
+                (c.get("content", "") or "")[:600] for c in chunks[:5]
+            )
+            prompt = f"""根据检索到的邮件正文片段回答用户问题（中文，简洁，<250字）。
+
+{self._context_prompt(context)}
+
+用户问题：{question}
+主题：{topic}
+
+RAGFlow 检索到 {len(chunks)} 段与"{topic}"相关的邮件正文：
+{evidence}
+
+请根据以上内容直接回答用户问题。列出相关邮件及其要点（日期、发件人、关键信息）。
+不要说"没有找到"——正文中已有相关邮件，请如实总结。"""
+            answer = self._call_llm(prompt, max_tokens=500)
+            if answer and answer != "{}":
+                return answer
+            # LLM 失败时给出模板兜底
+            doc_names = list({c.get("doc_name", "") for c in chunks[:8] if c.get("doc_name")})
+            if doc_names:
+                return f"检索到 {len(chunks)} 段与'{topic}'相关的邮件正文（{'; '.join(doc_names[:5])}），但未能精确匹配过滤条件。"
+            return f"检索到 {len(chunks)} 段与'{topic}'相关的邮件正文，但未能精确匹配过滤条件。"
+
         if not rows:
-            return f"没有找到同时满足过滤条件并与“{topic}”相关的邮件。"
+            return f"没有找到同时满足过滤条件并与'{topic}'相关的邮件。"
 
         preview = "\n".join(
             f"- {r.get('日期','')} | {r.get('主题','')} | {r.get('发件人','')}"
@@ -975,7 +1013,7 @@ class QueryEngine:
 
 用户问题：{question}
 主题：{topic}
-候选邮件总数：{len(stat_result.get('matched_ids', []))}
+候选邮件总数：{matched_count}
 候选邮件预览：
 {preview}
 
@@ -987,7 +1025,7 @@ RAGFlow chunk 证据：
         if answer and answer != "{}":
             return answer
         suffix = "，并检索到相关正文片段。" if chunks else "，但没有检索到可引用的正文片段。"
-        return f"找到 {len(stat_result.get('matched_ids', []))} 封候选邮件与“{topic}”相关{suffix}"
+        return f"找到 {matched_count} 封候选邮件与'{topic}'相关{suffix}"
 
     # ═══════════════════════════════════════════
     # 主入口：路由分发
@@ -1016,7 +1054,7 @@ RAGFlow chunk 证据：
 
     def _try_query_graph(self, question: str, context: dict | None = None) -> dict | None:
         try:
-            from src.ai.query_graph import build_query_graph
+            from src.backend.ai.query_graph import build_query_graph
         except Exception:
             return None
         try:

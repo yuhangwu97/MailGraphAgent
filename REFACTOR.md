@@ -44,3 +44,11 @@ query:   NL → graph_search + retrieve → LLM 总结 → 表格 + 子图
 纯 GraphRAG 不产出这种确定性状态字段。所以看板将改为**图谱可如实提供的内容**：
 项目 + 关联人员 + LLM 描述，去掉编造的状态/进度条。
 （如需状态，后续可加一个只跑状态一个字段的轻量标注，但那会重新引入小规模二次提取。）
+
+curl -s -H "Authorization: Bearer ragflow-TotgCeQwinlwoPP0SDnqbCUM4b5AJxhk9nyJviIhVgk" "http://localhost:9380/api/v1/datasets" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+data=d.get('data',{}) or {}
+print(f'progress={data.get(\"progress\")}')
+print(f'msg={str(data.get(\"progress_msg\",\"\"))[-200:]}')
+"
