@@ -272,7 +272,8 @@ def init_ragflow(account_id):
         from src.attachment.ragflow_client import get_ragflow_client
         rf = get_ragflow_client(account_id)
         rf.get_or_create_dataset(_dataset_name(account_id))
-        rf.enable_graphrag()
+        # GraphRAG 配置已在 create_dataset 时通过 parser_config 传入，
+        # 无需再调 enable_graphrag（RAGFlow /datasets/{id} 不支持 PUT/PATCH）
         return rf
     except Exception:
         return None
@@ -291,7 +292,7 @@ def init_query_engine(_ragflow, account_id):
     if _ragflow is None:
         return None
     from src.ai.query_engine import QueryEngine
-    return QueryEngine(_ragflow)
+    return QueryEngine(_ragflow, account_id=account_id)
 
 def _resolve_active_account():
     """迁移 env 邮箱 → 取账号列表 → 定位当前活动账号（存 session_state）。
@@ -454,7 +455,13 @@ def build_result_subgraph(result: dict) -> str:
     if not entities:
         return '<div style="padding:40px;text-align:center;color:#94A3B8;">无图谱数据</div>'
 
-    entity_ids = {e["id"] for e in entities}
+    entity_ids = set()
+    for e in entities:
+        eid = e.get("id", "")
+        if isinstance(eid, list):
+            eid = eid[0] if eid else ""
+        if isinstance(eid, str) and eid:
+            entity_ids.add(eid)
     for ent in entities:
         eid, etype, name = ent["id"], ent.get("type", "Entity"), ent.get("name", ent["id"])
         color = NODE_COLORS.get(etype, "#94A3B8")
@@ -462,6 +469,11 @@ def build_result_subgraph(result: dict) -> str:
 
     for rel in relationships:
         s, t = rel.get("source_id", ""), rel.get("target_id", "")
+        # RAGFlow 某些版本返回 list，展平
+        if isinstance(s, list):
+            s = s[0] if s else ""
+        if isinstance(t, list):
+            t = t[0] if t else ""
         if s in entity_ids and t in entity_ids:
             net.add_edge(s, t, title=rel.get("type", ""), color="#CBD5E1")
 
@@ -575,7 +587,7 @@ def _render_results(result: dict):
         with tabs[0]:
             if entities:
                 try:
-                    st.components.v1.html(build_result_subgraph(result), height=440, scrolling=False)
+                    st.iframe(src=f"data:text/html;charset=utf-8;base64,{__import__('base64').b64encode(build_result_subgraph(result).encode()).decode()}", height=440)
                 except Exception as e:
                     st.caption(f"图谱渲染失败: {e}")
             else:
@@ -644,12 +656,6 @@ def render_chat_page():
                     st.session_state.pending_prompt = q
                     st.rerun()
 
-        kpi = get_kpi_data()
-        if any(v > 0 for v in kpi.values()):
-            st.markdown('<div style="max-width:820px;margin:1.5rem auto 0 auto;">', unsafe_allow_html=True)
-            render_kpi_row(kpi)
-            st.markdown('</div>', unsafe_allow_html=True)
-
     # 历史消息
     for msg in st.session_state.chat:
         _render_history_message(msg)
@@ -686,6 +692,10 @@ elif page == "dashboard":
     st.markdown('<h2>📊 项目看板</h2>', unsafe_allow_html=True)
     st.caption("项目 · 关联人员 · 图谱描述 — 数据来自 RAGFlow GraphRAG 跨文档图谱")
 
+    # 顶部 KPI 卡片
+    kpi = get_kpi_data()
+    render_kpi_row(kpi)
+
     if ragflow is None:
         st.warning("RAGFlow 未连接，项目看板不可用。")
     else:
@@ -693,8 +703,17 @@ elif page == "dashboard":
         relationships = ragflow.get_graph_relationships(page_size=1000)
 
         projects = [e for e in entities if e.get("type") == "Project"]
-        people = {e["id"]: e for e in entities if e.get("type") in ("Contact", "Employee")}
-        companies = {e["id"]: e for e in entities if e.get("type") == "Company"}
+        people, companies = {}, {}
+        for e in entities:
+            eid = e.get("id", "")
+            if isinstance(eid, list):
+                eid = eid[0] if eid else ""
+            if not isinstance(eid, str) or not eid:
+                continue
+            if e.get("type") in ("Contact", "Employee"):
+                people[eid] = e
+            elif e.get("type") == "Company":
+                companies[eid] = e
 
         # 搜索
         search_proj = st.text_input("搜索项目", placeholder="按项目名称筛选...", label_visibility="collapsed")
@@ -706,9 +725,12 @@ elif page == "dashboard":
             for r in relationships:
                 if r.get("source_id") == p["id"] or r.get("target_id") == p["id"]:
                     other = r["source_id"] if r["target_id"] == p["id"] else r["target_id"]
-                    if other in people:
+                    # RAGFlow 某些版本返回 list，取第一个元素
+                    if isinstance(other, list):
+                        other = other[0] if other else ""
+                    if isinstance(other, str) and other in people:
                         related_people.append(people[other])
-                    elif other in companies:
+                    elif isinstance(other, str) and other in companies:
                         related_companies.append(companies[other])
             proj_data.append({
                 "name": p.get("name", ""),
@@ -723,15 +745,6 @@ elif page == "dashboard":
         if not proj_data:
             st.info("暂无项目数据。请先在「邮件工作台」拉取并导入邮件到图谱。")
         else:
-            # KPI（如实统计，不编造状态）
-            st.markdown(f"""
-            <div class="kpi-grid">
-                <div class="kpi-card"><div class="kpi-dot" style="background:#9A3B2E;"></div><div class="kpi-icon">📋</div><div class="kpi-value">{len(projects)}</div><div class="kpi-label">项目</div></div>
-                <div class="kpi-card"><div class="kpi-dot" style="background:#06B6D4;"></div><div class="kpi-icon">👤</div><div class="kpi-value">{len(people)}</div><div class="kpi-label">相关人员</div></div>
-                <div class="kpi-card"><div class="kpi-dot" style="background:#1F6F5C;"></div><div class="kpi-icon">🏢</div><div class="kpi-value">{len(companies)}</div><div class="kpi-label">公司</div></div>
-                <div class="kpi-card"><div class="kpi-dot" style="background:#4A5568;"></div><div class="kpi-icon">🔗</div><div class="kpi-value">{len(relationships)}</div><div class="kpi-label">关系</div></div>
-            </div>""", unsafe_allow_html=True)
-
             # 项目卡片
             st.markdown('<div class="project-grid">', unsafe_allow_html=True)
             for p in proj_data:
@@ -993,6 +1006,34 @@ elif page == "graph":
     if ragflow is None:
         st.warning("RAGFlow 未连接。")
     else:
+        # ── 工具栏：重建图谱按钮 ──
+        t1, t2, t3 = st.columns([2, 2, 3])
+        with t1:
+            do_build = st.button("🔄 重建图谱", width="stretch", type="primary",
+                                 help="显式触发 GraphRAG 建图（解析完成后图谱已自动构建，此按钮用于手动重跑）")
+        with t2:
+            if "graph_build_msg" in st.session_state:
+                st.caption(st.session_state.graph_build_msg)
+
+        if do_build:
+            msg_box = st.empty()
+            msgs = []
+
+            def _on_progress(msg):
+                msgs.append(msg)
+                msg_box.info(" · ".join(msgs[-3:]))
+
+            result = ragflow.build_graph(on_progress=_on_progress)
+            if result["ok"]:
+                msg_box.success(result["message"])
+                st.session_state.graph_build_msg = "✅ " + result["message"]
+            else:
+                msg_box.error(result["message"])
+                st.session_state.graph_build_msg = "❌ " + result["message"]
+            # 刷新以显示最新图谱
+            time.sleep(1)
+            st.rerun()
+
         entities = ragflow.get_graph_entities(page_size=500)
         relationships = ragflow.get_graph_relationships(page_size=1000)
 
@@ -1020,7 +1061,7 @@ elif page == "graph":
 
         with st.spinner("渲染图谱..."):
             html = build_pyvis_network_from_ragflow(ragflow, entity_types_filter=sel if sel else None)
-            st.components.v1.html(html, height=580, scrolling=False)
+            st.iframe(src=f"data:text/html;charset=utf-8;base64,{__import__('base64').b64encode(html.encode()).decode()}", height=580)
 
         st.caption("💡 拖拽平移 · 滚轮缩放 · 悬停查看详情")
 

@@ -95,6 +95,8 @@ class MailCache:
         # 回退 + 回填
         uids = set()
         for key in self.r.scan_iter(match=self._k("mail", "*")):
+            if self.r.type(key) != "hash":
+                continue
             status = self.r.hget(key, "status")
             f = self.r.hget(key, "folder")
             if status == "done" and f == folder:
@@ -108,6 +110,8 @@ class MailCache:
     def get_unprocessed_count(self) -> int:
         count = 0
         for key in self.r.scan_iter(match=self._k("mail", "*")):
+            if self.r.type(key) != "hash":
+                continue
             status = self.r.hget(key, "status")
             if status in ("failed", "pending"):
                 count += 1
@@ -116,12 +120,133 @@ class MailCache:
     def get_stats(self) -> dict:
         stats = {"done": 0, "failed": 0, "skipped": 0, "processing": 0, "pending": 0}
         for key in self.r.scan_iter(match=self._k("mail", "*")):
+            if self.r.type(key) != "hash":
+                continue
             status = self.r.hget(key, "status") or "pending"
             if status in stats:
                 stats[status] += 1
             else:
                 stats["pending"] += 1
         return stats
+
+    def query_stats(self, start_time=None, end_time=None,
+                    status: str | None = None,
+                    group_by: str | None = None,
+                    has_attachment: bool | None = None,
+                    limit: int = 0) -> dict:
+        """按多维度统计邮件。
+
+        Args:
+            start_time: 起始时间（datetime 对象）
+            end_time: 结束时间（datetime 对象）
+            status: 可选状态过滤（done/failed/skipped/processing/pending）
+            group_by: 分组维度 — "sender" 按发件人分组计数
+            has_attachment: True=仅统计有附件的，False=仅无附件的，None=不限
+            limit: group_by 时只返回 top N（0=全部）
+
+        Returns:
+            {"total": N, "by_status": {...}, "by_sender": [{addr, name, count}],
+             "items": [{message_id, subject, from_addr, date, status, has_attachment}],
+             "matched_ids": [...]}
+        """
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+        from collections import Counter
+
+        by_status = {"done": 0, "failed": 0, "skipped": 0, "processing": 0, "pending": 0}
+        sender_counter = Counter()
+        sender_names = {}
+        matched_ids = []
+        items = []
+
+        for key in self.r.scan_iter(match=self._k("mail", "*")):
+            if self.r.type(key) != "hash":
+                continue
+            data = self.r.hgetall(key)
+            st = data.get("status") or "pending"
+
+            if status and st != status:
+                continue
+
+            # 时间过滤
+            date_str = data.get("date", "")
+            if start_time or end_time:
+                mail_dt = None
+                try:
+                    mail_dt = parsedate_to_datetime(date_str)
+                except (ValueError, TypeError):
+                    try:
+                        mail_dt = datetime.fromisoformat(date_str)
+                    except (ValueError, TypeError):
+                        pass
+                if mail_dt is not None:
+                    if mail_dt.tzinfo is not None:
+                        mail_dt = mail_dt.replace(tzinfo=None)
+                    if start_time and mail_dt < start_time:
+                        continue
+                    if end_time and mail_dt > end_time:
+                        continue
+
+            # 附件过滤：看 body 暂存或标记
+            if has_attachment is not None:
+                body = self.get_mail(data.get("message_id", ""))
+                att_count = len(body.get("attachments", [])) if body else 0
+                if has_attachment and att_count == 0:
+                    continue
+                if not has_attachment and att_count > 0:
+                    continue
+
+            by_status[st] = by_status.get(st, 0) + 1
+            mid = data.get("message_id") or key.rsplit(":", 1)[-1]
+            matched_ids.append(mid)
+
+            # group_by: sender
+            if group_by == "sender":
+                addr = data.get("from_addr", "未知")
+                sender_counter[addr] += 1
+                # 尝试从 body 取发件人姓名（已入库邮件 body 可能已释放）
+                body = self.get_mail(mid)
+                if body and body.get("from_name"):
+                    sender_names[addr] = body["from_name"]
+
+            # list 模式：收集邮件摘要
+            if group_by is None:
+                body = self.get_mail(mid)
+                att_count = 0
+                if body:
+                    att_count = len(body.get("attachments", []) or [])
+                items.append({
+                    "message_id": mid,
+                    "subject": data.get("subject", "(无主题)"),
+                    "from_addr": data.get("from_addr", ""),
+                    "date": date_str,
+                    "status": st,
+                    "has_attachment": att_count > 0,
+                    "attachment_count": att_count,
+                })
+
+        # 排序：items 按日期倒序
+        items.sort(key=lambda x: x.get("date", ""), reverse=True)
+
+        # sender top N
+        by_sender = []
+        if group_by == "sender":
+            for addr, count in sender_counter.most_common(limit if limit > 0 else None):
+                by_sender.append({
+                    "addr": addr,
+                    "name": sender_names.get(addr, ""),
+                    "count": count,
+                })
+
+        total = sum(by_status.values())
+        logger.info("MailCache.query_stats: total=%d", total)
+        return {
+            "total": total,
+            "by_status": by_status,
+            "by_sender": by_sender,
+            "items": items[:limit] if limit > 0 and group_by is None else items,
+            "matched_ids": matched_ids,
+        }
 
     # ── 正文暂存 + ingest 队列 (fetch → ingest 单一事实源) ──
 

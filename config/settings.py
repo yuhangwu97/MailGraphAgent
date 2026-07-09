@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     ragflow_api_key: str = Field(default="", alias="RAGFLOW_API_KEY")
     # 空 = 用 RAGFlow 租户默认 embedding；否则须为 <model_name>@<provider> 格式
     ragflow_embedding_model: str = Field(default="", alias="RAGFLOW_EMBEDDING_MODEL")
+    # RAGFlow 聊天模型，格式 <model_name>@<instance_name>@<provider_name>
+    ragflow_chat_model: str = Field(default="", alias="RAGFLOW_CHAT_MODEL")
 
     # ── RAGFlow GraphRAG ──
     ragflow_dataset_name: str = Field(default="MailGraph", alias="RAGFLOW_DATASET_NAME")

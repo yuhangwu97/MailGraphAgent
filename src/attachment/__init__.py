@@ -1,23 +1,11 @@
 """
 附件处理模块
-支持 PDF、Word、Excel、纯文本等多种文件格式的解析
+附件由 RAGFlow DeepDoc 服务端统一解析，本模块仅保留 RAGFlow 客户端。
 """
 
-from .extractor import AttachmentExtractor, FileType
-from .parsers import (
-    parse_pdf,
-    parse_docx,
-    parse_excel,
-    parse_text,
-    extract_and_parse_zip,
-)
+from .ragflow_client import RAGFlowClient, get_ragflow_client
 
 __all__ = [
-    "AttachmentExtractor",
-    "FileType",
-    "parse_pdf",
-    "parse_docx",
-    "parse_excel",
-    "parse_text",
-    "extract_and_parse_zip",
+    "RAGFlowClient",
+    "get_ragflow_client",
 ]

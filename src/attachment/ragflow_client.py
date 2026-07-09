@@ -37,6 +37,26 @@ ENTITY_TYPE_MAP = {
 }
 
 
+def _norm_data(data, key: str = "", default=None):
+    """兼容 RAGFlow API 返回 data 可能是 dict 或 list[dict] 两种格式。
+
+    - 无 key 时返回规范化的 dict/list 本身（list 取首元素，dict 原样）
+    - 有 key 时从 dict 中取值（list 则从首元素 dict 中取）
+    """
+    if data is None:
+        return default
+    if isinstance(data, list):
+        if not data:
+            return default
+        item = data[0]
+        if not isinstance(item, dict):
+            return default
+        return item.get(key, default) if key else item
+    if isinstance(data, dict):
+        return data.get(key, default) if key else data
+    return default
+
+
 class RAGFlowClient:
     """RAGFlow API 客户端 — 知识库管理 + 文档解析 + 语义检索"""
 
@@ -94,13 +114,14 @@ class RAGFlowClient:
                 "chunk_token_num": 1024,
                 "delimiter": "\n\n",  # 按段落切，避免邮件单换行过碎
                 "graphrag": self._graphrag_config(),
+                "llm_id": self.cfg.ragflow_chat_model,  # GraphRAG 实体提取用
             },
         }
         if self.cfg.ragflow_embedding_model:
             payload["embedding_model"] = self.cfg.ragflow_embedding_model
         resp = self._api("POST", "/datasets", json=payload)
         if resp.get("code") == 0:
-            self.dataset_id = resp["data"]["id"]
+            self.dataset_id = _norm_data(resp.get("data"), "id")
             logger.info("RAGFlow 知识库已创建: %s", self.dataset_id)
             return self.dataset_id
         logger.warning("创建知识库失败: %s", resp.get("message", ""))
@@ -144,12 +165,7 @@ class RAGFlowClient:
                 resp = requests.post(url, headers=headers, files=files, timeout=60)
                 data = resp.json()
                 if data.get("code") == 0:
-                    # RAGFlow returns data as list for multipart upload
-                    result = data["data"]
-                    if isinstance(result, list) and result:
-                        doc_id = result[0]["id"]
-                    else:
-                        doc_id = result.get("id", "") if isinstance(result, dict) else ""
+                    doc_id = _norm_data(data.get("data"), "id")
                     if doc_id:
                         logger.info("文档已上传: %s → %s", filename, doc_id)
                         return doc_id
@@ -210,10 +226,11 @@ class RAGFlowClient:
                                      files={"file": (fname, f)}, timeout=60)
                 data = resp.json()
                 if data.get("code") == 0:
-                    doc_id = data["data"]["id"]
-                    logger.info("文件已上传: %s → %s", fname, doc_id)
-                    return doc_id
-                logger.warning("上传文件失败: %s", data.get("message", ""))
+                    doc_id = _norm_data(data.get("data"), "id")
+                    if doc_id:
+                        logger.info("文件已上传: %s → %s", fname, doc_id)
+                        return doc_id
+                logger.warning("上传文件失败: %s — %s", fname, data.get("message", ""))
         except Exception as e:
             logger.error("上传文件异常: %s", e)
         return None
@@ -289,7 +306,7 @@ class RAGFlowClient:
         })
         if resp.get("code") == 0:
             chunks = []
-            for c in resp.get("data", {}).get("chunks", []):
+            for c in _norm_data(resp.get("data"), "chunks", []):
                 chunks.append({
                     # 检索响应里正文字段可能是 content / content_with_weight
                     "content": c.get("content", c.get("content_with_weight", "")),
@@ -311,24 +328,33 @@ class RAGFlowClient:
         # 名字带 dataset_id，保证多账号各自独立的 chat assistant 不互相命中
         name = name or f"mailgraph-assistant-{self.dataset_id}"
 
-        # 先查已有同名助手
+        # 先查已有同名助手（兼容 RAGFlow 返回 list[dict] 或 list[str]）
         resp = self._api("GET", "/chats", params={"name": name, "page": 1, "page_size": 30})
         if resp.get("code") == 0:
             for c in resp.get("data", []) or []:
-                if c.get("name") == name:
-                    self.chat_id = c["id"]
+                if isinstance(c, dict):
+                    if c.get("name") == name:
+                        self.chat_id = c["id"]
+                        logger.info("使用已有 chat assistant: %s", self.chat_id)
+                        return self.chat_id
+                elif isinstance(c, str):
+                    # RAGFlow 某些版本返回纯 id 列表，无法按名匹配，
+                    # 直接复用第一个（dataset 隔离下不会串）
+                    self.chat_id = c
                     logger.info("使用已有 chat assistant: %s", self.chat_id)
                     return self.chat_id
 
-        # 不存在则创建，绑定当前 dataset
+        # 不存在则创建，绑定当前 dataset + 指定 llm_id
         resp = self._api("POST", "/chats", json={
             "name": name,
             "dataset_ids": [self.dataset_id],
+            "llm_id": self.cfg.ragflow_chat_model,
         })
         if resp.get("code") == 0:
-            self.chat_id = resp["data"]["id"]
-            logger.info("已创建 chat assistant: %s", self.chat_id)
-            return self.chat_id
+            self.chat_id = _norm_data(resp.get("data"), "id", "")
+            if self.chat_id:
+                logger.info("已创建 chat assistant: %s", self.chat_id)
+                return self.chat_id
         logger.warning("创建 chat assistant 失败: %s", resp.get("message", ""))
         return None
 
@@ -347,7 +373,7 @@ class RAGFlowClient:
         url = f"{self.base_url}/api/v1/openai/{cid}/chat/completions"
         try:
             resp = requests.post(url, headers=self.headers, json={
-                "model": "ragflow",
+                "model": self.cfg.ragflow_chat_model,
                 "messages": [{"role": "user", "content": question}],
                 "stream": False,
                 "extra_body": {"reference": True},
@@ -383,7 +409,7 @@ class RAGFlowClient:
         if not self.dataset_id:
             return False
         try:
-            resp = self._api("PUT", f"/datasets/{self.dataset_id}",
+            resp = self._api("PATCH", f"/datasets/{self.dataset_id}",
                              json={"parser_config": {"graphrag": self._graphrag_config()}})
             if resp.get("code") == 0:
                 logger.info("GraphRAG 已启用: %s", self.dataset_id)
@@ -398,12 +424,14 @@ class RAGFlowClient:
         """显式触发 GraphRAG 建图（解析完成后调用），用数据集已配置的 graphrag 设置。
 
         返回是否成功触发；建图进度由 wait_for_graphrag 轮询。
+
+        RAGFlow v0.26+ 使用 POST /index?type=graph（旧 /run_graphrag 已废弃且不持久化结果）。
         """
         if not self.dataset_id:
             return False
-        resp = self._api("POST", f"/datasets/{self.dataset_id}/run_graphrag")
+        resp = self._api("POST", f"/datasets/{self.dataset_id}/index?type=graph")
         if resp.get("code") == 0:
-            tid = resp.get("data", {}).get("graphrag_task_id", "")
+            tid = _norm_data(resp.get("data"), "task_id", "")
             logger.info("已触发 GraphRAG 建图 (task=%s)", tid)
             return True
         logger.warning("触发 GraphRAG 建图失败: %s", resp.get("message", ""))
@@ -418,9 +446,9 @@ class RAGFlowClient:
             return False
         start = time.time()
         while time.time() - start < timeout:
-            resp = self._api("GET", f"/datasets/{self.dataset_id}/trace_graphrag")
+            resp = self._api("GET", f"/datasets/{self.dataset_id}/index?type=graph")
             if resp.get("code") == 0:
-                data = resp.get("data", {}) or {}
+                data = _norm_data(resp.get("data")) or {}
                 progress = data.get("progress")
                 if progress is not None:
                     try:
@@ -438,14 +466,36 @@ class RAGFlowClient:
         logger.warning("GraphRAG 建图等待超时 (%ds)", timeout)
         return False
 
+    def build_graph(self, timeout: int = 300, on_progress=None) -> dict:
+        """一键触发 GraphRAG 建图并等待完成（供 Web UI 手动触发）。
+
+        Returns:
+            {"ok": bool, "message": str, "task_id": str|None}
+        """
+        if not self.dataset_id:
+            return {"ok": False, "message": "未设置知识库 ID", "task_id": None}
+        if not self.run_graphrag():
+            return {"ok": False, "message": "触发 GraphRAG 建图失败", "task_id": None}
+        if on_progress:
+            on_progress("GraphRAG 建图任务已触发，等待完成...")
+        ok = self.wait_for_graphrag(timeout=timeout)
+        if ok:
+            if on_progress:
+                on_progress("GraphRAG 图谱构建完成")
+            return {"ok": True, "message": "GraphRAG 图谱构建完成", "task_id": None}
+        else:
+            if on_progress:
+                on_progress("GraphRAG 建图超时或失败，可稍后重试")
+            return {"ok": False, "message": "GraphRAG 建图超时或失败", "task_id": None}
+
     def _get_knowledge_graph(self) -> dict:
         """获取 RAGFlow 知识图谱（实体 + 关系 + 思维导图）"""
         if not self.dataset_id:
             return {}
         try:
-            resp = self._api("GET", f"/datasets/{self.dataset_id}/knowledge_graph")
+            resp = self._api("GET", f"/datasets/{self.dataset_id}/graph")
             if resp.get("code") == 0:
-                return resp.get("data", {}).get("graph", {})
+                return _norm_data(resp.get("data"), "graph", {})
         except Exception as e:
             logger.warning("获取知识图谱失败: %s", e)
         return {}
@@ -483,9 +533,24 @@ class RAGFlowClient:
         all_rels = []
         # 整图返回，page_size 客户端截断
         for rel in (raw_rels or [])[:page_size]:
+            # RAGFlow GraphRAG: src_id/tgt_id 是实体 ID（字符串），
+            # source_id/target_id 是文档 ID 列表，优先用前者
+            src = rel.get("src_id") or rel.get("source") or ""
+            tgt = rel.get("tgt_id") or rel.get("target") or ""
+            if isinstance(src, list):
+                src = src[0] if src else ""
+            if isinstance(tgt, list):
+                tgt = tgt[0] if tgt else ""
+            # 兼容旧格式：source_id 可能是字符串
+            src_fallback = rel.get("source_id", "")
+            tgt_fallback = rel.get("target_id", "")
+            if isinstance(src_fallback, str) and src_fallback and not src:
+                src = src_fallback
+            if isinstance(tgt_fallback, str) and tgt_fallback and not tgt:
+                tgt = tgt_fallback
             all_rels.append({
-                "source_id": rel.get("source_id", rel.get("src_id", "")),
-                "target_id": rel.get("target_id", rel.get("tgt_id", "")),
+                "source_id": src,
+                "target_id": tgt,
                 "type": rel.get("type", rel.get("relation_type", "RELATED_TO")),
                 "properties": {k: v for k, v in rel.items()
                               if k not in ("source_id", "src_id", "target_id", "tgt_id", "type", "relation_type")},

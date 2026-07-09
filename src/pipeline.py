@@ -159,7 +159,6 @@ class Pipeline:
         log = on_log or (lambda m: logger.info(m))
         rf = get_ragflow_client(self.account_id)
         rf.get_or_create_dataset(self.dataset_name)
-        rf.enable_graphrag()
 
         cache = MailCache(self.account_id)
         stats = {"total": 0, "uploaded": 0, "failed": 0, "attachments": 0}
@@ -213,18 +212,14 @@ class Pipeline:
                     stats["failed"] += 1
                     logger.error(f"  [{i+1}] ✗ {subj}: {e}")
 
-            # 3) 触发解析 → 等分块完成 → 显式建 GraphRAG → 等图建完
+            # 3) 触发解析（向量化 + GraphRAG 实体提取同步完成）
             if doc_ids:
-                log(f"触发 RAGFlow 解析 {len(doc_ids)} 个文档...")
+                log(f"触发 RAGFlow 解析 {len(doc_ids)} 个文档（含 GraphRAG 建图）...")
                 rf.start_parsing(doc_ids)
                 if rf.wait_for_parsing(doc_ids):
-                    log("解析完成，触发 GraphRAG 建图...")
-                    if rf.run_graphrag() and rf.wait_for_graphrag():
-                        log("GraphRAG 图谱已更新")
-                    else:
-                        log("⚠ GraphRAG 建图未完成（触发失败或超时），可稍后重试")
+                    log("解析完成，GraphRAG 图谱已同步构建")
                 else:
-                    log("⚠ 文档解析超时，本轮跳过建图")
+                    log("⚠ 文档解析超时，可稍后重试")
         finally:
             cache.close()
 
