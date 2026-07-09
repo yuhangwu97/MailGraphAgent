@@ -12,6 +12,14 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_id(s: str) -> str:
+    """把 Message-ID/主题清洗成安全的文件名片段"""
+    import re
+    s = re.sub(r"[^0-9A-Za-z一-鿿]+", "_", (s or "").strip("<>"))
+    return s.strip("_")[:40]
+
+
 # RAGFlow GraphRAG 实体类型 → 业务实体类型映射
 ENTITY_TYPE_MAP = {
     "organization": "Company",
@@ -44,9 +52,20 @@ class RAGFlowClient:
 
     def __init__(self):
         cfg = get_settings()
+        self.cfg = cfg
         self.base_url = cfg.ragflow_base_url.rstrip("/")  # http://localhost:9380
         self.api_key = cfg.ragflow_api_key or ""
         self.dataset_id: Optional[str] = None
+
+    def _graphrag_config(self) -> dict:
+        """组装 GraphRAG parser_config.graphrag（跨文档统一建图）"""
+        return {
+            "use_graphrag": True,
+            "method": self.cfg.ragflow_graphrag_method,       # light | general
+            "entity_types": list(self.cfg.ragflow_entity_types),
+            "resolution": bool(self.cfg.ragflow_graphrag_resolution),
+            "community": bool(self.cfg.ragflow_graphrag_community),
+        }
 
     @property
     def headers(self) -> dict:
@@ -83,12 +102,11 @@ class RAGFlowClient:
             "parser_config": {
                 "chunk_token_num": 1024,
                 "delimiter": "\n",
-                "graphrag": {"use_graphrag": True},
+                "graphrag": self._graphrag_config(),
             },
         }
-        cfg = get_settings()
-        if cfg.ragflow_embedding_model:
-            payload["embedding_model"] = cfg.ragflow_embedding_model
+        if self.cfg.ragflow_embedding_model:
+            payload["embedding_model"] = self.cfg.ragflow_embedding_model
         resp = self._api("POST", "/datasets", json=payload)
         if resp.get("code") == 0:
             self.dataset_id = resp["data"]["id"]
@@ -154,7 +172,6 @@ class RAGFlowClient:
                 pass
         return None
 
-    def upload_file(self, file_path: str, filename: str = None) -> Optional[str]:
     def start_parsing(self, document_ids: list[str]) -> bool:
         """触发文档解析（上传后需要手动触发）"""
         if not self.dataset_id or not document_ids:
@@ -280,12 +297,12 @@ class RAGFlowClient:
     # ═══════════════════════════════════════
 
     def enable_graphrag(self) -> bool:
-        """确认/启用 GraphRAG（parser_config.graphrag.use_graphrag）"""
+        """确认/启用 GraphRAG，并同步 method/entity_types/resolution 等配置"""
         if not self.dataset_id:
             return False
         try:
             resp = self._api("PUT", f"/datasets/{self.dataset_id}",
-                             json={"parser_config": {"graphrag": {"use_graphrag": True}}})
+                             json={"parser_config": {"graphrag": self._graphrag_config()}})
             if resp.get("code") == 0:
                 logger.info("GraphRAG 已启用: %s", self.dataset_id)
                 return True
@@ -405,15 +422,18 @@ class RAGFlowClient:
         return parsed
 
     # ═══════════════════════════════════════
-    # 知识库导入 — 邮件提取结果
+    # 知识库导入 — 邮件原文（GraphRAG 单遍建图）
     # ═══════════════════════════════════════
 
-    def upload_email_extraction(self, metadata: dict, extraction: dict) -> Optional[str]:
-        """上传 AI 提取结果到 RAGFlow 知识库（作为结构化文档）
+    def upload_email(self, mail: dict) -> Optional[str]:
+        """上传一封清洗后的邮件（原文）到知识库，交给 GraphRAG 抽取实体/关系。
+
+        不再做 OpenAI 结构化提取再拍平——直接把干净的邮件文本作为一个文档上传，
+        由 RAGFlow GraphRAG（跨文档统一图）单遍抽取实体与关系。
 
         Args:
-            metadata: 邮件元数据 {message_id, subject, from_addr, date, ...}
-            extraction: OpenAI 提取的 JSON 结果
+            mail: {message_id, subject, from_addr, from_name, to_addrs, cc_addrs,
+                   date, cleaned_body} 等字段
 
         Returns:
             document_id 或 None
@@ -422,82 +442,37 @@ class RAGFlowClient:
             logger.warning("未设置知识库 ID")
             return None
 
-        # 构建结构化文档内容 — 让 RAGFlow GraphRAG 更好地识别实体和关系
-        parts = []
-        mid = metadata.get("message_id", "")
-        subject = metadata.get("subject", "")
-        from_addr = metadata.get("from_addr", "")
-        date_str = metadata.get("date", "")
+        mid = mail.get("message_id", "")
+        subject = mail.get("subject", "")
+        from_addr = mail.get("from_addr", "")
+        from_name = mail.get("from_name", "")
+        to_addrs = mail.get("to_addrs", []) or []
+        cc_addrs = mail.get("cc_addrs", []) or []
+        date_str = mail.get("date", "")
+        body = mail.get("cleaned_body", "") or ""
 
-        parts.append(f"# 邮件: {subject}")
-        parts.append(f"发件人: {from_addr}")
-        parts.append(f"日期: {date_str}")
-        parts.append(f"Message-ID: {mid}")
+        # 组装成结构清晰的纯文本，帮助 GraphRAG 识别往来双方与主题
+        parts = [
+            f"# 邮件：{subject}",
+            f"发件人：{from_name} <{from_addr}>" if from_name else f"发件人：{from_addr}",
+            f"收件人：{', '.join(to_addrs)}" if to_addrs else "",
+            f"抄送：{', '.join(cc_addrs)}" if cc_addrs else "",
+            f"日期：{date_str}",
+            f"Message-ID：{mid}",
+            "",
+            "## 正文",
+            body,
+        ]
+        content = "\n".join(p for p in parts if p != "")
+        filename = f"mail_{_safe_id(mid) or _safe_id(subject)}.md"
 
-        company = extraction.get("company", {}) or {}
-        if company.get("name"):
-            parts.append(f"\n## 客户公司")
-            parts.append(f"公司名称: {company['name']}")
-            if company.get("aliases"):
-                parts.append(f"别名: {', '.join(company['aliases'])}")
-
-        contacts = extraction.get("contacts", [])
-        if contacts:
-            parts.append(f"\n## 外部对接人")
-            for c in contacts:
-                parts.append(f"- {c.get('name','')} ({c.get('role','')}, {c.get('email','')})")
-
-        owners = extraction.get("internal_owners", [])
-        if owners:
-            parts.append(f"\n## 内部负责人")
-            for o in owners:
-                parts.append(f"- {o.get('name','')} ({o.get('role','')}, {o.get('department','')})")
-
-        projects = extraction.get("projects", [])
-        if projects:
-            parts.append(f"\n## 项目")
-            for p in projects:
-                parts.append(f"- {p.get('name','')} (状态: {p.get('status','')})")
-                if p.get("progress"):
-                    parts.append(f"  进度: {p['progress']}")
-                if p.get("risk_points"):
-                    parts.append(f"  风险: {', '.join(p['risk_points'])}")
-
-        if extraction.get("summary"):
-            parts.append(f"\n## 摘要\n{extraction['summary']}")
-
-        content = "\n".join(parts)
-        filename = f"mail_{mid[:32]}.md"
-
-        # 上传为结构化文档
         return self.upload_document(content, filename, metadata={
             "message_id": mid,
             "subject": subject,
             "from_addr": from_addr,
-            "type": "email_extraction",
+            "date": date_str,
+            "type": "email",
         })
-
-    def upload_batch_extractions(self, extractions: list[dict]) -> list[str]:
-        """批量上传提取结果
-
-        Args:
-            extractions: [{metadata: {...}, extraction: {...}}, ...]
-
-        Returns:
-            成功上传的 document_id 列表
-        """
-        doc_ids = []
-        for item in extractions:
-            doc_id = self.upload_email_extraction(
-                item.get("metadata", {}),
-                item.get("extraction", {}),
-            )
-            if doc_id:
-                doc_ids.append(doc_id)
-        logger.info("批量上传完成: %d/%d", len(doc_ids), len(extractions))
-        if doc_ids:
-            self.start_parsing(doc_ids)
-        return doc_ids
 
 
 # 全局单例
