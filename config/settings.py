@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     # 空 = 用 RAGFlow 租户默认 embedding；否则须为 <model_name>@<provider> 格式
     ragflow_embedding_model: str = Field(default="", alias="RAGFLOW_EMBEDDING_MODEL")
 
+    # ── RAGFlow GraphRAG ──
+    ragflow_dataset_name: str = Field(default="MailGraph", alias="RAGFLOW_DATASET_NAME")
+    # GraphRAG 抽取提示词方案: light(LightRAG, 省 token) | general(微软 GraphRAG, 含社区报告)
+    ragflow_graphrag_method: str = Field(default="light", alias="RAGFLOW_GRAPHRAG_METHOD")
+    # GraphRAG 要抽取的实体类型（跨文档统一建图）
+    ragflow_entity_types: list[str] = Field(
+        default=["organization", "person", "project"],
+        description="GraphRAG 抽取的实体类型",
+    )
+    # 实体消解开关：合并 dataset 内相似实体（跨文档去重/对齐）
+    ragflow_graphrag_resolution: bool = Field(default=True, alias="RAGFLOW_GRAPHRAG_RESOLUTION")
+    # 社区报告：light 方案通常不需要，关掉省 token
+    ragflow_graphrag_community: bool = Field(default=False, alias="RAGFLOW_GRAPHRAG_COMMUNITY")
+
     # ── 应用配置 ──
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -57,6 +71,10 @@ class Settings(BaseSettings):
     cache_db_path: str = Field(default="./data/cache.db", description="SQLite 缓存数据库路径")
     attachments_dir: str = Field(default="./data/attachments", description="附件保存目录")
     max_retries: int = Field(default=3, description="IMAP 连接最大重试次数")
+
+    # ── 正文暂存 (Redis) ──
+    # fetch 与 ingest 之间在 Redis 暂存正文的存活天数（即用即删，跑完批即过期）
+    fetched_body_ttl_days: int = Field(default=7, description="Redis 暂存正文存活天数")
 
     # ── 文本处理配置 ──
     enable_noise_filter: bool = Field(default=True, description="是否启用噪音过滤")
