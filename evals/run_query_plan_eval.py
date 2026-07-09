@@ -112,6 +112,10 @@ def _sender_for(question: str) -> str | None:
             name = m.group(1).strip(" 的")
             if name and name not in stop and not any(w in name for w in ("邮件", "附件", "失败", "哪些")):
                 return name
+    fallback = cleaned.strip(" 的邮件有哪些多少？?，,。")
+    if 2 <= len(fallback) <= 12 and fallback not in stop and not any(
+            w in fallback for w in ("邮件", "附件", "失败", "哪些")):
+        return fallback
     return None
 
 
