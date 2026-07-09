@@ -1,7 +1,11 @@
 """
 Redis 进度缓存
 轻量级邮件处理进度追踪，替代原来的 MySQL 缓存。
+
+同时作为 fetch → ingest 之间的正文暂存（单一事实源，替代 JSON 文件中转）：
+正文带 TTL 存于 Redis，待入库的 message_id 放入 ingest 队列（set）。
 """
+import json
 import time
 import logging
 import redis
@@ -15,6 +19,7 @@ class MailCache:
 
     def __init__(self):
         cfg = get_settings()
+        self._cfg = cfg
         self._r = redis.Redis(
             host=cfg.redis_host,
             port=cfg.redis_port,
@@ -24,6 +29,7 @@ class MailCache:
             socket_connect_timeout=5,
         )
         self._prefix = "mailgraph:"
+        self._body_ttl = int(cfg.fetched_body_ttl_days) * 86400
 
     @property
     def r(self) -> redis.Redis:
@@ -95,6 +101,73 @@ class MailCache:
             else:
                 stats["pending"] += 1
         return stats
+
+    # ── 正文暂存 + ingest 队列 (fetch → ingest 单一事实源) ──
+
+    def store_mail(self, mail: dict):
+        """暂存一封已清洗邮件的完整正文/元数据（带 TTL），并加入 ingest 队列。
+
+        mail 需含 message_id；其余字段（subject/from_addr/to_addrs/cc_addrs/
+        date/cleaned_body/attachments/folder/uid）原样存储。
+        """
+        mid = mail.get("message_id", "")
+        if not mid:
+            return
+        self.r.setex(self._k("body", mid), self._body_ttl,
+                     json.dumps(mail, ensure_ascii=False))
+        self.r.sadd(self._k("ingest_queue"), mid)
+
+    def get_mail(self, message_id: str) -> dict | None:
+        """取出暂存的邮件正文，过期或不存在返回 None"""
+        raw = self.r.get(self._k("body", message_id))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def list_pending_ingest(self) -> list[str]:
+        """列出待入库的 message_id（正文仍在 TTL 内的才有效）"""
+        return list(self.r.smembers(self._k("ingest_queue")))
+
+    def iter_pending_mails(self):
+        """迭代待入库邮件（正文已过期的自动从队列剔除）"""
+        for mid in self.list_pending_ingest():
+            mail = self.get_mail(mid)
+            if mail is None:
+                # 正文已过期，清理队列残留
+                self.r.srem(self._k("ingest_queue"), mid)
+                continue
+            yield mail
+
+    def mark_ingested(self, message_id: str, doc_id: str = "", drop_body: bool = True):
+        """标记已入库：出队、记录 doc_id、可选删除正文（即用即删）"""
+        self.r.srem(self._k("ingest_queue"), message_id)
+        key = self._k("mail", message_id)
+        self.r.hset(key, mapping={
+            "status": "done", "ragflow_doc_id": doc_id,
+            "updated_at": str(time.time()),
+        })
+        self.r.setex(self._k("mail", message_id, "done"), 30 * 86400, "1")
+        if drop_body:
+            self.r.delete(self._k("body", message_id))
+
+    def list_recent_mails(self, limit: int = 50) -> list[dict]:
+        """列出最近暂存的邮件正文（供前端工作台展示）"""
+        mails = []
+        for key in self.r.scan_iter(match=self._k("body", "*")):
+            raw = self.r.get(key)
+            if not raw:
+                continue
+            try:
+                mails.append(json.loads(raw))
+            except Exception:
+                pass
+            if len(mails) >= limit:
+                break
+        mails.sort(key=lambda m: m.get("date", ""), reverse=True)
+        return mails
 
     # ── 抓取进度 ──
 

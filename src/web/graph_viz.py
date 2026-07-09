@@ -10,24 +10,25 @@ from pyvis.network import Network
 logger = logging.getLogger(__name__)
 
 # Color scheme for each entity type (business types + RAGFlow native types)
+# 石墨中性调色：克制土系（公司=墨绿 / 联系人=古铜 / 项目=砖红 / 内部=石墨）
 NODE_COLORS = {
-    "Company": "#2563EB",
-    "Contact": "#10B981",
-    "Employee": "#F59E0B",
-    "Project": "#EF4444",
-    "Email": "#8B5CF6",
-    "Department": "#06B6D4",
-    "Attachment": "#F97316",
+    "Company": "#1F6F5C",
+    "Contact": "#C08A3E",
+    "Employee": "#4A5568",
+    "Project": "#9A3B2E",
+    "Email": "#7A756E",
+    "Department": "#4A7C8A",
+    "Attachment": "#B4791F",
     # RAGFlow GraphRAG native entity types
-    "Organization": "#2563EB",
-    "Person": "#10B981",
-    "Location": "#06B6D4",
-    "Event": "#F97316",
-    "Entity": "#94A3B8",
+    "Organization": "#1F6F5C",
+    "Person": "#C08A3E",
+    "Location": "#4A7C8A",
+    "Event": "#B4791F",
+    "Entity": "#A8A29E",
 }
 
 KNOWN_TYPES = list(NODE_COLORS.keys())
-DEFAULT_NODE_COLOR = "#95A5A6"
+DEFAULT_NODE_COLOR = "#A8A29E"
 
 
 def build_pyvis_network_from_ragflow(
@@ -142,7 +143,7 @@ def build_pyvis_network_from_ragflow(
                 "shape": "dot"
             },
             "edges": {
-                "color": {"color": "#CBD5E1", "highlight": "#2563EB", "hover": "#2563EB"},
+                "color": {"color": "#D6D3CE", "highlight": "#1F6F5C", "hover": "#1F6F5C"},
                 "width": 1.5,
                 "selectionWidth": 2,
                 "smooth": {"enabled": true, "type": "continuous"},

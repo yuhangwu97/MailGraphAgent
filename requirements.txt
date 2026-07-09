@@ -18,7 +18,7 @@ openpyxl>=3.1.0
 pyvis>=0.3.0
 
 # Web
-streamlit>=1.30.0
+streamlit>=1.31.0
 
 # HTTP retry
 tenacity>=8.0.0

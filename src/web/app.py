@@ -3,7 +3,7 @@ MailGraphAgent — 企业邮件关系分析平台 v3.0
 ============================================
 现代 SaaS 风格 Streamlit 前端。RAGFlow GraphRAG 为核心引擎。
 """
-import sys, json, time, logging, subprocess
+import sys, json, time, re, logging, subprocess
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="MailGraph — 企业邮件关系分析",
-    page_icon="◈",
+    page_icon="✉️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -31,19 +31,23 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 :root {
-  --p: #2563EB; --p-hover: #1D4ED8; --p-light: #EFF6FF; --p-ring: #BFDBFE;
-  --bg: #F8FAFC; --surface: #FFFFFF; --border: #E2E8F0; --border-light: #F1F5F9;
-  --t1: #0F172A; --t2: #334155; --t3: #475569; --t4: #94A3B8; --t5: #CBD5E1;
-  --green: #10B981; --green-bg: #ECFDF5; --green-t: #065F46;
-  --amber: #F59E0B; --amber-bg: #FFFBEB; --amber-t: #92400E;
-  --red: #EF4444; --red-bg: #FEF2F2; --red-t: #991B1B;
-  --purple: #8B5CF6; --purple-bg: #F5F3FF; --purple-t: #5B21B6;
-  --cyan: #06B6D4; --cyan-bg: #ECFEFF; --cyan-t: #155E75;
+  /* 石墨中性：暖白底 + 沉墨绿 accent（变量名沿用，值全部重映射） */
+  --p: #1F6F5C; --p-hover: #1A5C4C; --p-light: #EAF3F0; --p-ring: #C4E0D7;
+  --bg: #FAFAF9; --surface: #FFFFFF; --surface-2: #F5F4F2; --border: #E7E5E1; --border-light: #F0EFEC;
+  --t1: #14110F; --t2: #3D3A36; --t3: #57534E; --t4: #A8A29E; --t5: #D6D3CE;
+  --green: #2E9E6E; --green-bg: #E7F4EE; --green-t: #1A5C4C;
+  --amber: #B4791F; --amber-bg: #F7EFE0; --amber-t: #7A4E12;
+  --red: #9A3B2E; --red-bg: #F4E9E6; --red-t: #6E2A20;
+  --purple: #4A5568; --purple-bg: #EEF0F2; --purple-t: #2D3748;
+  --cyan: #4A7C8A; --cyan-bg: #E9F0F2; --cyan-t: #2C4A52;
+  /* 图谱节点：克制土系 */
+  --node-company: #1F6F5C; --node-contact: #C08A3E; --node-project: #9A3B2E; --node-emp: #4A5568;
+  --side: #1A1613;
   --r: 10px; --r-sm: 6px; --r-lg: 14px;
-  --sh-sm: 0 1px 2px rgba(0,0,0,0.04);
-  --sh: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
-  --sh-md: 0 4px 12px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.04);
-  --sh-lg: 0 12px 32px rgba(0,0,0,0.08), 0 4px 8px rgba(0,0,0,0.04);
+  --sh-sm: 0 1px 2px rgba(20,17,15,0.05);
+  --sh: 0 1px 3px rgba(20,17,15,0.07), 0 1px 2px rgba(20,17,15,0.04);
+  --sh-md: 0 6px 16px rgba(20,17,15,0.08), 0 2px 6px rgba(20,17,15,0.04);
+  --sh-lg: 0 14px 34px rgba(20,17,15,0.10), 0 5px 10px rgba(20,17,15,0.05);
   --sidebar-w: 260px;
 }
 * { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
@@ -51,12 +55,12 @@ body { background: var(--bg); }
 
 /* ── 全局布局 ── */
 .main .block-container { padding: 1.5rem 2rem 2rem 2rem; max-width: 1344px; }
-section[data-testid="stSidebar"] { background: #0F172A !important; }
+section[data-testid="stSidebar"] { background: var(--side) !important; }
 section[data-testid="stSidebar"] .block-container { padding: 1rem 0.75rem !important; }
 section[data-testid="stSidebar"] * { color: #E2E8F0 !important; font-family: 'Inter', sans-serif !important; }
 section[data-testid="stSidebar"] button { border-radius: var(--r-sm) !important; border: none !important; text-align: left !important; padding: 0.55rem 0.75rem !important; font-size: 0.84rem !important; font-weight: 500 !important; width: 100% !important; margin-bottom: 2px !important; transition: all 0.15s !important; }
 section[data-testid="stSidebar"] button:hover { background: rgba(255,255,255,0.08) !important; }
-section[data-testid="stSidebar"] button[kind="primary"] { background: rgba(37,99,235,0.25) !important; color: #BFDBFE !important; border-left: 3px solid #2563EB !important; }
+section[data-testid="stSidebar"] button[kind="primary"] { background: rgba(62,158,130,0.20) !important; color: #8FD3BF !important; border-left: 3px solid #3E9E82 !important; }
 section[data-testid="stSidebar"] button[kind="secondary"] { background: transparent !important; color: #CBD5E1 !important; }
 section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.08) !important; margin: 0.6rem 0.25rem !important; }
 section[data-testid="stSidebar"] [data-testid="stCaption"] { color: #94A3B8 !important; font-size: 0.7rem !important; }
@@ -114,7 +118,7 @@ hr { border-color: var(--border) !important; margin: 1.5rem 0 !important; }
   padding: 0.2rem 0.65rem; border-radius: var(--r-sm); margin: 0.15rem 0.35rem 0.15rem 0;
   line-height: 1.5;
 }
-.tag-blue { background: #EFF6FF; color: #1E40AF; }
+.tag-blue { background: var(--p-light); color: var(--p); }
 .tag-green { background: #ECFDF5; color: #065F46; }
 .tag-amber { background: #FFFBEB; color: #92400E; }
 .tag-purple { background: #F5F3FF; color: #5B21B6; }
@@ -263,7 +267,7 @@ def init_ragflow():
     try:
         from src.attachment.ragflow_client import get_ragflow_client
         rf = get_ragflow_client()
-        rf.get_or_create_dataset("MailGraph")
+        rf.get_or_create_dataset(get_settings().ragflow_dataset_name)
         rf.enable_graphrag()
         return rf
     except Exception:
@@ -299,7 +303,7 @@ with st.sidebar:
     st.markdown("""
     <div style="padding:0.25rem 0.5rem 1rem 0.5rem;border-bottom:1px solid rgba(255,255,255,0.08);margin-bottom:0.75rem;">
         <div style="display:flex;align-items:center;gap:10px;">
-            <div style="width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#2563EB,#7C3AED);display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.1rem;font-weight:800;flex-shrink:0;">◈</div>
+            <div style="width:36px;height:36px;border-radius:9px;background:#23795F;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.05rem;font-weight:800;letter-spacing:-0.5px;flex-shrink:0;">M</div>
             <div>
                 <div style="font-size:0.95rem;font-weight:700;color:#F1F5F9;letter-spacing:-0.3px;line-height:1.1;">MailGraph</div>
                 <div style="font-size:0.65rem;color:#64748B;font-weight:500;">企业关系分析平台</div>
@@ -325,7 +329,7 @@ with st.sidebar:
 
     # 导航
     nav_items = [
-        ("query", "🔍", "智能查询"),
+        ("query", "💬", "AI 对话"),
         ("dashboard", "📊", "项目看板"),
         ("workbench", "📬", "邮件工作台"),
         ("graph", "🔗", "关系图谱"),
@@ -359,7 +363,7 @@ with st.sidebar:
                     <span style="color:#F1F5F9;font-weight:600;">{s.get('done', 0)}/{total}</span>
                 </div>
                 <div style="height:3px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden;">
-                    <div style="width:{done_pct:.0f}%;height:100%;background:linear-gradient(90deg,#2563EB,#7C3AED);border-radius:2px;"></div>
+                    <div style="width:{done_pct:.0f}%;height:100%;background:#3E9E82;border-radius:2px;"></div>
                 </div>
             </div>""", unsafe_allow_html=True)
         except:
@@ -392,11 +396,11 @@ def get_kpi_data():
 
 def render_kpi_row(kpi):
     cards = [
-        ("📧", kpi["total_mails"], "邮件总数", "#3B82F6"),
-        ("✅", kpi["done_mails"], "已处理", "#10B981"),
-        ("🔗", kpi["graph_nodes"], "图谱节点", "#8B5CF6"),
-        ("📋", kpi["projects"], "项目数", "#F59E0B"),
-        ("👤", kpi["contacts"], "联系人", "#06B6D4"),
+        ("📧", kpi["total_mails"], "邮件总数", "#4A5568"),
+        ("✅", kpi["done_mails"], "已处理", "#1F6F5C"),
+        ("🔗", kpi["graph_nodes"], "图谱节点", "#7A756E"),
+        ("📋", kpi["projects"], "项目数", "#9A3B2E"),
+        ("👤", kpi["contacts"], "联系人", "#C08A3E"),
     ]
     html = '<div class="kpi-grid">'
     for icon, val, label, color in cards:
@@ -410,148 +414,239 @@ def render_kpi_row(kpi):
     html += '</div>'
     st.markdown(html, unsafe_allow_html=True)
 
+
+def build_result_subgraph(result: dict) -> str:
+    """从查询结果构建 pyvis 子图"""
+    from pyvis.network import Network
+
+    net = Network(height="500px", width="100%", directed=True, bgcolor="#FFFFFF", font_color="#0F172A")
+    entities = result.get("entities", [])
+    relationships = result.get("relationships", [])
+    if not entities:
+        return '<div style="padding:40px;text-align:center;color:#94A3B8;">无图谱数据</div>'
+
+    entity_ids = {e["id"] for e in entities}
+    for ent in entities:
+        eid, etype, name = ent["id"], ent.get("type", "Entity"), ent.get("name", ent["id"])
+        color = NODE_COLORS.get(etype, "#94A3B8")
+        net.add_node(eid, label=str(name)[:20], title=f"<b>{etype}</b><br>{name}<br>{ent.get('description','')[:80]}", color=color, size=18, group=etype)
+
+    for rel in relationships:
+        s, t = rel.get("source_id", ""), rel.get("target_id", "")
+        if s in entity_ids and t in entity_ids:
+            net.add_edge(s, t, title=rel.get("type", ""), color="#CBD5E1")
+
+    net.set_options("""
+    {
+        "nodes":{"font":{"size":11,"face":"Inter,sans-serif","color":"#0F172A","strokeWidth":2,"strokeColor":"#fff"},"borderWidth":2,"shape":"dot"},
+        "edges":{"color":{"color":"#D6D3CE","highlight":"#1F6F5C"},"width":1.5,"smooth":{"enabled":true,"type":"continuous"},"arrows":{"to":{"enabled":true,"scaleFactor":0.5}}},
+        "physics":{"enabled":true,"stabilization":{"iterations":100},"barnesHut":{"gravitationalConstant":-2000,"springLength":200,"springConstant":0.03,"damping":0.6}},
+        "interaction":{"hover":true,"tooltipDelay":50}
+    }
+    """)
+    return net.generate_html()
+
 # ═══════════════════════════════════════════════════════════════
-# PAGE 1: 智能查询（首页）
+# PAGE 1: AI 对话（Claude 风格聊天窗口）
 # ═══════════════════════════════════════════════════════════════
 
-if page == "query":
-    # Hero 搜索区
-    st.markdown("""
-    <div class="hero-section">
-        <div class="hero-icon">🔍</div>
-        <div class="hero-title">探索你的邮件关系网络</div>
-        <div class="hero-subtitle">
-            用自然语言提问，AI 自动通过 <b>GraphRAG 图谱检索</b> + <b>语义搜索</b> 找到答案<br>
-            发现隐藏的客户关系、追踪项目进展、分析沟通模式
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+CHAT_CSS = """
+<style>
+/* 会话区居中收窄，企业级留白 */
+[data-testid="stChatMessage"] {
+    max-width: 820px; margin: 0.35rem auto; padding: 0.35rem 0.25rem;
+    background: transparent !important; border: none !important; box-shadow: none !important;
+}
+[data-testid="stChatMessage"] [data-testid="stChatMessageContent"] { font-size: 0.92rem; line-height: 1.75; color: var(--t2); }
+[data-testid="stChatMessage"] p { line-height: 1.75; }
+/* 用户气泡：中性浅底圆角，贴主流聊天（不用彩色） */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"] {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 11px;
+    padding: 0.7rem 1rem; color: var(--t1);
+}
+/* 头像圆角（内容为 SVG 字标，背景兜底为中性/墨绿） */
+[data-testid="stChatMessageAvatar"] { border-radius: 8px !important; }
+[data-testid="stChatMessageAvatarUser"] { background: var(--surface-2) !important; }
+[data-testid="stChatMessageAvatarAssistant"] { background: var(--p) !important; }
+/* 底部输入框：Claude 主流风格，居中、圆角、阴影 */
+[data-testid="stChatInput"] {
+    max-width: 820px; margin: 0 auto;
+    border-radius: 16px !important; border: 1px solid var(--border) !important;
+    box-shadow: var(--sh-md) !important; background: var(--surface) !important;
+}
+[data-testid="stChatInput"] textarea { font-size: 0.92rem !important; font-family: 'Inter', sans-serif !important; }
+[data-testid="stBottomBlockContainer"] { background: transparent !important; }
+/* 空态欢迎区 */
+.chat-hero { max-width: 720px; margin: 3.5rem auto 1.25rem auto; text-align: center; }
+.chat-hero .ch-logo { width:54px;height:54px;border-radius:13px;background:#23795F;display:flex;align-items:center;justify-content:center;color:#fff;font-size:1.5rem;font-weight:800;letter-spacing:-1px;margin:0 auto 1rem auto;box-shadow:var(--sh-md);}
+.chat-hero .ch-title { font-size: 1.5rem; font-weight: 700; color: var(--t1); letter-spacing:-0.4px; margin-bottom: 0.4rem; }
+.chat-hero .ch-sub { font-size: 0.9rem; color: var(--t3); line-height: 1.6; }
+/* 来源引用 chip */
+.src-chip { display:inline-block; font-size:0.72rem; font-family:'SF Mono','JetBrains Mono',monospace; color:var(--t3); background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:0.1rem 0.5rem; margin:0.15rem 0.3rem 0.15rem 0; }
+</style>
+"""
 
-    # 搜索栏
-    col_q, col_b = st.columns([8, 1])
-    with col_q:
-        question = st.text_input(
-            "query",
-            placeholder="试试: A公司有哪些项目？张总参与了什么？谁负责X项目？还有哪些未完成的项目？",
-            label_visibility="collapsed",
-            key="query_main",
-        )
-    with col_b:
-        search_clicked = st.button("查询", type="primary", width="stretch", key="query_btn", help="执行智能图谱查询")
+# 头像：纯色 SVG 字标（data URI），避免 emoji/AI 图标味
+AVATAR_AI = (
+    "data:image/svg+xml,"
+    "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='64'%20height='64'%3E"
+    "%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%231F6F5C'/%3E"
+    "%3Ctext%20x='32'%20y='45'%20font-family='Arial,sans-serif'%20font-size='34'"
+    "%20font-weight='700'%20fill='white'%20text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E"
+)
+AVATAR_USER = (
+    "data:image/svg+xml,"
+    "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='64'%20height='64'%3E"
+    "%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%23E7E5E1'/%3E"
+    "%3Ctext%20x='32'%20y='44'%20font-family='Arial,sans-serif'%20font-size='28'"
+    "%20fill='%2357534E'%20text-anchor='middle'%3E%E6%88%91%3C/text%3E%3C/svg%3E"
+)
 
-    # 快捷查询
-    quick_queries = [
-        ("🏢 客户公司", "列出所有客户公司及其联系人"),
-        ("📋 进行中项目", "所有进行中的项目及其负责人"),
-        ("👥 联系人网络", "所有外部联系人及其所属公司和参与项目"),
-        ("📊 项目统计", "按状态统计项目数量，列出每个项目的关键人员"),
-        ("⚠️ 风险项目", "找出有风险或进度异常的项目"),
-    ]
-    qcols = st.columns(len(quick_queries))
-    triggered = None
-    for col, (label, q) in zip(qcols, quick_queries):
-        with col:
-            if st.button(label, key=f"qq_{label[:8]}", width="stretch"):
-                triggered = q
+CHAT_SUGGESTIONS = [
+    ("🏢", "客户全景", "列出所有客户公司及其对接人、涉及的项目"),
+    ("📋", "项目进展", "所有项目的当前进展和关键负责人"),
+    ("👥", "人物关系", "某个联系人参与了哪些项目、对接了哪些同事"),
+    ("🔍", "线索追踪", "最近有哪些值得关注的往来或风险信号"),
+]
 
-    query_text = None
-    if search_clicked and question.strip():
-        query_text = question.strip()
-    elif triggered:
-        query_text = triggered
 
-    # KPI 行
-    if not query_text:
-        kpi = get_kpi_data()
-        if any(v > 0 for v in kpi.values()):
-            st.markdown('<div style="margin-top:1.5rem;"></div>', unsafe_allow_html=True)
-            render_kpi_row(kpi)
+def _stream_text(text: str):
+    """把回答按词流式输出，营造主流聊天的打字效果"""
+    for tok in re.findall(r"\S+\s*|\s+", text):
+        yield tok
+        time.sleep(0.008)
 
-    # 查询执行
-    if "query_history" not in st.session_state:
-        st.session_state.query_history = []
 
-    if query_text and query_engine:
-        if query_text not in st.session_state.query_history:
-            st.session_state.query_history.insert(0, query_text)
-            st.session_state.query_history = st.session_state.query_history[:15]
+def _render_reasoning(trace: list):
+    """查询过程（可折叠），映射 GraphRAG 检索链路"""
+    if not trace:
+        return
+    total = sum(s.get("duration_ms", 0) for s in trace)
+    icons = " → ".join(s.get("icon", "•") for s in trace)
+    with st.expander(f"🧭 查询过程　{icons}　·　{total}ms", expanded=False):
+        for s in trace:
+            dot = {"ok": "🟢", "fail": "🔴", "warning": "🟡"}.get(s.get("status"), "⚪")
+            st.markdown(f"{dot} **{s.get('name','')}** · {s.get('duration_ms',0)}ms")
+            if s.get("content"):
+                st.caption(s["content"])
+            if s.get("detail"):
+                st.caption(s["detail"])
 
-        with st.spinner(f"正在分析：「{query_text}」..."):
-            result = query_engine.query(query_text)
 
-        # 流水线
-        st.markdown("### 查询流水线")
-        trace = result.get("trace", [])
-        if trace:
-            html = '<div class="pipeline">'
-            for i, step in enumerate(trace):
-                sc = {"ok": step["color"], "fail": "#EF4444", "warning": "#F59E0B"}.get(step["status"], "#94A3B8")
-                sb = {"ok": "#F0FDF4", "fail": "#FEF2F2", "warning": "#FFFBEB"}.get(step["status"], "#F8FAFC")
-                html += f"""
-                <div class="pipeline-step" style="background:{sb};">
-                    <div class="ps-icon" style="background:{sc};">{step["icon"]}</div>
-                    <div class="ps-body">
-                        <div class="ps-title">{step["name"]}</div>
-                        <div class="ps-detail">{step.get("content","")[:40]}{'…' if len(step.get("content","")) > 40 else ''} · {step.get("duration_ms",0)}ms</div>
-                    </div>
-                </div>"""
-                if i < len(trace) - 1:
-                    html += '<div class="pipeline-arrow">→</div>'
-            html += '</div>'
-            st.markdown(html, unsafe_allow_html=True)
+def _render_results(result: dict):
+    """结果的图谱 / 数据表 / 来源，收进折叠区，保持对话清爽"""
+    entities = result.get("entities") or []
+    rows = result.get("rows") or []
+    chunks = result.get("chunks") or []
+    if not (entities or rows or chunks):
+        return
 
-            # 步骤详情（折叠）
-            for step in trace:
-                with st.expander(f'{step["icon"]} {step["name"]} — {step.get("duration_ms",0)}ms', expanded=False):
-                    st.text(step.get("content", ""))
-                    if step.get("detail"):
-                        st.caption(step["detail"])
+    with st.expander("📊 图谱与数据", expanded=False):
+        tabs = st.tabs(["🔗 关系图谱", "📋 数据表", "📎 来源"])
+        with tabs[0]:
+            if entities:
+                try:
+                    st.components.v1.html(build_result_subgraph(result), height=440, scrolling=False)
+                except Exception as e:
+                    st.caption(f"图谱渲染失败: {e}")
+            else:
+                st.caption("本次未命中图谱实体")
+        with tabs[1]:
+            if rows:
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            else:
+                st.caption("无结构化结果")
+        with tabs[2]:
+            if chunks:
+                for c in chunks[:6]:
+                    doc = c.get("doc_name", "")
+                    st.markdown(f'<span class="src-chip">📄 {doc or "邮件"}</span>', unsafe_allow_html=True)
+                    st.caption((c.get("content", "") or "")[:280])
+            else:
+                st.caption("无引用来源")
 
-        # 结果
-        total_dur = result.get("total_duration_ms", 0)
-        n_rows = result.get("total_rows", 0)
-        st.markdown(f"""
-        <div class="flex-between" style="margin-top:1.5rem;margin-bottom:0.75rem;">
-            <h3 style="margin:0;">查询结果</h3>
-            <span class="text-muted">{n_rows} 条结果 · {total_dur}ms</span>
+
+def _render_history_message(msg: dict):
+    """重绘历史消息"""
+    if msg["role"] == "user":
+        with st.chat_message("user", avatar=AVATAR_USER):
+            st.markdown(msg["content"])
+    else:
+        with st.chat_message("assistant", avatar=AVATAR_AI):
+            result = msg.get("result") or {}
+            _render_reasoning(result.get("trace"))
+            st.markdown(msg["content"])
+            _render_results(result)
+
+
+def render_chat_page():
+    st.markdown(CHAT_CSS, unsafe_allow_html=True)
+
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
+
+    # 底部输入（始终固定在底部，先取值以便决定是否显示空态）
+    prompt = st.chat_input("给 MailGraph 发消息…问客户、项目、人物关系")
+    if not prompt and st.session_state.get("pending_prompt"):
+        prompt = st.session_state.pop("pending_prompt")
+
+    # 顶部工具条：新对话
+    if st.session_state.chat:
+        _, tcol = st.columns([6, 1])
+        with tcol:
+            if st.button("＋ 新对话", key="new_chat", width="stretch"):
+                st.session_state.chat = []
+                st.rerun()
+
+    # 空态：欢迎 + 建议 + 概览（仅当无历史且本轮无新问题）
+    if not st.session_state.chat and not prompt:
+        st.markdown("""
+        <div class="chat-hero">
+            <div class="ch-logo">M</div>
+            <div class="ch-title">你好，我是 MailGraph 助手</div>
+            <div class="ch-sub">基于 RAGFlow GraphRAG 跨文档图谱，用自然语言探索邮件里的<br>客户、对接人、项目与内部负责人关系</div>
         </div>
         """, unsafe_allow_html=True)
 
-        if result.get("error"):
-            st.error(result["error"])
-        elif not result.get("rows"):
-            st.info("未找到匹配结果。请尝试其他问题或先导入邮件数据。")
-        else:
-            t1, t2 = st.tabs(["📋 数据表格", "🔗 关系图谱"])
-            with t1:
-                df = pd.DataFrame(result["rows"])
-                st.dataframe(df, width="stretch", hide_index=True)
-            with t2:
-                if result.get("entities"):
-                    try:
-                        sub_html = build_result_subgraph(result)
-                        st.components.v1.html(sub_html, height=520, scrolling=False)
-                    except Exception as e:
-                        st.caption(f"图谱渲染失败: {e}")
-                else:
-                    st.info("无图谱数据")
-
-        if result.get("answer"):
-            st.markdown(f"""<div class="card" style="margin-top:1rem;">
-                <div class="d-lbl">AI 回答摘要</div>
-                <div style="font-size:0.9rem;color:var(--t2);line-height:1.7;">{result['answer']}</div>
-            </div>""", unsafe_allow_html=True)
-
-    # 查询历史
-    if st.session_state.query_history:
-        with st.sidebar:
-            st.markdown("---")
-            st.caption("📝 最近查询")
-            for h in st.session_state.query_history[:8]:
-                if st.button(h[:30] + ("…" if len(h) > 30 else ""), key=f"hist_{h[:12]}", width="stretch",
-                             type="secondary"):
-                    st.session_state.query_main = h
+        cols = st.columns(len(CHAT_SUGGESTIONS))
+        for col, (icon, title, q) in zip(cols, CHAT_SUGGESTIONS):
+            with col:
+                if st.button(f"{icon}  {title}", key=f"sug_{title}", width="stretch"):
+                    st.session_state.pending_prompt = q
                     st.rerun()
+
+        kpi = get_kpi_data()
+        if any(v > 0 for v in kpi.values()):
+            st.markdown('<div style="max-width:820px;margin:1.5rem auto 0 auto;">', unsafe_allow_html=True)
+            render_kpi_row(kpi)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # 历史消息
+    for msg in st.session_state.chat:
+        _render_history_message(msg)
+
+    if prompt:
+        st.session_state.chat.append({"role": "user", "content": prompt})
+        with st.chat_message("user", avatar=AVATAR_USER):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant", avatar=AVATAR_AI):
+            if query_engine is None:
+                answer = "⚠️ RAGFlow 未连接，无法查询。请先在「系统设置」确认服务状态，并在「邮件工作台」导入邮件。"
+                st.markdown(answer)
+                st.session_state.chat.append({"role": "assistant", "content": answer, "result": {}})
+            else:
+                with st.spinner("检索图谱与语义…"):
+                    result = query_engine.query(prompt)
+                _render_reasoning(result.get("trace"))
+                answer = result.get("answer") or "没找到相关信息。可以换个问法，或先在「邮件工作台」导入更多邮件。"
+                st.write_stream(_stream_text(answer))
+                _render_results(result)
+                st.session_state.chat.append({"role": "assistant", "content": answer, "result": result})
+
+
+if page == "query":
+    render_chat_page()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -560,7 +655,7 @@ if page == "query":
 
 elif page == "dashboard":
     st.markdown('<h2>📊 项目看板</h2>', unsafe_allow_html=True)
-    st.caption("客户公司 → 对接人 → 项目 → 内部负责人 · 全局视图")
+    st.caption("项目 · 关联人员 · 图谱描述 — 数据来自 RAGFlow GraphRAG 跨文档图谱")
 
     if ragflow is None:
         st.warning("RAGFlow 未连接，项目看板不可用。")
@@ -569,84 +664,59 @@ elif page == "dashboard":
         relationships = ragflow.get_graph_relationships(page_size=1000)
 
         projects = [e for e in entities if e.get("type") == "Project"]
-        contacts = {e["id"]: e for e in entities if e.get("type") in ("Contact", "Employee")}
+        people = {e["id"]: e for e in entities if e.get("type") in ("Contact", "Employee")}
+        companies = {e["id"]: e for e in entities if e.get("type") == "Company"}
 
-        # 筛选栏
-        f1, f2 = st.columns([3, 1])
-        with f1:
-            status_filter = st.selectbox(
-                "状态筛选", ["全部", "进行中", "已完成", "停滞", "已取消"],
-                label_visibility="collapsed",
-            )
-        with f2:
-            search_proj = st.text_input("搜索项目", placeholder="项目名称...", label_visibility="collapsed")
+        # 搜索
+        search_proj = st.text_input("搜索项目", placeholder="按项目名称筛选...", label_visibility="collapsed")
 
-        # 构建项目数据
+        # 组装项目 → 关联人员/公司
         proj_data = []
         for p in projects:
-            name = p.get("name", "")
-            desc = p.get("description", "")[:100]
-            # 找关联的联系人和负责人
-            related_people = []
+            related_people, related_companies = [], []
             for r in relationships:
                 if r.get("source_id") == p["id"] or r.get("target_id") == p["id"]:
                     other = r["source_id"] if r["target_id"] == p["id"] else r["target_id"]
-                    if other in contacts:
-                        related_people.append(contacts[other])
-
-            status = "进行中"  # default
-            for prop_k, prop_v in p.get("properties", {}).items():
-                if "status" in prop_k.lower():
-                    status = str(prop_v)
-
+                    if other in people:
+                        related_people.append(people[other])
+                    elif other in companies:
+                        related_companies.append(companies[other])
             proj_data.append({
-                "id": p["id"], "name": name, "description": desc,
-                "status": status, "people": related_people,
-                "properties": p.get("properties", {}),
+                "name": p.get("name", ""),
+                "description": p.get("description", "")[:160],
+                "people": related_people,
+                "companies": related_companies,
             })
 
-        # 筛选
-        if status_filter != "全部":
-            proj_data = [p for p in proj_data if p["status"] == status_filter]
         if search_proj:
             proj_data = [p for p in proj_data if search_proj.lower() in p["name"].lower()]
 
         if not proj_data:
-            st.info("暂无项目数据。请先导入邮件提取结果到知识库。")
+            st.info("暂无项目数据。请先在「邮件工作台」拉取并导入邮件到图谱。")
         else:
-            # KPI 统计
-            total = len(proj_data)
-            active = sum(1 for p in proj_data if p["status"] == "进行中")
-            done = sum(1 for p in proj_data if p["status"] == "已完成")
-            at_risk = sum(1 for p in proj_data if p["status"] in ("停滞", "已取消"))
-
+            # KPI（如实统计，不编造状态）
             st.markdown(f"""
             <div class="kpi-grid">
-                <div class="kpi-card"><div class="kpi-dot" style="background:#3B82F6;"></div><div class="kpi-icon">📋</div><div class="kpi-value">{total}</div><div class="kpi-label">项目总数</div></div>
-                <div class="kpi-card"><div class="kpi-dot" style="background:#10B981;"></div><div class="kpi-icon">🚀</div><div class="kpi-value">{active}</div><div class="kpi-label">进行中</div></div>
-                <div class="kpi-card"><div class="kpi-dot" style="background:#8B5CF6;"></div><div class="kpi-icon">✅</div><div class="kpi-value">{done}</div><div class="kpi-label">已完成</div></div>
-                <div class="kpi-card"><div class="kpi-dot" style="background:#EF4444;"></div><div class="kpi-icon">⚠️</div><div class="kpi-value">{at_risk}</div><div class="kpi-label">需关注</div></div>
+                <div class="kpi-card"><div class="kpi-dot" style="background:#9A3B2E;"></div><div class="kpi-icon">📋</div><div class="kpi-value">{len(projects)}</div><div class="kpi-label">项目</div></div>
+                <div class="kpi-card"><div class="kpi-dot" style="background:#06B6D4;"></div><div class="kpi-icon">👤</div><div class="kpi-value">{len(people)}</div><div class="kpi-label">相关人员</div></div>
+                <div class="kpi-card"><div class="kpi-dot" style="background:#1F6F5C;"></div><div class="kpi-icon">🏢</div><div class="kpi-value">{len(companies)}</div><div class="kpi-label">公司</div></div>
+                <div class="kpi-card"><div class="kpi-dot" style="background:#4A5568;"></div><div class="kpi-icon">🔗</div><div class="kpi-value">{len(relationships)}</div><div class="kpi-label">关系</div></div>
             </div>""", unsafe_allow_html=True)
 
-            # 项目卡片网格
+            # 项目卡片
             st.markdown('<div class="project-grid">', unsafe_allow_html=True)
             for p in proj_data:
-                s_color = {"进行中": "#3B82F6", "已完成": "#10B981", "停滞": "#F59E0B", "已取消": "#EF4444"}.get(p["status"], "#94A3B8")
-                s_badge = {"进行中": "badge-info", "已完成": "badge-success", "停滞": "badge-warning", "已取消": "badge-danger"}.get(p["status"], "badge-neutral")
-                people_str = "、".join(q.get("name", "") for q in p["people"][:4]) or "暂无关联人员"
+                people_str = "、".join(q.get("name", "") for q in p["people"][:5]) or "暂无关联人员"
+                comp_str = "、".join(q.get("name", "") for q in p["companies"][:3])
+                comp_line = f'<div class="pc-meta-item">🏢 {comp_str[:40]}</div>' if comp_str else ""
                 st.markdown(f"""
                 <div class="project-card">
-                    <div class="pc-accent" style="background:{s_color};"></div>
-                    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                        <div class="pc-name">{p['name']}</div>
-                        <span class="badge {s_badge}">{p['status']}</span>
-                    </div>
-                    <div class="pc-desc">{p['description'] or '暂无描述'}</div>
+                    <div class="pc-accent" style="background:#1F6F5C;"></div>
+                    <div class="pc-name">{p['name']}</div>
+                    <div class="pc-desc">{p['description'] or '（图谱暂无描述）'}</div>
                     <div class="pc-meta">
                         <div class="pc-meta-item">👥 {people_str[:40]}{'…' if len(people_str) > 40 else ''}</div>
-                    </div>
-                    <div class="pc-progress-bar">
-                        <div class="pc-progress-fill" style="width:{"{:.0f}".format(min(float(str(p.get("properties", {}).get("progress", p.get("properties", {}).get("progress_percentage", "50"))).replace("%","")) if p.get("properties",{}).get("progress") else 50, 100))}%;background:{s_color};"></div>
+                        {comp_line}
                     </div>
                 </div>""", unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
@@ -658,7 +728,7 @@ elif page == "dashboard":
 
 elif page == "workbench":
     st.markdown('<h2>📬 邮件工作台</h2>', unsafe_allow_html=True)
-    st.caption("拉取邮件、AI 提取实体、导入 RAGFlow 知识库")
+    st.caption("拉取邮件 → 清洗 → 导入 RAGFlow GraphRAG（原文 + 附件，单遍建图）")
 
     if cache is None:
         st.warning("Redis 未连接，请先启动 Docker 服务。")
@@ -669,11 +739,11 @@ elif page == "workbench":
         # KPI
         st.markdown(f"""
         <div class="kpi-grid">
-            <div class="kpi-card"><div class="kpi-dot" style="background:#3B82F6;"></div><div class="kpi-icon">📧</div><div class="kpi-value">{total}</div><div class="kpi-label">邮件总数</div></div>
+            <div class="kpi-card"><div class="kpi-dot" style="background:#4A5568;"></div><div class="kpi-icon">📧</div><div class="kpi-value">{total}</div><div class="kpi-label">邮件总数</div></div>
             <div class="kpi-card"><div class="kpi-dot" style="background:#10B981;"></div><div class="kpi-icon">✅</div><div class="kpi-value">{stats.get('done', 0)}</div><div class="kpi-label">已完成</div></div>
             <div class="kpi-card"><div class="kpi-dot" style="background:#F59E0B;"></div><div class="kpi-icon">⏳</div><div class="kpi-value">{stats.get('pending', 0)}</div><div class="kpi-label">待处理</div></div>
             <div class="kpi-card"><div class="kpi-dot" style="background:#EF4444;"></div><div class="kpi-icon">❌</div><div class="kpi-value">{stats.get('failed', 0)}</div><div class="kpi-label">失败</div></div>
-            <div class="kpi-card"><div class="kpi-dot" style="background:#8B5CF6;"></div><div class="kpi-icon">⏭️</div><div class="kpi-value">{stats.get('skipped', 0)}</div><div class="kpi-label">已跳过</div></div>
+            <div class="kpi-card"><div class="kpi-dot" style="background:#7A756E;"></div><div class="kpi-icon">⏭️</div><div class="kpi-value">{stats.get('skipped', 0)}</div><div class="kpi-label">已跳过</div></div>
         </div>""", unsafe_allow_html=True)
 
         # 工具栏
@@ -686,172 +756,81 @@ elif page == "workbench":
         with op3:
             do_fetch = st.button("📥 拉取", width="stretch", type="primary", key="btn_fetch")
         with op4:
-            pending_count = stats.get("pending", 0) + stats.get("failed", 0)
-            do_process = st.button(f"⚡ 处理 ({pending_count})" if pending_count else "⚡ 处理", width="stretch", disabled=pending_count == 0, key="btn_process")
+            pending_count = len(cache.list_pending_ingest())
+            do_process = st.button(f"⚡ 导入图谱 ({pending_count})" if pending_count else "⚡ 导入图谱", width="stretch", disabled=pending_count == 0, key="btn_process")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # 拉取逻辑
+        # 拉取逻辑 — 走 Pipeline，暂存到 Redis
         if do_fetch:
-            from src.mail.imap_client import IMAPClient
-            from src.mail.parser import parse_email
-            from src.mail.cleaner import MailCleaner
+            from src.pipeline import Pipeline
 
-            cleaner = MailCleaner()
-            fetched_results = []
+            log_box = st.empty()
+            logs = []
+
+            def flog(msg):
+                logs.append(msg)
+                log_box.markdown(
+                    '<div style="font-family:monospace;font-size:0.75rem;max-height:300px;overflow-y:auto;'
+                    'background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'
+                    + "<br>".join(logs[-30:]) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
             try:
-                with IMAPClient() as client:
-                    uids = client.search_uids(folder=fetch_folder)
-                    if uids:
-                        uids = uids[-fetch_count:]
-                        progress = st.progress(0)
-                        fetched = 0
-                        for uid, msg in client.fetch_batch(uids, folder=fetch_folder):
-                            try:
-                                parsed = parse_email(msg)
-                                cleaned = cleaner.clean(parsed.body_text, parsed.body_html)
-                                is_noise = cleaner.is_noise_email(parsed.subject, parsed.from_addr, cleaned)
-                                cache.mark_processing(parsed.message_id, uid, fetch_folder, parsed.subject, parsed.from_addr, parsed.date)
-                                if is_noise:
-                                    cache.mark_skipped(parsed.message_id, "噪音邮件")
-                                else:
-                                    cache.mark_done(parsed.message_id)
-                                    fetched_results.append({
-                                        "message_id": parsed.message_id, "uid": uid, "folder": fetch_folder,
-                                        "subject": parsed.subject, "from_addr": parsed.from_addr,
-                                        "to_addrs": parsed.to_addrs, "cc_addrs": parsed.cc_addrs,
-                                        "date": parsed.date, "cleaned_body": cleaned,
-                                        "attachments": [{"filename": a["filename"], "path": a["path"]} for a in parsed.attachments],
-                                    })
-                                fetched += 1
-                                progress.progress(fetched / len(uids))
-                            except Exception as e:
-                                logger.error(f"拉取失败: {e}")
-                        progress.empty()
-
-                        output_file = settings.resolve_data_path("fetched_mails.json")
-                        with open(output_file, "w", encoding="utf-8") as f:
-                            json.dump(fetched_results, f, ensure_ascii=False, indent=2)
-                        st.success(f"拉取完成：{len(fetched_results)} 封邮件")
-                        init_cache.clear()
-                        time.sleep(1)
-                        st.rerun()
+                n = Pipeline().run_fetch(folder=fetch_folder, limit=fetch_count, on_log=flog)
+                st.success(f"拉取完成：{n} 封邮件已入队，点击 **⚡ 导入图谱** 建图")
+                init_cache.clear()
+                time.sleep(1)
+                st.rerun()
             except Exception as e:
                 st.error(f"拉取失败: {e}")
 
-        # 处理逻辑
+        # 导入逻辑 — 走 Pipeline，Redis 队列 → RAGFlow GraphRAG
         if do_process:
-            from src.ai.extractor import Extractor
-            from src.attachment.ragflow_client import get_ragflow_client
+            from src.pipeline import Pipeline
 
-            rf = get_ragflow_client()
-            rf.get_or_create_dataset("MailGraph")
-            rf.enable_graphrag()
+            log_container = st.empty()
+            logs = []
 
-            fetched_file = settings.resolve_data_path("fetched_mails.json")
-            if fetched_file.exists():
-                with open(fetched_file, "r", encoding="utf-8") as f:
-                    mails = json.load(f)
+            def ilog(msg):
+                logs.append(msg)
+                log_container.markdown(
+                    '<div style="font-family:monospace;font-size:0.75rem;max-height:400px;overflow-y:auto;'
+                    'background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'
+                    + "<br>".join(logs[-30:]) + "</div>",
+                    unsafe_allow_html=True,
+                )
 
-                log_container = st.empty()
-                prog = st.progress(0)
-                logs = []
-
-                def log(msg):
-                    logs.append(msg)
-                    log_container.markdown(
-                        '<div style="font-family:monospace;font-size:0.75rem;max-height:400px;overflow-y:auto;background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'
-                        + "<br>".join(logs[-30:]) + "</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                log("🚀 开始批量处理...")
-                extractor = None
-                try:
-                    extractor = Extractor()
-                    log("✅ AI 提取器就绪")
-                except Exception as e:
-                    log(f"⚠️ AI 不可用: {e}")
-
-                doc_ids = []
-                batch = mails[:min(pending_count, 50)]
-                for i, mail in enumerate(batch):
-                    subj = mail["subject"][:50]
-                    log(f"📧 [{i+1}/{len(batch)}] {subj}")
-                    try:
-                        if extractor:
-                            ext = extractor.extract_from_email(
-                                subject=mail.get("subject", ""), body=mail.get("cleaned_body", ""),
-                                from_addr=mail.get("from_addr", ""), to_addrs=mail.get("to_addrs", []),
-                                date=mail.get("date", ""),
-                            )
-                            co = (ext.get("company") or {}).get("name", "?")
-                            log(f"  🤖 公司={co} · 联系人={len(ext.get('contacts',[]))} · 项目={len(ext.get('projects',[]))}")
-                            doc_id = rf.upload_email_extraction(
-                                metadata={"message_id": mail.get("message_id",""), "subject": mail.get("subject",""),
-                                          "from_addr": mail.get("from_addr",""), "date": mail.get("date","")},
-                                extraction=ext,
-                            )
-                            if doc_id:
-                                doc_ids.append(doc_id)
-                                log(f"  📚 RAGFlow KB: {doc_id}")
-                            mail["extraction"] = ext
-                        prog.progress((i+1)/len(batch))
-                    except Exception as e:
-                        log(f"  ❌ {e}")
-
-                if doc_ids:
-                    log(f"⏳ 等待 RAGFlow 解析 {len(doc_ids)} 个文档...")
-                    rf.wait_for_parsing(doc_ids)
-                    log("✅ GraphRAG 图谱已更新")
-
-                log(f"✅ 完成！成功: {len(doc_ids)}/{len(batch)}")
-
-                extracted_file = settings.resolve_data_path("extracted_mails.json")
-                with open(extracted_file, "w", encoding="utf-8") as f:
-                    json.dump(mails, f, ensure_ascii=False, indent=2)
-
+            try:
+                stats_ing = Pipeline().run_ingest(on_log=ilog)
+                st.success(f"导入完成：{stats_ing['uploaded']}/{stats_ing['total']} 封"
+                           f"（附件 {stats_ing['attachments']}，失败 {stats_ing['failed']}）")
                 init_cache.clear()
                 time.sleep(1.5)
                 st.rerun()
+            except Exception as e:
+                st.error(f"导入失败: {e}")
 
-        # 邮件列表
-        st.markdown("### 已拉取邮件")
-        fetched_file = settings.resolve_data_path("fetched_mails.json")
-        if fetched_file.exists():
-            with open(fetched_file, "r", encoding="utf-8") as f:
-                mails = json.load(f)
-            if mails:
-                for i, mail in enumerate(mails[:50]):
-                    has_ext = bool(mail.get("extraction"))
-                    subj = mail.get("subject", "(无主题)")[:80]
-                    with st.expander(f"{mail.get('date','')[:10]} · {subj} · {mail.get('from_addr','')[:30]}", expanded=False):
-                        c1, c2 = st.columns([3, 1])
-                        with c1:
-                            st.markdown(f'<div class="d-lbl">发件人</div><div class="d-val">{mail.get("from_addr","")}</div>', unsafe_allow_html=True)
-                            st.markdown(f'<div class="d-lbl">时间</div><div class="d-val">{mail.get("date","")}</div>', unsafe_allow_html=True)
-                            if mail.get("cleaned_body"):
-                                st.text(mail["cleaned_body"][:2000])
-                        with c2:
-                            if has_ext:
-                                ext = mail["extraction"]
-                                if isinstance(ext, dict):
-                                    co = ext.get("company", {}) or {}
-                                    if co.get("name"):
-                                        st.markdown(f'<div class="d-lbl">公司</div><div class="d-val" style="font-weight:600;">{co["name"]}</div>', unsafe_allow_html=True)
-                                    for c in ext.get("contacts", []):
-                                        st.markdown(f'<span class="tag tag-blue">{c.get("name","")}</span>', unsafe_allow_html=True)
-                                    for o in ext.get("internal_owners", []):
-                                        st.markdown(f'<span class="tag tag-amber">{o.get("name","")}</span>', unsafe_allow_html=True)
-                                    for p in ext.get("projects", []):
-                                        st.markdown(f'<span class="tag tag-purple">{p.get("name","")}</span>', unsafe_allow_html=True)
-                                    if ext.get("summary"):
-                                        st.markdown(f'<div style="font-size:0.82rem;color:var(--t3);margin-top:0.5rem;">{ext["summary"][:200]}</div>', unsafe_allow_html=True)
-                            else:
-                                st.caption("未提取")
-            else:
-                st.info("暂无邮件。点击 **📥 拉取** 开始。")
+        # 邮件列表 — 待入库队列（Redis 暂存正文）
+        st.markdown("### 待导入邮件（已拉取，未入库）")
+        mails = cache.list_recent_mails(limit=50)
+        if mails:
+            for mail in mails:
+                subj = mail.get("subject", "(无主题)")[:80]
+                atts = mail.get("attachments", []) or []
+                att_badge = f" · 📎 {len(atts)}" if atts else ""
+                with st.expander(f"{mail.get('date','')[:10]} · {subj} · {mail.get('from_addr','')[:30]}{att_badge}", expanded=False):
+                    st.markdown(f'**发件人**：{mail.get("from_addr","")}')
+                    if mail.get("to_addrs"):
+                        st.markdown(f'**收件人**：{", ".join(mail["to_addrs"][:5])}')
+                    st.markdown(f'**时间**：{mail.get("date","")}')
+                    if atts:
+                        st.markdown("**附件**：" + "、".join(a.get("filename", "") for a in atts))
+                    if mail.get("cleaned_body"):
+                        st.text(mail["cleaned_body"][:2000])
+            st.caption("入库后正文将从 Redis 释放（即用即删），实体/关系保存在 RAGFlow 图谱中。")
         else:
-            st.info("暂无邮件数据。点击 **📥 拉取** 开始。")
+            st.info("队列为空。点击 **📥 拉取** 获取邮件，或全部已导入图谱。")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -979,39 +958,3 @@ else:
                 st.caption("Docker 未安装")
             except Exception as e:
                 st.caption(f"获取失败: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════
-# 辅助函数
-# ═══════════════════════════════════════════════════════════════
-
-def build_result_subgraph(result: dict) -> str:
-    """从查询结果构建 pyvis 子图"""
-    from pyvis.network import Network
-
-    net = Network(height="500px", width="100%", directed=True, bgcolor="#FFFFFF", font_color="#0F172A")
-    entities = result.get("entities", [])
-    relationships = result.get("relationships", [])
-    if not entities:
-        return '<div style="padding:40px;text-align:center;color:#94A3B8;">无图谱数据</div>'
-
-    entity_ids = {e["id"] for e in entities}
-    for ent in entities:
-        eid, etype, name = ent["id"], ent.get("type", "Entity"), ent.get("name", eid)
-        color = NODE_COLORS.get(etype, "#94A3B8")
-        net.add_node(eid, label=str(name)[:20], title=f"<b>{etype}</b><br>{name}<br>{ent.get('description','')[:80]}", color=color, size=18, group=etype)
-
-    for rel in relationships:
-        s, t = rel.get("source_id", ""), rel.get("target_id", "")
-        if s in entity_ids and t in entity_ids:
-            net.add_edge(s, t, title=rel.get("type", ""), color="#CBD5E1")
-
-    net.set_options("""
-    {
-        "nodes":{"font":{"size":11,"face":"Inter,sans-serif","color":"#0F172A","strokeWidth":2,"strokeColor":"#fff"},"borderWidth":2,"shape":"dot"},
-        "edges":{"color":{"color":"#CBD5E1","highlight":"#2563EB"},"width":1.5,"smooth":{"enabled":true,"type":"continuous"},"arrows":{"to":{"enabled":true,"scaleFactor":0.5}}},
-        "physics":{"enabled":true,"stabilization":{"iterations":100},"barnesHut":{"gravitationalConstant":-2000,"springLength":200,"springConstant":0.03,"damping":0.6}},
-        "interaction":{"hover":true,"tooltipDelay":50}
-    }
-    """)
-    return net.generate_html()
