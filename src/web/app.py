@@ -23,6 +23,13 @@ def h(s):
         return ""
     return _html.escape(str(s))
 
+# 剥离 HTML 标签：RAGFlow 图谱实体的 description 可能被 LLM 包裹了 <div> 等标签
+_STRIP_HTML_RE = re.compile(r"<[^>]*>")
+def strip_html(s):
+    if s is None:
+        return ""
+    return _STRIP_HTML_RE.sub("", str(s))
+
 st.set_page_config(
     page_title="MailGraph — 企业邮件关系分析",
     page_icon="✉️",
@@ -355,7 +362,29 @@ def _ensure_active_chat_session():
         store.close()
 
 
-active_chat_session, chat_sessions, agent_memory = _ensure_active_chat_session()
+# 懒初始化：仅 chat 页面需要，非 chat 页跳过昂贵的 store 调用
+_chat_ready = False
+_active_chat_session = None
+_chat_sessions: list = []
+_agent_memory = None
+
+def _ensure_chat_ready():
+    global _chat_ready, _active_chat_session, _chat_sessions, _agent_memory
+    if _chat_ready:
+        return
+    store = _conversation_store()
+    if store is None:
+        _chat_ready = True
+        return
+    try:
+        session = store.ensure_session(st.session_state.get("active_chat_session"))
+        st.session_state["active_chat_session"] = session["id"]
+        _active_chat_session = session
+        _chat_sessions = store.list_sessions()
+        _agent_memory = store.get_memory()
+    finally:
+        store.close()
+    _chat_ready = True
 
 # ═══════════════════════════════════════════════════════════════
 # 侧边栏 — 深色主题
@@ -498,7 +527,7 @@ def build_result_subgraph(result: dict) -> str:
     for ent in entities:
         eid, etype, name = ent["id"], ent.get("type", "Entity"), ent.get("name", ent["id"])
         color = NODE_COLORS.get(etype, "#94A3B8")
-        net.add_node(eid, label=str(name)[:20], title=f"<b>{etype}</b><br>{name}<br>{ent.get('description','')[:80]}", color=color, size=18, group=etype)
+        net.add_node(eid, label=str(name)[:20], title=f"<b>{etype}</b><br>{h(name)}<br>{h(strip_html(ent.get('description',''))[:80])}", color=color, size=18, group=etype)
 
     for rel in relationships:
         s, t = rel.get("source_id", ""), rel.get("target_id", "")
@@ -687,11 +716,12 @@ def _render_history_message(msg: dict):
             _render_results(result, key_prefix=msg.get("id"))
 
 
-def _render_chat_session_toolbar(memory_prompt: str = ""):
+def _render_chat_session_toolbar(memory_prompt: str = "", sessions: list | None = None):
     if not active_account_id:
         return
 
-    sessions = chat_sessions or []
+    if sessions is None:
+        sessions = []
     left, new_col, del_col = st.columns([5, 1, 1])
     with left:
         if sessions:
@@ -722,6 +752,7 @@ def _render_chat_session_toolbar(memory_prompt: str = ""):
                     st.session_state["active_chat_session"] = session["id"]
                 finally:
                     store.close()
+            _mark_chat_dirty()
             st.rerun()
 
     with del_col:
@@ -736,6 +767,7 @@ def _render_chat_session_toolbar(memory_prompt: str = ""):
                     st.session_state["active_chat_session"] = next_session["id"]
                 finally:
                     store.close()
+            _mark_chat_dirty()
             st.rerun()
 
     if memory_prompt:
@@ -743,26 +775,57 @@ def _render_chat_session_toolbar(memory_prompt: str = ""):
             st.caption(memory_prompt[:1200])
 
 
-def render_chat_page():
-    st.markdown(CHAT_CSS, unsafe_allow_html=True)
+def _load_chat_state():
+    """加载聊天状态，用 st.session_state 缓存避免每次重渲染都访问 Redis。"""
+    _ensure_chat_ready()
+    sid = _active_chat_session["id"] if _active_chat_session else None
 
-    store = _conversation_store()
-    session = active_chat_session
+    cache_sid = st.session_state.get("_chat_cached_sid")
+    dirty = st.session_state.pop("_chat_dirty", True)
+
+    # 会话未变且未标记脏 → 直接用缓存
+    if not dirty and cache_sid == sid and "_chat_msgs" in st.session_state:
+        return (
+            sid, _chat_sessions,
+            st.session_state.get("_chat_memory_prompt", ""),
+            st.session_state["_chat_msgs"],
+        )
+
+    # 需要从 Redis 加载
     messages = []
     memory_prompt = ""
+    store = _conversation_store()
     if store:
         try:
             ensured = store.ensure_session(st.session_state.get("active_chat_session"))
-            session = ensured["id"]
-            st.session_state["active_chat_session"] = session
-            messages = store.list_messages(session)
-            memory_prompt = store.get_memory().to_prompt()
+            sid = ensured["id"]
+            st.session_state["active_chat_session"] = sid
+            messages = store.list_messages(sid)
+            mp = store.get_memory()
+            memory_prompt = mp.to_prompt() if mp else ""
         finally:
             store.close()
     elif "chat" in st.session_state:
         messages = st.session_state.chat
 
-    _render_chat_session_toolbar(memory_prompt)
+    # 写入缓存
+    st.session_state["_chat_cached_sid"] = sid
+    st.session_state["_chat_msgs"] = messages
+    st.session_state["_chat_memory_prompt"] = memory_prompt
+
+    return sid, _chat_sessions, memory_prompt, messages
+
+
+def _mark_chat_dirty():
+    st.session_state["_chat_dirty"] = True
+
+
+def render_chat_page():
+    st.markdown(CHAT_CSS, unsafe_allow_html=True)
+
+    session_id, sessions, memory_prompt, messages = _load_chat_state()
+
+    _render_chat_session_toolbar(memory_prompt, sessions)
 
     # 底部输入（始终固定在底部，先取值以便决定是否显示空态）
     prompt = st.chat_input("给 MailGraph 发消息…问客户、项目、人物关系")
@@ -791,11 +854,11 @@ def render_chat_page():
         _render_history_message(msg)
 
     if prompt:
-        if session:
+        if session_id:
             store = _conversation_store()
             if store:
                 try:
-                    store.add_message(session, "user", prompt)
+                    store.add_message(session_id, "user", prompt)
                 finally:
                     store.close()
         else:
@@ -807,11 +870,11 @@ def render_chat_page():
             if query_engine is None:
                 answer = "⚠️ RAGFlow 未连接，无法查询。请先在「系统设置」确认服务状态，并在「邮件工作台」导入邮件。"
                 st.markdown(answer)
-                if session:
+                if session_id:
                     store = _conversation_store()
                     if store:
                         try:
-                            store.add_message(session, "assistant", answer, {})
+                            store.add_message(session_id, "assistant", answer, {})
                         finally:
                             store.close()
                 else:
@@ -820,27 +883,31 @@ def render_chat_page():
                 with st.spinner("检索图谱与语义…"):
                     store = _conversation_store()
                     history = []
-                    if store and session:
+                    if store and session_id:
                         try:
-                            history = store.recent_context(session, limit=8)
+                            history = store.recent_context(session_id, limit=8)
                         finally:
-                            store.close()
+                            pass
                     context = {"memory": memory_prompt, "history": history}
                     result = query_engine.query(prompt, context=context)
                 _render_reasoning(result.get("trace"))
                 answer = result.get("answer") or "没找到相关信息。可以换个问法，或先在「邮件工作台」导入更多邮件。"
                 st.write_stream(_stream_text(answer))
                 _render_results(result, key_prefix=f"live_{time.time_ns()}")
-                if session:
-                    store = _conversation_store()
+                if session_id:
+                    if store is None:
+                        store = _conversation_store()
                     if store:
                         try:
-                            store.add_message(session, "assistant", answer, result)
+                            store.add_message(session_id, "assistant", answer, result)
                             store.update_memory_from_turn(prompt, answer)
                         finally:
                             store.close()
                 else:
                     st.session_state.setdefault("chat", []).append({"role": "assistant", "content": answer, "result": result})
+
+        # 消息已发送，标记下次重渲染时重新加载
+        _mark_chat_dirty()
 
 
 if page == "query":
@@ -896,8 +963,8 @@ elif page == "dashboard":
                     elif isinstance(other, str) and other in companies:
                         related_companies.append(companies[other])
             proj_data.append({
-                "name": p.get("name", ""),
-                "description": p.get("description", "")[:160],
+                "name": strip_html(p.get("name", "")),
+                "description": strip_html(p.get("description", ""))[:160],
                 "people": related_people,
                 "companies": related_companies,
             })

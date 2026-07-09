@@ -447,13 +447,14 @@ class MailCache:
 
         if statuses:
             status_ids: set[str] = set()
-            saw_status_index = False
+            missing_status_index = False
             for st in statuses:
                 key = self._status_key(st)
                 if self.r.exists(key):
-                    saw_status_index = True
                     status_ids.update(self.r.smembers(key))
-            if saw_status_index:
+                else:
+                    missing_status_index = True
+            if not missing_status_index:
                 indexed_sets.append(status_ids)
 
         if has_attachment is not None:
