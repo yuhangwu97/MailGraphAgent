@@ -586,6 +586,17 @@ CHAT_CSS = """
 .chat-hero .ch-sub { font-size: 0.9rem; color: var(--t3); line-height: 1.6; }
 /* 来源引用 chip */
 .src-chip { display:inline-block; font-size:0.72rem; font-family:'SF Mono','JetBrains Mono',monospace; color:var(--t3); background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:0.1rem 0.5rem; margin:0.15rem 0.3rem 0.15rem 0; }
+/* 空态快捷问题 */
+.quick-card {
+    min-height: 126px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 0.85rem 0.9rem; box-shadow: var(--sh-sm);
+    margin-bottom: 0.45rem;
+}
+.quick-card .qc-top { display:flex; align-items:center; gap:0.45rem; margin-bottom:0.45rem; }
+.quick-card .qc-icon { font-size:1rem; line-height:1; }
+.quick-card .qc-title { font-size:0.86rem; font-weight:650; color:var(--t1); }
+.quick-card .qc-desc { font-size:0.73rem; color:var(--t3); line-height:1.45; min-height:2.1rem; }
+.quick-card .qc-query { font-size:0.68rem; color:var(--t4); line-height:1.45; margin-top:0.45rem; }
 </style>
 """
 
@@ -606,10 +617,22 @@ AVATAR_USER = (
 )
 
 CHAT_SUGGESTIONS = [
-    ("🏢", "客户全景", "列出所有客户公司及其对接人、涉及的项目"),
-    ("📋", "项目进展", "所有项目的当前进展和关键负责人"),
-    ("👥", "人物关系", "某个联系人参与了哪些项目、对接了哪些同事"),
-    ("🔍", "线索追踪", "最近有哪些值得关注的往来或风险信号"),
+    ("🏢", "客户-项目图谱", "客户、对接人、项目、内部负责人关系",
+     "梳理邮件中出现的客户公司、外部对接人、相关项目和内部负责人"),
+    ("⚠️", "风险与延期", "定位项目风险、延期原因和客户反馈",
+     "最近邮件里提到的项目风险、延期原因和客户反馈是什么"),
+    ("📎", "合同/报价附件", "按时间、附件和主题筛出关键邮件",
+     "最近七天带附件的邮件中哪些和报价或合同有关"),
+    ("📊", "处理看板", "查看入库成功率、失败和待处理数量",
+     "本周邮件入库成功率、失败数量和待处理邮件分别是多少"),
+    ("👤", "联系人脉络", "查看某个联系人关联的项目和内部同事",
+     "王总参与了哪些项目，主要对接了哪些内部同事"),
+    ("🏷️", "客户反馈", "归纳客户诉求、问题和后续动作",
+     "客户最近反馈了哪些问题，有哪些需要跟进的事项"),
+    ("🔎", "失败排查", "快速列出失败邮件和可能原因",
+     "列出最近三天失败的邮件，并说明是否和附件解析或合同内容有关"),
+    ("📬", "发件人排行", "找出高频往来对象和邮件占比",
+     "本月谁发邮件最多，前十名分别是多少封"),
 ]
 
 
@@ -842,12 +865,20 @@ def render_chat_page():
         </div>
         """, unsafe_allow_html=True)
 
-        cols = st.columns(len(CHAT_SUGGESTIONS))
-        for col, (icon, title, q) in zip(cols, CHAT_SUGGESTIONS):
-            with col:
-                if st.button(f"{icon}  {title}", key=f"sug_{title}", width="stretch"):
-                    st.session_state.pending_prompt = q
-                    st.rerun()
+        for row_start in range(0, len(CHAT_SUGGESTIONS), 4):
+            cols = st.columns(4)
+            for col, (icon, title, desc, q) in zip(cols, CHAT_SUGGESTIONS[row_start:row_start + 4]):
+                with col:
+                    st.markdown(f"""
+                    <div class="quick-card">
+                        <div class="qc-top"><span class="qc-icon">{icon}</span><span class="qc-title">{h(title)}</span></div>
+                        <div class="qc-desc">{h(desc)}</div>
+                        <div class="qc-query">{h(q)}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if st.button("使用这个问题", key=f"sug_{title}", width="stretch"):
+                        st.session_state.pending_prompt = q
+                        st.rerun()
 
     # 历史消息
     for msg in messages:
