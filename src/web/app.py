@@ -262,37 +262,66 @@ section[data-testid="stSidebar"] ::-webkit-scrollbar-thumb { background: rgba(25
 # 连接初始化
 # ═══════════════════════════════════════════════════════════════
 
+def _dataset_name(account_id):
+    base = get_settings().ragflow_dataset_name
+    return f"{base}-{account_id}" if account_id else base
+
 @st.cache_resource
-def init_ragflow():
+def init_ragflow(account_id):
     try:
         from src.attachment.ragflow_client import get_ragflow_client
-        rf = get_ragflow_client()
-        rf.get_or_create_dataset(get_settings().ragflow_dataset_name)
+        rf = get_ragflow_client(account_id)
+        rf.get_or_create_dataset(_dataset_name(account_id))
         rf.enable_graphrag()
         return rf
     except Exception:
         return None
 
 @st.cache_resource(ttl=10)
-def init_cache():
+def init_cache(account_id):
     try:
-        c = MailCache()
+        c = MailCache(account_id)
         c.get_stats()
         return c
     except Exception:
         return None
 
 @st.cache_resource
-def init_query_engine(_ragflow):
+def init_query_engine(_ragflow, account_id):
     if _ragflow is None:
         return None
     from src.ai.query_engine import QueryEngine
     return QueryEngine(_ragflow)
 
-ragflow = init_ragflow()
-cache = init_cache()
+def _resolve_active_account():
+    """迁移 env 邮箱 → 取账号列表 → 定位当前活动账号（存 session_state）。
+
+    Redis 不可用时降级为无账号（页面各自给出连接提示，不让整个 app 崩）。
+    """
+    from src.storage.account_store import AccountStore
+    try:
+        store = AccountStore()
+        try:
+            store.ensure_default_from_env()
+            accounts = store.list()
+        finally:
+            store.close()
+    except Exception:
+        return None, []
+    if not accounts:
+        return None, []
+    ids = [a["id"] for a in accounts]
+    active = st.session_state.get("active_account")
+    if active not in ids:
+        active = ids[0]
+        st.session_state["active_account"] = active
+    return active, accounts
+
 settings = get_settings()
-query_engine = init_query_engine(ragflow) if ragflow else None
+active_account_id, accounts = _resolve_active_account()
+ragflow = init_ragflow(active_account_id) if active_account_id else None
+cache = init_cache(active_account_id) if active_account_id else None
+query_engine = init_query_engine(ragflow, active_account_id) if ragflow else None
 
 # ═══════════════════════════════════════════════════════════════
 # 侧边栏 — 深色主题
@@ -730,7 +759,76 @@ elif page == "workbench":
     st.markdown('<h2>📬 邮件工作台</h2>', unsafe_allow_html=True)
     st.caption("拉取邮件 → 清洗 → 导入 RAGFlow GraphRAG（原文 + 附件，单遍建图）")
 
-    if cache is None:
+    # ── 邮箱账号：选择当前处理的邮箱 + 增删管理 ──
+    from src.storage.account_store import AccountStore
+
+    if accounts:
+        labels = {a["id"]: f'{a.get("label") or a["email_user"]} · {a["email_user"]}' for a in accounts}
+        ids = list(labels.keys())
+        cur = st.session_state.get("active_account", ids[0])
+        idx = ids.index(cur) if cur in ids else 0
+        chosen = st.selectbox("处理邮箱", ids, index=idx,
+                              format_func=lambda i: labels[i], key="acct_select")
+        if chosen != st.session_state.get("active_account"):
+            st.session_state["active_account"] = chosen
+            st.rerun()
+    else:
+        st.info("尚未配置邮箱账号，请在下方「管理邮箱账号」添加。")
+
+    with st.expander("⚙️ 管理邮箱账号", expanded=not accounts):
+        PROVIDER_PRESETS = {
+            "Gmail": ("imap.gmail.com", 993),
+            "QQ 邮箱": ("imap.qq.com", 993),
+            "阿里企业邮箱": ("imap.mxhichina.com", 993),
+            "自定义": ("", 993),
+        }
+        prov = st.selectbox("服务商预设", list(PROVIDER_PRESETS.keys()), key="acct_provider")
+        def_server, def_port = PROVIDER_PRESETS[prov]
+        with st.form("add_account_form", clear_on_submit=True):
+            f_label = st.text_input("名称（备注）", placeholder="如：工作邮箱")
+            f_server = st.text_input("IMAP 服务器", value=def_server)
+            f_port = st.number_input("端口", 1, 65535, def_port)
+            f_user = st.text_input("邮箱地址")
+            f_pass = st.text_input("密码 / 授权码", type="password")
+            if st.form_submit_button("＋ 保存账号", type="primary"):
+                if not (f_user and f_pass and f_server):
+                    st.error("服务器 / 邮箱 / 密码 均必填")
+                else:
+                    store = AccountStore()
+                    try:
+                        acct = store.add(f_label, f_server, int(f_port), f_user, f_pass, prov)
+                    finally:
+                        store.close()
+                    st.session_state["active_account"] = acct["id"]
+                    init_cache.clear()
+                    init_ragflow.clear()
+                    st.success(f"已保存：{acct['label']}")
+                    time.sleep(0.5)
+                    st.rerun()
+
+        if accounts:
+            st.markdown("**已配置账号**")
+            for a in accounts:
+                c1, c2 = st.columns([6, 1])
+                with c1:
+                    st.markdown(f'{a.get("label") or ""} · `{a["email_user"]}` · {a.get("imap_server","")}')
+                with c2:
+                    if st.button("删除", key=f"del_acct_{a['id']}"):
+                        store = AccountStore()
+                        try:
+                            store.delete(a["id"])
+                        finally:
+                            store.close()
+                        if st.session_state.get("active_account") == a["id"]:
+                            st.session_state.pop("active_account", None)
+                        init_cache.clear()
+                        init_ragflow.clear()
+                        st.rerun()
+            st.caption("删除仅移除账号条目；该邮箱已入库的 Redis 数据与 RAGFlow 图谱不在此清理。")
+
+    if not accounts:
+        st.info("请先添加一个邮箱账号，再拉取邮件。")
+    elif cache is None:
         st.warning("Redis 未连接，请先启动 Docker 服务。")
     else:
         stats = cache.get_stats()
@@ -777,7 +875,7 @@ elif page == "workbench":
                 )
 
             try:
-                n = Pipeline().run_fetch(folder=fetch_folder, limit=fetch_count, on_log=flog)
+                n = Pipeline(active_account_id).run_fetch(folder=fetch_folder, limit=fetch_count, on_log=flog)
                 st.success(f"拉取完成：{n} 封邮件已入队，点击 **⚡ 导入图谱** 建图")
                 init_cache.clear()
                 time.sleep(1)
@@ -802,7 +900,7 @@ elif page == "workbench":
                 )
 
             try:
-                stats_ing = Pipeline().run_ingest(on_log=ilog)
+                stats_ing = Pipeline(active_account_id).run_ingest(on_log=ilog)
                 st.success(f"导入完成：{stats_ing['uploaded']}/{stats_ing['total']} 封"
                            f"（附件 {stats_ing['attachments']}，失败 {stats_ing['failed']}）")
                 init_cache.clear()
@@ -831,6 +929,57 @@ elif page == "workbench":
             st.caption("入库后正文将从 Redis 释放（即用即删），实体/关系保存在 RAGFlow 图谱中。")
         else:
             st.info("队列为空。点击 **📥 拉取** 获取邮件，或全部已导入图谱。")
+
+        # 已入库邮件 — 勾选后强制重新处理（先删旧 RAGFlow 文档再重传，避免图谱重复）
+        st.markdown("### 已入库邮件（可强制重新处理）")
+        done_mails = cache.list_done_mails(limit=100)
+        if done_mails:
+            sel_ids = []
+            for m in done_mails:
+                mid = m.get("message_id", "")
+                subj = (m.get("subject") or "(无主题)")[:70]
+                c_chk, c_info = st.columns([1, 16])
+                with c_chk:
+                    checked = st.checkbox("选择", key=f"rp_{mid}", label_visibility="collapsed")
+                with c_info:
+                    st.markdown(f"{m.get('date','')[:10]} · {subj} · {m.get('from_addr','')[:30]}")
+                if checked:
+                    sel_ids.append(mid)
+
+            do_reprocess = st.button(
+                f"🔄 重新处理选中 ({len(sel_ids)})",
+                width="stretch", type="primary",
+                disabled=len(sel_ids) == 0, key="btn_reprocess")
+
+            if do_reprocess and sel_ids:
+                from src.pipeline import Pipeline
+
+                rp_box = st.empty()
+                rlogs = []
+
+                def rlog(msg):
+                    rlogs.append(msg)
+                    rp_box.markdown(
+                        '<div style="font-family:monospace;font-size:0.75rem;max-height:400px;overflow-y:auto;'
+                        'background:#1E293B;color:#E2E8F0;padding:0.75rem;border-radius:8px;line-height:1.6;">'
+                        + "<br>".join(rlogs[-30:]) + "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                try:
+                    stats_rp = Pipeline(active_account_id).reprocess(sel_ids, on_log=rlog)
+                    st.success(
+                        f"重新处理完成：重置 {stats_rp.get('reset', 0)} 封 · "
+                        f"重新入队 {stats_rp.get('requeued', 0)} 封 · "
+                        f"上传 {stats_rp.get('uploaded', 0)}/{stats_rp.get('total', 0)} 封"
+                        f"（附件 {stats_rp.get('attachments', 0)}，失败 {stats_rp.get('failed', 0)}）")
+                    init_cache.clear()
+                    time.sleep(1.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"重新处理失败: {e}")
+        else:
+            st.caption("暂无已入库邮件。")
 
 
 # ═══════════════════════════════════════════════════════════════

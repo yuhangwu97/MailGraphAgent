@@ -5,6 +5,7 @@ IMAP 邮件客户端
 import imaplib
 import email
 import email.policy  # Python 3.14 需显式导入
+import re
 import time
 import random
 import logging
@@ -44,12 +45,19 @@ def create_imap_client_from_settings() -> "IMAPClient":
 class IMAPClient:
     """IMAP 邮件客户端，封装连接、搜索、获取操作"""
 
-    def __init__(self):
+    def __init__(self, account: dict | None = None):
         cfg = get_settings()
-        self.server = cfg.imap_server
-        self.port = cfg.imap_port
-        self.username = cfg.email_user
-        self.password = cfg.email_pass
+        # account 传入时用账号配置；否则回退环境变量（向后兼容单邮箱）
+        if account:
+            self.server = account.get("imap_server") or cfg.imap_server
+            self.port = int(account.get("imap_port") or cfg.imap_port)
+            self.username = account.get("email_user") or cfg.email_user
+            self.password = account.get("email_pass") or cfg.email_pass
+        else:
+            self.server = cfg.imap_server
+            self.port = cfg.imap_port
+            self.username = cfg.email_user
+            self.password = cfg.email_pass
         self.batch_size = cfg.imap_batch_size
         self.delay_min = cfg.imap_request_delay_min
         self.delay_max = cfg.imap_request_delay_max
@@ -211,21 +219,64 @@ class IMAPClient:
             logger.error(f"UID {uid}: 解析失败 - {e}")
             return None
 
+    def fetch_by_uids(
+        self, uids: list[str], folder: str = "INBOX",
+    ) -> dict[str, email.message.EmailMessage]:
+        """一条 UID FETCH 命令批量取多封邮件，返回 {uid: message}。
+
+        比逐封 FETCH 少一个数量级的往返。按响应里的 `UID N` 回填映射，
+        不依赖服务器返回顺序。解析失败的单封跳过，不影响其余。
+        """
+        if not uids:
+            return {}
+        conn = self.connect()
+        conn.select(folder, readonly=True)
+
+        uid_arg = ",".join(str(u) for u in uids)
+        status, data = conn.uid("FETCH", uid_arg, "(RFC822)")
+        result: dict[str, email.message.EmailMessage] = {}
+        if status != "OK" or not data:
+            logger.warning(f"批量 FETCH 失败 (status={status})")
+            return result
+
+        for item in data:
+            # 有效负载是 (envelope_bytes, raw_email) 元组；b')' 等分隔项跳过
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            envelope, raw_email = item[0], item[1]
+            m = re.search(rb"UID (\d+)", envelope or b"")
+            if not m:
+                continue
+            uid = m.group(1).decode()
+            try:
+                msg = email.message_from_bytes(raw_email, policy=email.policy.default)
+                result[uid] = msg
+            except Exception as e:
+                logger.error(f"UID {uid}: 解析失败 - {e}")
+        return result
+
     def fetch_batch(
         self,
         uids: list[str],
         folder: str = "INBOX",
     ) -> Iterator[tuple[str, email.message.EmailMessage]]:
-        """批量获取邮件，返回 (uid, message) 迭代器，每批次间自动延迟"""
-        for i, uid in enumerate(uids):
-            if i > 0 and i % self.batch_size == 0:
+        """批量获取邮件，返回 (uid, message) 迭代器。
+
+        按 batch_size 分块，每块一条 UID FETCH，块间自动延迟。
+        yield 顺序与传入 uids 一致。
+        """
+        for i in range(0, len(uids), self.batch_size):
+            if i > 0:
                 delay = random.uniform(self.delay_min, self.delay_max)
                 logger.debug(f"已处理 {i}/{len(uids)}, 休眠 {delay:.1f}s...")
                 time.sleep(delay)
 
-            msg = self.fetch_by_uid(uid, folder)
-            if msg is not None:
-                yield uid, msg
+            chunk = uids[i:i + self.batch_size]
+            fetched = self.fetch_by_uids(chunk, folder)
+            for uid in chunk:
+                msg = fetched.get(str(uid))
+                if msg is not None:
+                    yield uid, msg
 
     # ── 时间分片生成器 ──
 

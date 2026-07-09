@@ -4,26 +4,13 @@
 接收自然语言问题，通过 RAGFlow GraphRAG 执行图谱检索 + 语义搜索，
 LLM 生成自然语言回答。
 """
-import json, logging, time
+import logging, time
 from dataclasses import dataclass, field
 from openai import OpenAI
 
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
-
-QUERY_ROUTER_PROMPT = """你是查询路由器。分析用户问题，决定用哪种查询方式。
-
-问题: {question}
-
-图谱可查的业务实体:
-  节点: 客户公司(Company)、外部对接人(Contact)、内部负责人(Employee)、项目(Project)、邮件(Email)、部门(Department)
-  关系: 对接人属于公司、员工对接联系人、员工管理项目、联系人参与项目、项目服务于公司
-
-全文可查: 邮件正文、附件内容、项目摘要等文本信息
-
-返回 JSON: {{"type": "graph|search|both", "reason": "理由"}}"""
-
 
 @dataclass
 class QueryResult:
@@ -51,87 +38,11 @@ class QueryEngine:
         self.rf = ragflow_client
 
     def query(self, question: str) -> dict:
-        """主查询入口：路由 → 图谱/搜索 → 总结"""
+        """主查询入口：RAGFlow 原生一体化问答（检索+图谱+生成+引用）。"""
         start_time = time.time()
-        trace = []
-
-        # Step 1: 路由决策
-        t0 = time.time()
-        route = self._call_llm(QUERY_ROUTER_PROMPT.format(question=question))
-        try:
-            route_data = json.loads(route)
-        except Exception:
-            route_data = {"type": "both", "reason": "fallback"}
-        trace.append({
-            "name": "意图分析", "icon": "🧠",
-            "content": f"路由: {route_data.get('type', 'both')}",
-            "detail": route_data.get("reason", ""),
-            "status": "ok", "color": "#8B5CF6",
-            "duration_ms": int((time.time() - t0) * 1000),
-        })
-
-        # Step 2a: 图谱检索 (GraphRAG)
-        entities, relationships, chunks = [], [], []
-        if route_data.get("type") in ("graph", "both") and self.rf:
-            t1 = time.time()
-            try:
-                graph_result = self.rf.graph_search(question)
-                entities = graph_result.get("entities", [])
-                relationships = graph_result.get("relationships", [])
-                chunks = graph_result.get("chunks", [])
-                trace.append({
-                    "name": "图谱检索 (GraphRAG)", "icon": "🔗",
-                    "content": f"实体 {len(entities)} 个, 关系 {len(relationships)} 条",
-                    "status": "ok" if entities else "warning",
-                    "color": "#3B82F6" if entities else "#F59E0B",
-                    "duration_ms": int((time.time() - t1) * 1000),
-                })
-            except Exception as e:
-                logger.warning("GraphRAG 检索失败: %s", e)
-                trace.append({
-                    "name": "图谱检索 (GraphRAG)", "icon": "🔗",
-                    "content": f"失败: {e}",
-                    "status": "fail", "color": "#EF4444",
-                    "duration_ms": int((time.time() - t1) * 1000),
-                })
-
-        # Step 2b: 语义搜索（仅在需要时且 chunks 为空）
-        if route_data.get("type") in ("search", "both") and self.rf and not chunks:
-            t2 = time.time()
-            try:
-                chunks = self.rf.retrieve_chunks(question, top_k=10)
-                trace.append({
-                    "name": "语义搜索", "icon": "🔍",
-                    "content": f"{len(chunks)} 个相关文本块",
-                    "status": "ok" if chunks else "warning",
-                    "color": "#10B981" if chunks else "#F59E0B",
-                    "duration_ms": int((time.time() - t2) * 1000),
-                })
-            except Exception as e:
-                logger.warning("语义搜索失败: %s", e)
-                trace.append({
-                    "name": "语义搜索", "icon": "🔍",
-                    "content": f"失败: {e}",
-                    "status": "fail", "color": "#EF4444",
-                    "duration_ms": int((time.time() - t2) * 1000),
-                })
-
-        # Step 3: LLM 总结
-        t3 = time.time()
-        answer = self._summarize(question, entities, relationships, chunks)
-        trace.append({
-            "name": "LLM 总结", "icon": "✨",
-            "content": answer[:80] + ("…" if len(answer) > 80 else ""),
-            "status": "ok",
-            "color": "#8B5CF6",
-            "duration_ms": int((time.time() - t3) * 1000),
-        })
-
+        answer, trace, entities, relationships, chunks = self._native_query(question)
         total_dur = int((time.time() - start_time) * 1000)
-
-        # 转换为兼容前端的格式
         rows = self._to_rows(entities, relationships)
-
         return {
             "question": question,
             "answer": answer,
@@ -145,6 +56,36 @@ class QueryEngine:
             "total_duration_ms": total_dur,
             "error": "",
         }
+
+    def _native_query(self, question: str):
+        """RAGFlow 原生问答：一次调用完成检索+图谱+生成，trace 由响应的 references 重建。"""
+        t0 = time.time()
+        res = self.rf.chat_answer(question)
+        answer = res.get("answer", "")
+        refs = res.get("references", [])
+
+        # 原生失败兜底：本地检索 + OpenAI 总结
+        if not answer:
+            fallback_chunks = self.rf.retrieve_chunks(question, top_k=10)
+            answer = self._summarize(question, [], [], fallback_chunks)
+            trace = [{
+                "name": "RAGFlow 原生问答（回退本地总结）", "icon": "✨",
+                "content": f"原生无结果，改用 {len(fallback_chunks)} 段检索总结",
+                "status": "warning", "color": "#F59E0B",
+                "duration_ms": int((time.time() - t0) * 1000),
+            }]
+            return answer, trace, [], [], fallback_chunks
+
+        # trace 直接反映真实检索：引用了哪些来源
+        trace = [{
+            "name": "RAGFlow 原生问答（检索+图谱+生成）", "icon": "✨",
+            "content": f"引用 {len(refs)} 段来源",
+            "detail": "、".join(r.get("doc_name", "") for r in refs[:5] if r.get("doc_name")),
+            "status": "ok", "color": "#8B5CF6",
+            "duration_ms": int((time.time() - t0) * 1000),
+        }]
+        # references 即答案依据的文本块；实体/关系子图归“关系图谱”页展示，此处不再全图 dump
+        return answer, trace, [], [], refs
 
     def _call_llm(self, prompt: str, max_tokens: int = 500) -> str:
         try:
