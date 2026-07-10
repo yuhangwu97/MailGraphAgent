@@ -557,7 +557,28 @@ class MailCache:
         """取一封邮件的处理状态哈希（uid/folder/status/ragflow_doc_id 等）"""
         return self.r.hgetall(self._k("mail", message_id))
 
-    def list_done_mails(self, limit: int = 100) -> list[dict]:
+    def count_done_mails(self) -> int:
+        """返回已入库(done)邮件总数。优先使用 status 索引集 (SCARD O(1))。"""
+        done_key = self._status_key("done")
+        if self.r.exists(done_key):
+            return self.r.scard(done_key)
+        # Fallback: scan all mail hashes
+        count = 0
+        for key in self.r.scan_iter(match=self._k("mail", "*")):
+            if self.r.type(key) != "hash":
+                continue
+            if self.r.hget(key, "status") == "done":
+                count += 1
+        return count
+
+    def count_recent_mails(self) -> int:
+        """返回暂存邮件正文（body TTL 内）总数。"""
+        count = 0
+        for _ in self.r.scan_iter(match=self._k("body", "*")):
+            count += 1
+        return count
+
+    def list_done_mails(self, limit: int = 100, offset: int = 0) -> list[dict]:
         """列出已入库(done)邮件的元数据（正文已释放，用于强制重新处理）。
 
         返回含 message_id / subject / from_addr / date / uid / folder /
@@ -574,12 +595,12 @@ class MailCache:
                 continue
             data["message_id"] = key[prefix_len:]
             mails.append(data)
-            if len(mails) >= limit:
+            if len(mails) >= offset + limit:
                 break
         mails.sort(key=lambda m: m.get("updated_at", ""), reverse=True)
-        return mails
+        return mails[offset:offset + limit]
 
-    def list_recent_mails(self, limit: int = 50) -> list[dict]:
+    def list_recent_mails(self, limit: int = 50, offset: int = 0) -> list[dict]:
         """列出最近暂存的邮件正文（供前端工作台展示）"""
         mails = []
         for key in self.r.scan_iter(match=self._k("body", "*")):
@@ -590,10 +611,10 @@ class MailCache:
                 mails.append(json.loads(raw))
             except Exception:
                 pass
-            if len(mails) >= limit:
+            if len(mails) >= offset + limit:
                 break
         mails.sort(key=lambda m: m.get("date", ""), reverse=True)
-        return mails
+        return mails[offset:offset + limit]
 
     # ── 抓取进度 ──
 

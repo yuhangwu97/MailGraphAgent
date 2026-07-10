@@ -909,9 +909,13 @@ class QueryEngine:
         if not self.rf:
             return [], set()
 
-        chunks = self.rf.retrieve_chunks(topic, top_k=30)
+        # 增大 top_k 提升召回率，避免被单一项目邮件占满结果集
+        chunks = self.rf.retrieve_chunks(topic, top_k=50)
         if not chunks:
             return [], set()
+
+        # 多样性去重：每个文档最多保留 3 个 chunk，避免单项目垄断
+        chunks = self._diversify_chunks(chunks, max_per_doc=3)
 
         cache = self._get_cache()
         doc_ids = set()
@@ -926,6 +930,18 @@ class QueryEngine:
         if cache is not None and doc_ids:
             mids.update(cache.message_ids_for_docs(list(doc_ids)))
         return chunks, mids
+
+    def _diversify_chunks(self, chunks: list[dict], max_per_doc: int = 3) -> list[dict]:
+        """限制每个文档的 chunk 数量，保证结果多样性。"""
+        seen: dict[str, int] = {}
+        diverse = []
+        for c in chunks:
+            doc_id = self._chunk_doc_id(c) or c.get("doc_name", c.get("document_id", ""))
+            count = seen.get(doc_id, 0)
+            if count < max_per_doc:
+                diverse.append(c)
+                seen[doc_id] = count + 1
+        return diverse
 
     def _retrieve_hybrid_chunks(self, topic: str, matched_ids: list[str]) -> list[dict]:
         chunks, _ = self._retrieve_topic_message_ids(topic)
@@ -1074,13 +1090,11 @@ RAGFlow chunk 证据：
     def _execute_content_query(self, question: str, plan: QueryPlan,
                                start_time: float,
                                context: dict | None = None) -> dict:
-        # content_query → RAGFlow
-        enriched_question = question
+        # content_query → 宽域检索 + LLM 总结
+        # 注意：检索只用原始问题，避免 memory/history 污染语义搜索
         context_text = self._context_prompt(context)
-        if context_text:
-            enriched_question = f"{context_text}\n\n当前用户问题：{question}"
         answer, trace, entities, relationships, chunks = \
-            self._native_query(enriched_question)
+            self._native_query(question, context_text)
         total_dur = int((time.time() - start_time) * 1000)
         rows = self._to_rows(entities, relationships)
         return {
@@ -1102,39 +1116,34 @@ RAGFlow chunk 证据：
     # RAGFlow 内容查询（不变）
     # ═══════════════════════════════════════════
 
-    def _native_query(self, question: str):
+    def _native_query(self, question: str, context_text: str = ""):
         t0 = time.time()
-        res = self.rf.chat_answer(question)
-        answer = res.get("answer", "")
-        refs = res.get("references", [])
 
-        if not answer:
-            fallback_chunks = self.rf.retrieve_chunks(question, top_k=10)
-            answer = self._summarize(question, [], [], fallback_chunks)
+        # 宽域检索：只用原始问题做语义搜索，避免 memory/history 污染
+        chunks = self.rf.retrieve_chunks(question, top_k=50)
+        chunks = self._diversify_chunks(chunks, max_per_doc=3)
+
+        if not chunks:
             trace = [{
-                "name": "RAGFlow 原生问答（回退本地总结）", "icon": "✨",
-                "content": f"原生无结果，改用 {len(fallback_chunks)} 段检索总结",
-                "status": "warning", "color": "#F59E0B",
+                "name": "RAGFlow 检索无结果", "icon": "✨",
+                "content": "RAGFlow 未检索到任何相关文档",
+                "status": "fail", "color": "#EF4444",
                 "duration_ms": int((time.time() - t0) * 1000),
             }]
-            return answer, trace, [], [], fallback_chunks
+            return "未找到相关信息，请尝试其他关键词或先导入邮件数据。", trace, [], [], []
 
+        # LLM 总结时引入上下文记忆，帮助理解用户意图
+        enriched_question = question
+        if context_text:
+            enriched_question = f"{context_text}\n\n当前用户问题：{question}"
+        answer = self._summarize(enriched_question, [], [], chunks)
         trace = [{
-            "name": "RAGFlow 原生问答（检索+图谱+生成）", "icon": "✨",
-            "content": f"引用 {len(refs)} 段来源",
-            "detail": "、".join(r.get("doc_name", "") for r in refs[:5] if r.get("doc_name")),
+            "name": "RAGFlow 宽域检索+LLM 总结", "icon": "✨",
+            "content": f"检索 {len(chunks)} 段文档，LLM 总结回答",
             "status": "ok", "color": "#8B5CF6",
             "duration_ms": int((time.time() - t0) * 1000),
         }]
-
-        entities, relationships = [], []
-        try:
-            entities = self.rf.get_graph_entities(page_size=100)
-            relationships = self.rf.get_graph_relationships(page_size=500)
-        except Exception as e:
-            logger.warning("获取图谱数据失败: %s", e)
-
-        return answer, trace, entities, relationships, refs
+        return answer, trace, [], [], chunks
 
     def _summarize(self, question: str, entities: list,
                    relationships: list, chunks: list) -> str:
@@ -1156,10 +1165,16 @@ RAGFlow chunk 证据：
             parts.append(f"关系: {', '.join(f'{k}×{v}' for k, v in rs.items())}")
         if chunks:
             context = "\n---\n".join(
-                c.get("content", "")[:400] for c in chunks[:5])
+                c.get("content", "")[:400] for c in chunks[:10])
+            system_prompt = (
+                "你是一个精准的信息提取助手。请仔细阅读提供的邮件文档，"
+                "提取与用户问题直接相关的所有信息。即使信息分散在多封邮件中，"
+                "也要逐一列出。如果有具体数字（金额、日期、百分比），务必引用。"
+                "不要说'未找到'除非你真的逐条检查了所有文档。"
+            )
             summary = self._call_llm(
-                f"基于以下信息简洁回答（中文，<200字）：\n问题：{question}\n图谱：{'; '.join(parts)}\n文档：{context}",
-                400)
+                f"问题：{question}\n\n邮件文档：\n{context}",
+                max_tokens=800, system=system_prompt)
             if summary and summary != "{}":
                 return summary
         if entities:

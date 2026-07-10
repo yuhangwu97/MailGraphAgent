@@ -126,13 +126,38 @@ export interface MailDetail extends MailItem {
   body: string; to_addrs: string[]; cc_addrs: string[]
 }
 
+export interface MailQueryRequest {
+  start_time?: string
+  end_time?: string
+  status?: string
+  sender?: string
+  has_attachment?: boolean
+  message_ids?: string[]
+  topic?: string
+  aggregation?: 'count' | 'list' | 'rate' | 'top_senders'
+  limit?: number
+}
+
+export interface PaginatedMails {
+  items: MailItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
 export const mailsApi = {
   stats: () => request<MailStats>('/mails/stats'),
   pending: () => request<MailItem[]>('/mails/pending'),
-  done: (limit = 100) => request<MailItem[]>(`/mails/done?limit=${limit}`),
-  recent: (limit = 50) => request<MailItem[]>(`/mails/recent?limit=${limit}`),
+  done: (params?: { page?: number; page_size?: number }) => {
+    const p = params || {}
+    return request<PaginatedMails>(`/mails/done?page=${p.page ?? 1}&page_size=${p.page_size ?? 20}`)
+  },
+  recent: (params?: { page?: number; page_size?: number }) => {
+    const p = params || {}
+    return request<PaginatedMails>(`/mails/recent?page=${p.page ?? 1}&page_size=${p.page_size ?? 20}`)
+  },
   detail: (id: string) => request<MailDetail>(`/mails/${id}`),
-  query: (data: unknown) => request<any>('/mails/query', { method: 'POST', body: JSON.stringify(data) }),
+  query: (data: MailQueryRequest) => request<any>('/mails/query', { method: 'POST', body: JSON.stringify(data) }),
 
   fetch: (folder: string, limit: number, handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/fetch', { folder, limit }, handlers),

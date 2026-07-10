@@ -40,7 +40,7 @@ const kpiCards = [
 
 async function refreshStats() { try { kpi.value = await mailsApi.stats() } catch (e) { console.error(e) } }
 async function refreshPending() { try { pendingMails.value = await mailsApi.pending() } catch (e) { console.error(e) } }
-async function refreshDone() { try { doneMails.value = await mailsApi.done(100) } catch (e) { console.error(e) } }
+async function refreshDone() { try { const r = await mailsApi.done({ page_size: 100 }); doneMails.value = r.items } catch (e) { console.error(e) } }
 
 async function handleFetch() {
   fetching.value = true; fetchLogs.value = []

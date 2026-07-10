@@ -220,6 +220,17 @@ export class ForceGraph {
     this.offsetY = this.H / 2 - ((minY + maxY) / 2) * this.scale
   }
 
+  /** Zoom by a factor around the center of the viewport */
+  zoom(factor: number) {
+    const cx = this.W / 2
+    const cy = this.H / 2
+    const worldX = (cx - this.offsetX) / this.scale
+    const worldY = (cy - this.offsetY) / this.scale
+    this.scale = clamp(this.scale * factor, 0.1, 3.5)
+    this.offsetX = cx - worldX * this.scale
+    this.offsetY = cy - worldY * this.scale
+  }
+
   destroy() {
     this.stop()
     this.unbindEvents()

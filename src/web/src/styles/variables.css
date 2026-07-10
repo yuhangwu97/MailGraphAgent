@@ -1,66 +1,111 @@
 /* ═══════════════════════════════════════════════════════════════
-   Design System — migrated from Streamlit CSS (app.py)
-   Linear/Notion-inspired SaaS palette
+   MailGraph Design System v2 — Product-grade SaaS palette
+   Inspired by Linear, Notion, Vercel
    ═══════════════════════════════════════════════════════════════ */
 
 :root {
-  /* Primary — deep teal-green */
+  /* ── Primary — deep teal-green ── */
   --p: #1F6F5C;
   --p-hover: #1A5C4C;
   --p-light: #EAF3F0;
-  --p-ring: #C4E0D7;
+  --p-ring: rgba(31, 111, 92, 0.2);
+  --p-bg: rgba(31, 111, 92, 0.06);
+  --p-text: #1F6F5C;
 
-  /* Neutrals — warm white/stone base */
+  /* ── Neutrals — warm white/stone base ── */
   --bg: #FAFAF9;
   --surface: #FFFFFF;
   --surface-2: #F5F4F2;
   --border: #E7E5E1;
   --border-light: #F0EFEC;
 
-  /* Text */
+  /* ── Text scale ── */
   --t1: #14110F;
   --t2: #3D3A36;
   --t3: #57534E;
   --t4: #A8A29E;
   --t5: #D6D3CE;
 
-  /* Semantic */
+  /* ── Semantic colors ── */
   --green: #2E9E6E;
   --green-bg: #E7F4EE;
   --green-t: #1A5C4C;
+
   --amber: #B4791F;
   --amber-bg: #F7EFE0;
   --amber-t: #7A4E12;
+
   --red: #9A3B2E;
   --red-bg: #F4E9E6;
   --red-t: #6E2A20;
-  --purple: #4A5568;
-  --purple-bg: #EEF0F2;
-  --purple-t: #2D3748;
+
+  --blue: #2D5F8A;
+  --blue-bg: rgba(45, 95, 138, 0.08);
+  --blue-t: #214568;
+
+  --purple: #6B4C8A;
+  --purple-bg: rgba(107, 76, 138, 0.08);
+  --purple-t: #523A6B;
+
   --cyan: #4A7C8A;
   --cyan-bg: #E9F0F2;
   --cyan-t: #2C4A52;
 
-  /* Graph nodes — muted earth tones */
+  /* ── Graph node colors (CSS side) ── */
   --node-company: #1F6F5C;
   --node-contact: #C08A3E;
   --node-project: #9A3B2E;
   --node-emp: #4A5568;
+  --node-dept: #5A6F8A;
+  --node-email: #6B8A5A;
 
-  /* Sidebar */
+  /* ── Sidebar ── */
   --side: #1A1613;
+  --side-text: #9B9590;
+  --side-active: #FFFFFF;
+  --side-hover: rgba(255, 255, 255, 0.05);
+  --side-border: rgba(255, 255, 255, 0.06);
+  --sidebar-w: 240px;
 
-  /* Radii */
-  --r: 10px;
+  /* ── Radius scale ── */
+  --r: 8px;
   --r-sm: 6px;
   --r-lg: 14px;
+  --r-xl: 20px;
 
-  /* Shadows */
-  --sh-sm: 0 1px 2px rgba(20, 17, 15, 0.05);
-  --sh: 0 1px 3px rgba(20, 17, 15, 0.07), 0 1px 2px rgba(20, 17, 15, 0.04);
-  --sh-md: 0 6px 16px rgba(20, 17, 15, 0.08), 0 2px 6px rgba(20, 17, 15, 0.04);
-  --sh-lg: 0 14px 34px rgba(20, 17, 15, 0.10), 0 5px 10px rgba(20, 17, 15, 0.05);
+  /* ── Shadow scale ── */
+  --sh-xs: 0 1px 2px rgba(20, 17, 15, 0.04);
+  --sh-sm: 0 1px 3px rgba(20, 17, 15, 0.06), 0 1px 2px rgba(20, 17, 15, 0.04);
+  --sh: 0 4px 14px rgba(20, 17, 15, 0.06), 0 1px 4px rgba(20, 17, 15, 0.04);
+  --sh-md: 0 8px 28px rgba(20, 17, 15, 0.08), 0 2px 8px rgba(20, 17, 15, 0.04);
+  --sh-lg: 0 16px 48px rgba(20, 17, 15, 0.1), 0 4px 14px rgba(20, 17, 15, 0.05);
 
-  /* Layout */
-  --sidebar-w: 260px;
+  /* ── Spacing scale ── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* ── Type scale ── */
+  --text-xs: 0.7rem;
+  --text-sm: 0.8rem;
+  --text-base: 0.92rem;
+  --text-md: 1.05rem;
+  --text-lg: 1.2rem;
+  --text-xl: 1.5rem;
+
+  /* ── Layout ── */
+  --header-h: 3rem;
+  --max-w: 1200px;
+
+  /* ── Transitions ── */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --dur-fast: 0.12s;
+  --dur: 0.2s;
+  --dur-slow: 0.35s;
 }

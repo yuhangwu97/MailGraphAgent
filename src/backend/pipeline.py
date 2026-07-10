@@ -139,7 +139,8 @@ class Pipeline:
                 "timestamp": parsed.timestamp,
                 "cleaned_body": cleaned,
                 "attachments": [
-                    {"filename": a["filename"], "path": a["path"]}
+                    {"filename": a["filename"], "path": a["path"],
+                     "mime_type": a.get("mime_type", ""), "size": a.get("size", 0)}
                     for a in parsed.attachments
                 ],
             })

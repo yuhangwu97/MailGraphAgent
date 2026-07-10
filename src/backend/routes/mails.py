@@ -21,6 +21,7 @@ from src.backend.schemas import (
     MailItem,
     MailQueryRequest,
     MailStats,
+    PaginatedMailResponse,
     ReprocessRequest,
 )
 
@@ -54,6 +55,11 @@ def mail_query(body: MailQueryRequest, cache=Depends(get_cache)):
     if cache is None:
         raise HTTPException(status_code=503, detail="Redis unavailable")
     try:
+        # Map aggregation to group_by for MailCache.query_stats
+        group_by = None
+        if body.aggregation == "top_senders":
+            group_by = "sender"
+
         result = cache.query_stats(
             start_time=body.start_time,
             end_time=body.end_time,
@@ -61,8 +67,7 @@ def mail_query(body: MailQueryRequest, cache=Depends(get_cache)):
             sender=body.sender,
             has_attachment=body.has_attachment,
             message_ids=body.message_ids,
-            topic=body.topic,
-            aggregation=body.aggregation,
+            group_by=group_by,
             limit=body.limit,
         )
         return result
@@ -86,20 +91,42 @@ def pending_mails(cache=Depends(get_cache)):
     return items
 
 
-@router.get("/done", response_model=list[MailItem])
-def done_mails(limit: int = Query(100, ge=1, le=500), cache=Depends(get_cache)):
+@router.get("/done", response_model=PaginatedMailResponse)
+def done_mails(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=500),
+    cache=Depends(get_cache),
+):
     if cache is None:
         raise HTTPException(status_code=503, detail="Redis unavailable")
-    mails = cache.list_done_mails(limit=limit)
-    return [_to_mail_item(m) for m in mails]
+    offset = (page - 1) * page_size
+    mails = cache.list_done_mails(limit=page_size, offset=offset)
+    total = cache.count_done_mails()
+    return PaginatedMailResponse(
+        items=[_to_mail_item(m) for m in mails],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
-@router.get("/recent", response_model=list[MailItem])
-def recent_mails(limit: int = Query(50, ge=1, le=200), cache=Depends(get_cache)):
+@router.get("/recent", response_model=PaginatedMailResponse)
+def recent_mails(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    cache=Depends(get_cache),
+):
     if cache is None:
         raise HTTPException(status_code=503, detail="Redis unavailable")
-    mails = cache.list_recent_mails(limit=limit)
-    return [_to_mail_item(m) for m in mails]
+    offset = (page - 1) * page_size
+    mails = cache.list_recent_mails(limit=page_size, offset=offset)
+    total = cache.count_recent_mails()
+    return PaginatedMailResponse(
+        items=[_to_mail_item(m) for m in mails],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/{message_id}", response_model=MailDetail)

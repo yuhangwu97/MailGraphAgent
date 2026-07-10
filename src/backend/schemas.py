@@ -66,6 +66,13 @@ class MailItem(BaseModel):
     attachments: list[dict] = Field(default_factory=list)
 
 
+class PaginatedMailResponse(BaseModel):
+    items: list[MailItem]
+    total: int
+    page: int
+    page_size: int
+
+
 class MailDetail(MailItem):
     body: str = ""
     to_addrs: list[str] = Field(default_factory=list)
