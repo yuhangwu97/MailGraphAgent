@@ -99,8 +99,8 @@ input:focus, select:focus, textarea:focus {
 .main-content {
   flex: 1;
   padding: 1.5rem 2rem 2rem 2rem;
-  max-width: 1344px;
   margin-left: var(--sidebar-w);
+  min-width: 0;
 }
 
 h2 { font-size: 1.4rem; font-weight: 700; color: var(--t1); letter-spacing: -0.3px; }
