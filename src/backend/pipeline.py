@@ -94,19 +94,28 @@ class Pipeline:
         log(f"已入队 {queued} 封邮件，待 ingest")
         return queued
 
-    def _store_fetched_mail(self, uid, msg, folder, cache, cleaner, attach_root):
+    def _store_fetched_mail(self, uid, msg, folder, cache, cleaner, attach_root,
+                            forced_message_id: str = "", apply_noise_filter: bool = True):
         """解析 + 清洗 + 噪音过滤 + 暂存一封邮件。
 
         入队成功返回 parsed 对象；被去重/噪音跳过或失败返回 None。
-        run_fetch 与 reprocess 共用此逻辑。
+        run_fetch / reprocess / parse_selected（文件邮件）共用此逻辑。
+
+        - forced_message_id: 文件邮件解析出的 msg 可能无 Message-ID，沿用扫描阶段
+          合成的 id，保证「先扫表头、再解析」两段的 message_id 一致。
+        - apply_noise_filter: 用户显式勾选解析的邮件不应被噪音过滤误跳过，可关掉。
         """
         from src.backend.mail.parser import parse_email
 
         parsed = None
         try:
             # 关键：传 download_dir，附件才会被提取（旧流程漏了这一步）
-            dl_dir = Path(attach_root) / _safe(uid)
+            dl_dir = Path(attach_root) / _safe(uid or forced_message_id or "file")
             parsed = parse_email(msg, download_dir=dl_dir)
+
+            # 文件邮件兜底：无 Message-ID 时用扫描阶段合成的 id
+            if not parsed.message_id and forced_message_id:
+                parsed.message_id = forced_message_id
 
             # message_id 级兜底去重（UID 复用 / 跨 folder 同信时 UID 过滤会漏）
             if cache.is_processed(parsed.message_id):
@@ -121,7 +130,7 @@ class Pipeline:
                 attachment_count=len(parsed.attachments or []),
             )
 
-            if self.cfg.enable_noise_filter and \
+            if apply_noise_filter and self.cfg.enable_noise_filter and \
                     cleaner.is_noise_email(parsed.subject, parsed.from_addr, cleaned):
                 cache.mark_skipped(parsed.message_id, "噪音邮件")
                 return None
@@ -245,6 +254,115 @@ class Pipeline:
         """fetch + ingest 一条龙"""
         self.run_fetch(folder=folder, limit=limit, since=since, on_log=on_log)
         return self.run_ingest(on_log=on_log)
+
+    # ══════════════════════════════════════════════
+    # 文件邮件源：Step1 扫表头 / Step2 按需解析+向量化
+    # ══════════════════════════════════════════════
+
+    def run_index_files(self, paths: list[str], on_log=None) -> dict:
+        """Step 1：扫描本地邮件文件（.eml/.msg/.pst/.ost）的表头，存入 indexed。
+
+        只读 Subject/Message-ID/发件人/日期/文件夹，不读正文。返回统计。
+        """
+        from src.backend.mail.sources import expand_paths, scan_file
+        from src.backend.storage.redis_cache import MailCache
+
+        log = on_log or (lambda m: logger.info(m))
+        if not self.account:
+            log("未配置邮箱账号，请先在工作台添加")
+            return {"files": 0, "scanned": 0, "indexed": 0}
+
+        files = expand_paths(paths)
+        if not files:
+            log("未找到受支持的邮件文件（.eml/.msg/.pst/.ost）")
+            return {"files": 0, "scanned": 0, "indexed": 0}
+
+        cache = MailCache(self.account_id)
+        stats = {"files": len(files), "scanned": 0, "indexed": 0}
+        try:
+            for fp in files:
+                log(f"扫描 {fp.name} ...")
+                try:
+                    for rec in scan_file(str(fp)):
+                        stats["scanned"] += 1
+                        if cache.store_indexed(rec):
+                            stats["indexed"] += 1
+                        if stats["scanned"] % 200 == 0:
+                            log(f"  已扫描 {stats['scanned']} 封，新增 {stats['indexed']}")
+                except Exception as e:
+                    logger.error("扫描文件失败 %s: %s", fp, e)
+                    log(f"  ✗ {fp.name} 扫描失败: {e}")
+        finally:
+            cache.close()
+        log(f"扫描完成：{stats['files']} 个文件，共 {stats['scanned']} 封，"
+            f"新增待解析 {stats['indexed']}")
+        return stats
+
+    def parse_selected(self, message_ids: list[str], on_log=None) -> dict:
+        """Step 2：对选中的 indexed 邮件回原文件读正文（含附件），清洗入队后 ingest 向量化。
+
+        按源文件归组，PST/OST 每个文件只 open 一次。用户显式勾选的邮件不做噪音过滤。
+        """
+        import json as _json
+
+        from src.backend.mail.sources import open_reader
+        from src.backend.mail.cleaner import MailCleaner
+        from src.backend.storage.redis_cache import MailCache
+
+        log = on_log or (lambda m: logger.info(m))
+        if not self.account:
+            log("未配置邮箱账号")
+            return {"total": 0, "uploaded": 0, "failed": 0, "attachments": 0, "queued": 0}
+        cache = MailCache(self.account_id)
+        cleaner = MailCleaner()
+        attach_root = self.cfg.resolve_data_path("attachments")
+
+        queued = 0
+        # 按 (源类型, 源文件) 归组
+        groups: dict[tuple[str, str], list[tuple[str, dict, str]]] = {}
+        try:
+            for mid in message_ids or []:
+                state = cache.get_mail_state(mid)
+                if not state or state.get("status") == "done":
+                    continue
+                try:
+                    locator = _json.loads(state.get("source_locator") or "{}")
+                except Exception:
+                    locator = {}
+                if not locator:
+                    continue
+                key = (locator.get("source_type", ""), locator.get("path", ""))
+                groups.setdefault(key, []).append((mid, locator, state.get("folder", "")))
+
+            for (stype, spath), items in groups.items():
+                log(f"解析 {Path(spath).name} 的 {len(items)} 封...")
+                reader = open_reader(stype, spath)
+                try:
+                    for mid, locator, folder in items:
+                        try:
+                            msg = reader.read(locator)
+                            parsed = self._store_fetched_mail(
+                                "", msg, folder, cache, cleaner, attach_root,
+                                forced_message_id=mid, apply_noise_filter=False,
+                            )
+                            if parsed is not None:
+                                queued += 1
+                                log(f"  [{queued}] {(parsed.subject or '(无主题)')[:50]}")
+                        except Exception as e:
+                            logger.error("解析失败 %s: %s", mid, e)
+                            cache.mark_failed(mid, str(e))
+                finally:
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+        finally:
+            cache.close()
+
+        log(f"已解析入队 {queued} 封，开始向量化 + GraphRAG 建图...")
+        stats = self.run_ingest(on_log=on_log)
+        stats["queued"] = queued
+        return stats
 
     # ══════════════════════════════════════════════
     # 强制重新处理（绕过幂等）

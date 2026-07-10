@@ -9,6 +9,10 @@ mail-parser>=3.15.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
+# File-based mail import (.pst/.ost/.eml/.msg)
+extract-msg>=0.55.0          # .msg (pure Python)
+libpff-python>=20231205      # .pst/.ost (pypff). 若某 Python 版本无 wheel，改用 readpst(libpst) 导出 .eml
+
 # Attachment parsing (fallback)
 pypdf>=4.0.0
 python-docx>=1.1.0

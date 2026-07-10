@@ -2,10 +2,11 @@
 import { ref, computed, onMounted } from 'vue'
 import { graphApi } from '@/api'
 import GraphView from '@/components/graph/GraphView.vue'
+import type { RawEntity, RawRelationship } from '@/components/graph/GraphView.vue'
 import { NODE_COLORS, LABEL_NAMES, LABEL_ICONS, colorOf } from '@/components/graph/graphTheme'
 
-const entities = ref<any[]>([])
-const relationships = ref<any[]>([])
+const entities = ref<RawEntity[]>([])
+const relationships = ref<RawRelationship[]>([])
 const buildLogs = ref<string[]>([])
 const building = ref(false)
 const entityTypes = ref<string[]>([])
