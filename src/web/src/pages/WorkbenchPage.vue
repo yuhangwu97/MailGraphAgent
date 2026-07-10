@@ -2,8 +2,9 @@
 import { ref, computed, onMounted } from 'vue'
 import { mailsApi, type MailStats, type MailItem } from '@/api'
 import AccountManager from '@/components/workbench/AccountManager.vue'
+import FileImportPanel from '@/components/workbench/FileImportPanel.vue'
 
-const kpi = ref<MailStats>({ total: 0, done: 0, pending: 0, failed: 0, skipped: 0, ingested: 0 })
+const kpi = ref<MailStats>({ total: 0, done: 0, pending: 0, failed: 0, skipped: 0, ingested: 0, indexed: 0 })
 const pendingMails = ref<MailItem[]>([])
 const doneMails = ref<MailItem[]>([])
 const selectedIds = ref<Set<string>>(new Set())
@@ -12,6 +13,7 @@ const ingestLogs = ref<string[]>([])
 const fetching = ref(false)
 const ingesting = ref(false)
 const activeTab = ref<'pending' | 'done'>('pending')
+const sourceMode = ref<'imap' | 'file'>('imap')
 
 const folder = ref('INBOX')
 const limit = ref(20)
@@ -32,8 +34,9 @@ function toggleSelect(id: string) {
 
 const kpiCards = [
   { key: 'total' as const, value: '邮件总数', color: '#57534E', get: (k: MailStats) => k.total },
+  { key: 'indexed' as const, value: '待解析', color: '#3B6EA5', get: (k: MailStats) => k.indexed },
   { key: 'done' as const, value: '已处理', color: '#1F6F5C', get: (k: MailStats) => k.done },
-  { key: 'pending' as const, value: '待处理', color: '#B4791F', get: (k: MailStats) => k.pending },
+  { key: 'pending' as const, value: '待导入', color: '#B4791F', get: (k: MailStats) => k.pending },
   { key: 'failed' as const, value: '失败', color: '#9A3B2E', get: (k: MailStats) => k.failed },
   { key: 'skipped' as const, value: '已跳过', color: '#A8A29E', get: (k: MailStats) => k.skipped },
 ]
@@ -86,6 +89,18 @@ onMounted(async () => { await Promise.all([refreshStats(), refreshPending(), ref
       </div>
     </div>
 
+    <!-- Source mode switch -->
+    <div class="seg">
+      <button :class="['seg-btn', { active: sourceMode === 'imap' }]" @click="sourceMode = 'imap'">
+        从邮箱拉取 (IMAP)
+      </button>
+      <button :class="['seg-btn', { active: sourceMode === 'file' }]" @click="sourceMode = 'file'">
+        从文件导入 (PST / EML / MSG)
+      </button>
+    </div>
+
+    <!-- ══ IMAP mode ══ -->
+    <div v-if="sourceMode === 'imap'">
     <!-- Toolbar -->
     <div class="toolbar">
       <div class="toolbar-account">
@@ -195,6 +210,17 @@ onMounted(async () => { await Promise.all([refreshStats(), refreshPending(), ref
         重新处理选中 ({{ selectedIds.size }})
       </button>
     </div>
+    </div>
+
+    <!-- ══ File import mode ══ -->
+    <div v-else>
+      <div class="toolbar">
+        <div class="toolbar-account">
+          <AccountManager />
+        </div>
+      </div>
+      <FileImportPanel @changed="() => { refreshStats(); refreshDone() }" />
+    </div>
   </div>
 </template>
 
@@ -214,6 +240,20 @@ onMounted(async () => { await Promise.all([refreshStats(), refreshPending(), ref
 .kpi-item:last-child { border-right: none; }
 .kpi-num { display: block; font-size: 1.35rem; font-weight: 700; line-height: 1.2; }
 .kpi-text { display: block; font-size: 0.7rem; color: var(--t4); margin-top: 0.15rem; }
+
+/* ── Source mode segmented control ── */
+.seg {
+  display: inline-flex; gap: 2px; padding: 3px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-2); margin-bottom: 1rem;
+}
+.seg-btn {
+  padding: 0.4rem 0.9rem; border: none; background: transparent;
+  border-radius: calc(var(--r-sm) - 2px); font-size: 0.8rem; font-weight: 500;
+  color: var(--t4); cursor: pointer; transition: all 0.12s; font-family: inherit;
+}
+.seg-btn:hover { color: var(--t2); }
+.seg-btn.active { background: var(--surface); color: var(--t1); box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
 
 /* ── Toolbar ── */
 .toolbar {

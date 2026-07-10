@@ -142,38 +142,33 @@ async def run_in_thread(fn, *args, **kwargs):
 
 
 async def run_pipeline_with_sse(fn, *args, queue: asyncio.Queue):
-    """Run a Pipeline method in a thread, pushing log messages to an SSE queue."""
+    """Run a Pipeline method in a thread, pushing log messages to an SSE queue.
+
+    Capture the running loop *before* spawning the worker thread — inside the
+    thread there is no current event loop (asyncio.get_event_loop() raises on
+    Python 3.12+), so we must hold a reference to hand items back thread-safely.
+    """
+    main_loop = asyncio.get_running_loop()
+
+    def _put(item):
+        try:
+            main_loop.call_soon_threadsafe(queue.put_nowait, item)
+        except Exception:
+            pass
 
     def _target():
         def on_log(msg: str):
-            # Push from thread — must be thread-safe
-            try:
-                loop = asyncio.get_event_loop()
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, {"event": "progress", "data": {"msg": msg}}
-                )
-            except Exception:
-                pass
+            _put({"event": "progress", "data": {"msg": msg}})
 
         try:
             result = fn(on_log=on_log, *args)
-            # Push result on main thread
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"event": "complete", "data": result if isinstance(result, dict) else {"result": str(result)}},
-            )
+            _put({
+                "event": "complete",
+                "data": result if isinstance(result, dict) else {"result": str(result)},
+            })
         except Exception as exc:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                {"event": "error", "data": {"msg": str(exc)}},
-            )
+            _put({"event": "error", "data": {"msg": str(exc)}})
         finally:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+            _put(None)  # sentinel
 
-    import asyncio
-
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _target)
+    await main_loop.run_in_executor(None, _target)

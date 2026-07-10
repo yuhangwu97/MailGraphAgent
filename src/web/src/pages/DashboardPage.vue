@@ -5,7 +5,7 @@ import SvgIcon from '@/components/SvgIcon.vue'
 import KpiCards from '@/components/dashboard/KpiCards.vue'
 import ProjectCard from '@/components/dashboard/ProjectCard.vue'
 
-const kpi = ref<MailStats>({ total: 0, done: 0, pending: 0, failed: 0, skipped: 0, ingested: 0 })
+const kpi = ref<MailStats>({ total: 0, done: 0, pending: 0, failed: 0, skipped: 0, ingested: 0, indexed: 0 })
 const graphNodes = ref(0)
 const projectCount = ref(0)
 const contactCount = ref(0)
@@ -13,26 +13,68 @@ const projects = ref<any[]>([])
 const search = ref('')
 const loading = ref(true)
 
+const PEOPLE_TYPES = ['Contact', 'Employee', 'Person']
+
 onMounted(async () => {
   try {
-    const [stats, entRes] = await Promise.all([
+    const [stats, entRes, relRes] = await Promise.all([
       mailsApi.stats(),
       graphApi.entities(1, 500),
+      graphApi.relationships(1, 2000),
     ])
     kpi.value = stats
     const entities = entRes.entities || []
+    const rels = relRes.relationships || []
     graphNodes.value = entities.length
     projectCount.value = entities.filter((e: any) => e.type === 'Project').length
     contactCount.value = entities.filter((e: any) => ['Contact', 'Employee'].includes(e.type)).length
 
+    // 实体按 id 与 name 双键索引，关系边的端点可能用其中任一标识
+    const byKey = new Map<string, any>()
+    for (const e of entities) {
+      if (e.id) byKey.set(String(e.id), e)
+      if (e.name) byKey.set(String(e.name), e)
+    }
+
+    // 为每个项目收集其在图谱中的邻居实体
+    const neighborsOf = (proj: any): any[] => {
+      const keys = new Set([String(proj.id), String(proj.name)].filter(Boolean))
+      const out: any[] = []
+      const seen = new Set<string>()
+      for (const r of rels) {
+        const s = String(r.source_id ?? '')
+        const t = String(r.target_id ?? '')
+        let otherKey = ''
+        if (keys.has(s)) otherKey = t
+        else if (keys.has(t)) otherKey = s
+        if (!otherKey) continue
+        const ent = byKey.get(otherKey)
+        if (!ent || !ent.name) continue
+        const dedupe = String(ent.id || ent.name)
+        if (seen.has(dedupe)) continue
+        seen.add(dedupe)
+        out.push(ent)
+      }
+      return out
+    }
+
+    const clean = (s: string) => (s || '').replace(/<[^>]*>/g, '')
+
     projects.value = entities
       .filter((e: any) => e.type === 'Project')
-      .map((p: any) => ({
-        name: (p.name || '').replace(/<[^>]*>/g, ''),
-        description: ((p.description || '') + '').replace(/<[^>]*>/g, '').slice(0, 200),
-        people: [],
-        companies: [],
-      }))
+      .map((p: any) => {
+        const neighbors = neighborsOf(p)
+        return {
+          name: clean(p.name),
+          description: clean((p.description || '') + '').slice(0, 200),
+          people: neighbors
+            .filter((n: any) => PEOPLE_TYPES.includes(n.type))
+            .map((n: any) => ({ name: clean(n.name) })),
+          companies: neighbors
+            .filter((n: any) => n.type === 'Company')
+            .map((n: any) => ({ name: clean(n.name) })),
+        }
+      })
   } catch (e) {
     console.error(e)
   } finally {

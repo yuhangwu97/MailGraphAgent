@@ -41,6 +41,7 @@ class MailStats(BaseModel):
     failed: int
     skipped: int
     ingested: int = 0
+    indexed: int = 0
 
 
 class MailQueryRequest(BaseModel):
@@ -64,6 +65,8 @@ class MailItem(BaseModel):
     status: str = "pending"
     attachment_count: int = 0
     attachments: list[dict] = Field(default_factory=list)
+    folder: str = ""
+    source_type: str = ""
 
 
 class PaginatedMailResponse(BaseModel):
@@ -90,6 +93,30 @@ class IngestRequest(BaseModel):
 
 class ReprocessRequest(BaseModel):
     message_ids: list[str]
+
+
+# ── 文件邮件导入（本地 .eml/.msg/.pst/.ost）──
+
+class IndexFilesRequest(BaseModel):
+    """Step 1：扫描给定本地文件/目录路径的邮件表头。"""
+    paths: list[str]
+
+
+class ParseSelectedRequest(BaseModel):
+    """Step 2：解析并向量化选中的 indexed 邮件。"""
+    message_ids: list[str]
+
+
+class BrowseFile(BaseModel):
+    path: str
+    name: str
+    size: int = 0
+    ext: str = ""
+
+
+class BrowseResponse(BaseModel):
+    dir: str
+    files: list[BrowseFile] = Field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════

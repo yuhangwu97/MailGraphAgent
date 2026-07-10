@@ -113,13 +113,22 @@ export const accountsApi = {
 
 export interface MailStats {
   total: number; done: number; pending: number
-  failed: number; skipped: number; ingested: number
+  failed: number; skipped: number; ingested: number; indexed: number
 }
 
 export interface MailItem {
   message_id: string; subject: string; from_addr: string
   from_name: string; date: string; status: string
   attachment_count: number; attachments: { filename: string }[]
+  folder?: string; source_type?: string
+}
+
+export interface BrowseFile {
+  path: string; name: string; size: number; ext: string
+}
+
+export interface BrowseResponse {
+  dir: string; files: BrowseFile[]
 }
 
 export interface MailDetail extends MailItem {
@@ -165,6 +174,17 @@ export const mailsApi = {
     sseStream('/mails/ingest', { limit }, handlers),
   reprocess: (messageIds: string[], handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/reprocess', { message_ids: messageIds }, handlers),
+
+  // ── File import (.eml/.msg/.pst/.ost) ──
+  browse: (dir: string) => request<BrowseResponse>(`/mails/browse?dir=${encodeURIComponent(dir)}`),
+  indexed: (params?: { page?: number; page_size?: number }) => {
+    const p = params || {}
+    return request<PaginatedMails>(`/mails/indexed?page=${p.page ?? 1}&page_size=${p.page_size ?? 50}`)
+  },
+  indexFiles: (paths: string[], handlers: Parameters<typeof sseStream>[2]) =>
+    sseStream('/mails/index', { paths }, handlers),
+  parseSelected: (messageIds: string[], handlers: Parameters<typeof sseStream>[2]) =>
+    sseStream('/mails/parse-selected', { message_ids: messageIds }, handlers),
 }
 
 // ═══════════════════════════════════════════════════════════════

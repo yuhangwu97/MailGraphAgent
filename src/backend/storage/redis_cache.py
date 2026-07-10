@@ -272,7 +272,7 @@ class MailCache:
         return count
 
     def get_stats(self) -> dict:
-        stats = {"done": 0, "failed": 0, "skipped": 0, "processing": 0, "pending": 0}
+        stats = {"done": 0, "failed": 0, "skipped": 0, "processing": 0, "pending": 0, "indexed": 0}
         for key in self.r.scan_iter(match=self._k("mail", "*")):
             if self.r.type(key) != "hash":
                 continue
@@ -598,6 +598,83 @@ class MailCache:
             if len(mails) >= offset + limit:
                 break
         mails.sort(key=lambda m: m.get("updated_at", ""), reverse=True)
+        return mails[offset:offset + limit]
+
+    # ── 文件邮件源：indexed（表头已知、正文未解析）──
+
+    def store_indexed(self, rec) -> bool:
+        """暂存一条文件邮件表头（status=indexed），记录回读定位符，不写正文/不入队。
+
+        rec 为 HeaderRecord。返回是否新增（已存在任何状态则跳过，保证去重幂等）。
+        """
+        import json as _json
+
+        mid = getattr(rec, "message_id", "") or ""
+        if not mid:
+            return False
+        # 去重：已存在（indexed/pending/processing/done/failed/skipped）则跳过
+        if self.get_mail_state(mid):
+            return False
+
+        locator = getattr(rec, "locator", {}) or {}
+        key = self._k("mail", mid)
+        data = {
+            "message_id": mid,
+            "uid": "",
+            "folder": getattr(rec, "folder", "") or "",
+            "subject": getattr(rec, "subject", "") or "",
+            "from_addr": getattr(rec, "from_addr", "") or "",
+            "from_name": getattr(rec, "from_name", "") or "",
+            "date": getattr(rec, "date", "") or "",
+            "attachment_count": "1" if getattr(rec, "has_attachment", False) else "0",
+            "status": "indexed",
+            "source_type": locator.get("source_type", ""),
+            "source_path": locator.get("path", ""),
+            "source_locator": _json.dumps(locator, ensure_ascii=False),
+            "updated_at": str(time.time()),
+        }
+        pipe = self.r.pipeline()
+        pipe.hset(key, mapping=data)
+        self._index_state(pipe, mid, data)
+        pipe.execute()
+        return True
+
+    def count_indexed(self) -> int:
+        """已扫描待解析(indexed)邮件总数。优先 status 索引集 (SCARD)。"""
+        idx_key = self._status_key("indexed")
+        if self.r.exists(idx_key):
+            return self.r.scard(idx_key)
+        count = 0
+        for key in self.r.scan_iter(match=self._k("mail", "*")):
+            if self.r.type(key) != "hash":
+                continue
+            if self.r.hget(key, "status") == "indexed":
+                count += 1
+        return count
+
+    def list_indexed(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """列出 indexed 邮件（表头 + 回读定位符），按 date 倒序分页。"""
+        idx_key = self._status_key("indexed")
+        mids = list(self.r.smembers(idx_key)) if self.r.exists(idx_key) else []
+        mails: list[dict] = []
+        if mids:
+            for mid in mids:
+                data = self.r.hgetall(self._k("mail", mid))
+                if data.get("status") == "indexed":
+                    data["message_id"] = mid
+                    mails.append(data)
+        else:
+            # 回退：无索引集时全量扫描
+            prefix_len = len(self._prefix) + len("mail:")
+            for key in self.r.scan_iter(match=self._k("mail", "*")):
+                if self.r.type(key) != "hash":
+                    continue
+                data = self.r.hgetall(key)
+                if data.get("status") != "indexed":
+                    continue
+                data["message_id"] = key[prefix_len:]
+                mails.append(data)
+        mails.sort(key=lambda m: m.get("date", ""), reverse=True)
         return mails[offset:offset + limit]
 
     def list_recent_mails(self, limit: int = 50, offset: int = 0) -> list[dict]:
