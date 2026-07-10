@@ -73,65 +73,83 @@ onMounted(loadGraph)
 </script>
 
 <template>
-  <div>
-    <div class="graph-header">
-      <div>
-        <h2>🔗 关系图谱</h2>
-        <p class="text-muted">客户公司 — 对接人 — 项目 — 内部负责人 · 全局关系可视化</p>
+  <div class="graph-dashboard">
+    <!-- Top toolbar -->
+    <div class="graph-toolbar">
+      <div class="toolbar-left">
+        <h2 class="toolbar-title">🕸️ 关系图谱</h2>
+        <span class="toolbar-sub">全局关系可视化 · 大屏模式</span>
       </div>
-      <button class="btn btn-primary build-btn" :disabled="building" @click="handleBuild">
-        🔄 {{ building ? '建图中…' : '重建图谱' }}
-      </button>
+      <div class="toolbar-center">
+        <div class="stat-pills-inline">
+          <span class="stat-pill-mini">节点 <b>{{ shownEntities.length }}</b></span>
+          <span class="stat-pill-mini">关系 <b>{{ shownRelationships.length }}</b></span>
+        </div>
+      </div>
+      <div class="toolbar-right">
+        <div class="filter-row" v-if="entityTypes.length">
+          <label
+            v-for="t in entityTypes" :key="t"
+            class="filter-chip" :class="{ active: selectedTypes.includes(t) }"
+            :style="{ '--chip': colorOf(t) }"
+          >
+            <input type="checkbox" :checked="selectedTypes.includes(t)" @change="toggleType(t)" hidden />
+            <span class="chip-dot"></span>
+            {{ LABEL_ICONS[t] || '' }} {{ LABEL_NAMES[t] || t }}
+            <span class="chip-count">{{ typeCounts[t] }}</span>
+          </label>
+        </div>
+        <button class="btn btn-primary build-btn" :disabled="building" @click="handleBuild">
+          🔄 {{ building ? '建图中…' : '重建' }}
+        </button>
+      </div>
     </div>
 
+    <!-- Build log -->
     <div v-if="buildLogs.length" class="log-box">
       <div v-for="(l, i) in buildLogs" :key="i">{{ l }}</div>
     </div>
 
-    <!-- Stat pills -->
-    <div class="stat-row">
-      <span class="stat-pill">
-        <b>{{ shownEntities.length }}</b> 个实体节点
-      </span>
-      <span class="stat-pill">
-        <b>{{ shownRelationships.length }}</b> 条关系
-      </span>
-    </div>
-
-    <!-- Filter -->
-    <div class="filter-row" v-if="entityTypes.length">
-      <label
-        v-for="t in entityTypes" :key="t"
-        class="filter-chip" :class="{ active: selectedTypes.includes(t) }"
-        :style="{ '--chip': colorOf(t) }"
-      >
-        <input type="checkbox" :checked="selectedTypes.includes(t)" @change="toggleType(t)" hidden />
-        <span class="chip-dot"></span>
-        {{ LABEL_ICONS[t] || '' }} {{ LABEL_NAMES[t] || t }}
-        <span class="chip-count">{{ typeCounts[t] }}</span>
-      </label>
-    </div>
-
-    <GraphView :entities="shownEntities" :relationships="shownRelationships" />
-
-    <p class="text-muted hint">💡 拖拽节点 · 空白处平移 · 滚轮缩放 · 悬停查看详情</p>
-
-    <!-- Legend -->
-    <div class="legend">
-      <div v-for="t in entityTypes" :key="t" class="legend-item">
-        <span class="legend-dot" :style="{ background: NODE_COLORS[t] || '#94A3B8', boxShadow: `0 0 8px ${NODE_COLORS[t] || '#94A3B8'}` }"></span>
-        {{ LABEL_NAMES[t] || t }}
-      </div>
+    <!-- Graph (fills remaining space) -->
+    <div class="graph-container">
+      <GraphView :entities="shownEntities" :relationships="shownRelationships" />
     </div>
   </div>
 </template>
 
 <style scoped>
-.graph-header {
-  display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 1rem; margin-bottom: 1rem;
+.graph-dashboard {
+  display: flex; flex-direction: column;
+  height: calc(100vh - var(--header-h));
+  overflow: hidden;
 }
-.build-btn { flex-shrink: 0; }
+
+.graph-toolbar {
+  display: flex; align-items: center; gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0; flex-wrap: wrap;
+}
+.toolbar-left { display: flex; align-items: baseline; gap: 0.6rem; }
+.toolbar-title { font-size: 0.95rem; font-weight: 700; color: var(--t1); }
+.toolbar-sub { font-size: 0.7rem; color: var(--t4); }
+.toolbar-center { flex: 1; display: flex; justify-content: center; }
+.stat-pills-inline { display: flex; gap: 0.5rem; }
+.stat-pill-mini {
+  font-size: 0.72rem; color: var(--t3);
+  background: var(--surface-2); padding: 3px 10px; border-radius: 20px;
+}
+.toolbar-right { display: flex; align-items: center; gap: 0.6rem; }
+.build-btn { flex-shrink: 0; font-size: 0.75rem; padding: 0.35rem 0.8rem; }
+
+.graph-container {
+  flex: 1; min-height: 0;
+  padding: 8px;
+  background: #070B17;
+}
+
+.filter-row { display: flex; gap: 4px; flex-wrap: wrap; }
 
 .log-box {
   background: #0E1424; color: #A7F3E4; font-family: 'SF Mono', monospace;

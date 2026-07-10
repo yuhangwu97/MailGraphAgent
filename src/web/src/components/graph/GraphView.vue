@@ -164,7 +164,8 @@ onMounted(() => {
 <style scoped>
 .graph-wrap {
   position: relative;
-  height: 620px;
+  height: 100%;
+  min-height: 400px;
   border-radius: 16px;
   overflow: hidden;
   background: #070B17;

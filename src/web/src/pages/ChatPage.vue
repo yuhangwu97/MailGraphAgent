@@ -10,7 +10,6 @@ const messagesEl = ref<HTMLElement | null>(null)
 const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
 const editingTitle = ref<string | null>(null)
 const titleInput = ref<HTMLInputElement | null>(null)
-const sessionPillsEl = ref<HTMLElement | null>(null)
 
 const hasMessages = computed(() => chatStore.messages.length > 0)
 const sessionCount = computed(() => chatStore.sessions.length)
@@ -33,12 +32,6 @@ async function scrollDown() {
   messagesEl.value?.scrollTo({ top: messagesEl.value.scrollHeight, behavior: 'smooth' })
 }
 
-// Scroll active session pill into view
-watch(() => chatStore.activeSessionId, async () => {
-  await nextTick()
-  const active = sessionPillsEl.value?.querySelector('.session-pill.active') as HTMLElement | null
-  active?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
-})
 
 // Session title editing
 function startRename() {
@@ -113,20 +106,17 @@ async function handleSend(question: string) {
         </div>
       </div>
 
-      <!-- Session pills -->
-      <div class="session-pills" ref="sessionPillsEl">
-        <button
-          v-for="s in chatStore.sessions"
-          :key="s.id"
-          class="session-pill"
-          :class="{ active: s.id === chatStore.activeSessionId }"
-          @click="chatStore.switchSession(s.id)"
+      <!-- Session dropdown -->
+      <div class="session-select-wrap" v-if="sessionCount > 0">
+        <select
+          class="session-dropdown"
+          :value="chatStore.activeSessionId"
+          @change="chatStore.switchSession(($event.target as HTMLSelectElement).value)"
         >
-          <span class="pill-title">{{ s.title || '新对话' }}</span>
-          <span class="pill-count" :class="{ 'pill-count-active': s.id === chatStore.activeSessionId }">
-            {{ s.message_count }}
-          </span>
-        </button>
+          <option v-for="s in chatStore.sessions" :key="s.id" :value="s.id">
+            {{ s.title || '新对话' }} ({{ s.message_count }})
+          </option>
+        </select>
       </div>
     </header>
 
@@ -213,7 +203,10 @@ async function handleSend(question: string) {
   display: flex;
   flex-direction: column;
   height: calc(100vh - var(--header-h));
-  background: var(--bg);
+  background:
+    radial-gradient(ellipse at 80% 20%, rgba(31, 111, 92, 0.04) 0%, transparent 60%),
+    radial-gradient(ellipse at 20% 80%, rgba(196, 138, 62, 0.03) 0%, transparent 50%),
+    linear-gradient(180deg, var(--bg) 0%, #F7F6F4 100%);
   position: relative;
 }
 
@@ -359,83 +352,20 @@ async function handleSend(question: string) {
   background: var(--red-bg);
 }
 
-/* ── Session pills ── */
-
-.session-pills {
-  display: flex;
-  gap: var(--space-2);
-  overflow-x: auto;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-  padding-bottom: 2px;
+/* ── Session dropdown ── */
+.session-select-wrap { flex-shrink: 0; }
+.session-dropdown {
+  font-size: 0.78rem; padding: 0.4rem 0.7rem;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); color: var(--t2);
+  cursor: pointer; font-family: inherit; max-width: 220px;
+  outline: none; transition: border-color 0.15s;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2357534E' stroke-width='2'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 8px center;
+  padding-right: 28px;
 }
-
-.session-pills::-webkit-scrollbar {
-  display: none;
-}
-
-.session-pill {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0.35rem 0.85rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--t3);
-  font-size: var(--text-xs);
-  font-weight: 500;
-  cursor: pointer;
-  transition: all var(--dur-fast) var(--ease);
-  white-space: nowrap;
-  font-family: inherit;
-  user-select: none;
-}
-
-.session-pill:hover {
-  border-color: var(--p);
-  color: var(--p);
-  background: var(--p-bg);
-}
-
-.session-pill.active {
-  background: var(--p);
-  border-color: var(--p);
-  color: #fff;
-  font-weight: 600;
-  box-shadow: 0 1px 6px rgba(31, 111, 92, 0.25);
-}
-
-.pill-title {
-  max-width: 110px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.pill-count {
-  font-size: 0.62rem;
-  font-weight: 600;
-  opacity: 0.55;
-  background: var(--surface-2);
-  padding: 0 5px;
-  border-radius: 20px;
-  line-height: 1.4;
-  min-width: 16px;
-  text-align: center;
-  transition: all var(--dur-fast) var(--ease);
-}
-
-.session-pill:hover .pill-count {
-  opacity: 0.8;
-  background: transparent;
-}
-
-.pill-count-active {
-  opacity: 0.85;
-  background: rgba(255, 255, 255, 0.2);
-  color: #fff;
-}
+.session-dropdown:focus { border-color: var(--p); box-shadow: 0 0 0 2px var(--p-ring); }
 
 /* ── Messages area ── */
 

@@ -140,89 +140,106 @@ const entitySummary = computed(() => {
         </div>
       </div>
 
-      <!-- Sources panel with tabs -->
-      <div v-if="showSources && (chunks.length || hasGraphData)" class="sources-panel">
-        <div class="panel-header">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-          引用来源
-        </div>
-        <div class="source-tabs">
-          <button
-            v-if="chunks.length"
-            class="source-tab"
-            :class="{ active: activeSourceTab === 'chunks' }"
-            @click="activeSourceTab = 'chunks'"
-          >
-            <span class="tab-icon">📄</span>
-            <span class="tab-label">文档来源</span>
-            <span class="tab-count">{{ chunkGroups.length }}</span>
-          </button>
-          <button
-            v-if="hasGraphData"
-            class="source-tab"
-            :class="{ active: activeSourceTab === 'graph' }"
-            @click="activeSourceTab = 'graph'"
-          >
-            <span class="tab-icon">📊</span>
-            <span class="tab-label">知识图谱</span>
-            <span class="tab-count">{{ entities.length }}</span>
-          </button>
-        </div>
+      <!-- Sources modal overlay -->
+      <Teleport to="body">
+        <Transition name="modal">
+          <div v-if="showSources && (chunks.length || hasGraphData)" class="sources-overlay" @click.self="showSources = false">
+            <div class="sources-modal">
+              <!-- Modal header -->
+              <div class="modal-header">
+                <div class="modal-title-row">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  <span>引用来源</span>
+                </div>
+                <button class="modal-close" @click="showSources = false" title="关闭">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+              </div>
 
-        <!-- Document sources -->
-        <Transition name="fade" mode="out-in">
-          <div v-if="activeSourceTab === 'chunks' && chunkGroups.length" key="chunks" class="source-list">
-            <div v-for="(g, i) in chunkGroups" :key="i" class="source-card">
-              <div class="source-card-header">
-                <span class="source-rank">#{{ i + 1 }}</span>
-                <span class="source-doc">{{ g.doc_name }}</span>
-                <span class="source-score" :class="scoreLevel(g.maxScore)">
-                  {{ (g.maxScore * 100).toFixed(0) }}%
-                </span>
+              <!-- Source tabs -->
+              <div class="source-tabs">
+                <button
+                  v-if="chunks.length"
+                  class="source-tab"
+                  :class="{ active: activeSourceTab === 'chunks' }"
+                  @click="activeSourceTab = 'chunks'"
+                >
+                  <span class="tab-icon">📄</span>
+                  <span class="tab-label">文档来源</span>
+                  <span class="tab-count">{{ chunkGroups.length }}</span>
+                </button>
+                <button
+                  v-if="hasGraphData"
+                  class="source-tab"
+                  :class="{ active: activeSourceTab === 'graph' }"
+                  @click="activeSourceTab = 'graph'"
+                >
+                  <span class="tab-icon">📊</span>
+                  <span class="tab-label">知识图谱</span>
+                  <span class="tab-count">{{ entities.length }}</span>
+                </button>
               </div>
-              <div v-for="(c, j) in g.chunks.slice(0, 2)" :key="j" class="source-chunk">
-                <span class="chunk-preview">{{ (c.content || '').slice(0, 350) }}{{ (c.content || '').length > 350 ? '…' : '' }}</span>
-              </div>
-            </div>
-          </div>
 
-          <!-- Graph sources -->
-          <div v-else-if="activeSourceTab === 'graph' && hasGraphData" key="graph" class="graph-source">
-            <div v-if="entitySummary.length" class="graph-section">
-              <div class="section-label">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-                实体类型分布
-              </div>
-              <div class="stat-chips">
-                <span v-for="[type, count] in entitySummary" :key="type" class="stat-chip">
-                  {{ type }}
-                  <span class="chip-count">{{ count }}</span>
-                </span>
-              </div>
-            </div>
-            <div v-if="entities.length" class="graph-section">
-              <div class="section-label">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                关键实体
-                <span class="panel-badge">{{ Math.min(entities.length, 20) }}/{{ entities.length }}</span>
-              </div>
-              <div class="entity-grid">
-                <span v-for="e in entities.slice(0, 20)" :key="e.id" class="entity-tag">
-                  <span class="entity-name">{{ e.name || e.id }}</span>
-                  <span class="entity-type">{{ e.type }}</span>
-                </span>
-              </div>
-            </div>
-            <div v-if="relationships.length" class="graph-section">
-              <div class="section-label">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
-                关系
-                <span class="panel-badge">{{ relationships.length }} 条</span>
+              <!-- Modal body -->
+              <div class="modal-body">
+                <Transition name="fade" mode="out-in">
+                  <!-- Document sources -->
+                  <div v-if="activeSourceTab === 'chunks' && chunkGroups.length" key="chunks" class="source-list">
+                    <div v-for="(g, i) in chunkGroups" :key="i" class="source-card">
+                      <div class="source-card-header">
+                        <span class="source-rank">#{{ i + 1 }}</span>
+                        <span class="source-doc">{{ g.doc_name }}</span>
+                        <span class="source-score" :class="scoreLevel(g.maxScore)">
+                          {{ (g.maxScore * 100).toFixed(0) }}%
+                        </span>
+                      </div>
+                      <div v-for="(c, j) in g.chunks.slice(0, 3)" :key="j" class="source-chunk">
+                        <span class="chunk-preview">{{ (c.content || '').slice(0, 500) }}{{ (c.content || '').length > 500 ? '…' : '' }}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Graph sources -->
+                  <div v-else-if="activeSourceTab === 'graph' && hasGraphData" key="graph" class="graph-source">
+                    <div v-if="entitySummary.length" class="graph-section">
+                      <div class="section-label">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                        实体类型分布
+                      </div>
+                      <div class="stat-chips">
+                        <span v-for="[type, count] in entitySummary" :key="type" class="stat-chip">
+                          {{ type }}
+                          <span class="chip-count">{{ count }}</span>
+                        </span>
+                      </div>
+                    </div>
+                    <div v-if="entities.length" class="graph-section">
+                      <div class="section-label">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                        关键实体
+                        <span class="panel-badge">{{ Math.min(entities.length, 30) }}/{{ entities.length }}</span>
+                      </div>
+                      <div class="entity-grid">
+                        <span v-for="e in entities.slice(0, 30)" :key="e.id" class="entity-tag">
+                          <span class="entity-name">{{ e.name || e.id }}</span>
+                          <span class="entity-type">{{ e.type }}</span>
+                        </span>
+                      </div>
+                    </div>
+                    <div v-if="relationships.length" class="graph-section">
+                      <div class="section-label">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
+                        关系
+                        <span class="panel-badge">{{ relationships.length }} 条</span>
+                      </div>
+                    </div>
+                  </div>
+                </Transition>
               </div>
             </div>
           </div>
         </Transition>
-      </div>
+      </Teleport>
     </div>
   </div>
 </template>
@@ -571,8 +588,8 @@ const entitySummary = computed(() => {
   flex-shrink: 0;
 }
 
-/* ── Panels ── */
-.trace-panel, .sources-panel {
+/* ── Trace panel (stays inline) ── */
+.trace-panel {
   margin-top: 0.6rem;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -685,90 +702,88 @@ const entitySummary = computed(() => {
   width: fit-content;
 }
 
-/* ── Source tabs ── */
-.source-tabs {
-  display: flex;
-  gap: 0;
-  margin-bottom: 0.7rem;
-  background: var(--surface-2);
-  border-radius: 8px;
-  padding: 2px;
+/* ── Sources modal ── */
+.sources-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 2rem;
 }
-.source-tab {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  font-size: 0.75rem;
-  padding: 0.45rem 0.7rem;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--t4);
-  cursor: pointer;
-  transition: all 0.2s;
-  font-weight: 500;
-}
-.source-tab.active {
+.sources-modal {
   background: var(--surface);
-  color: var(--t1);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-}
-.source-tab:not(.active):hover {
-  color: var(--t2);
-  background: color-mix(in srgb, var(--surface) 50%, transparent);
-}
-.tab-icon { font-size: 0.85rem; }
-.tab-count {
-  font-size: 0.65rem;
-  font-weight: 600;
-  background: color-mix(in srgb, var(--p) 12%, transparent);
-  color: var(--p);
-  padding: 0 6px;
-  border-radius: 20px;
-  min-width: 18px;
-  text-align: center;
-  line-height: 1.5;
-}
-
-/* ── Document sources ── */
-.source-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-}
-.source-card {
-  background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 0.6rem 0.8rem;
-  transition: border-color 0.15s;
+  border-radius: var(--r-xl);
+  box-shadow: var(--sh-lg);
+  width: 100%; max-width: 720px; max-height: 80vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
 }
-.source-card:hover {
-  border-color: color-mix(in srgb, var(--p) 40%, transparent);
-}
-.source-card-header {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.35rem;
-}
-.source-rank {
-  font-size: 0.66rem;
-  font-weight: 700;
-  color: var(--p);
-  background: color-mix(in srgb, var(--p) 12%, transparent);
-  padding: 2px 7px;
-  border-radius: 5px;
+.modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 1rem 1.25rem; border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+.modal-title-row {
+  display: flex; align-items: center; gap: 0.5rem;
+  font-size: 0.92rem; font-weight: 650; color: var(--t1);
+}
+.modal-close {
+  width: 32px; height: 32px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--t3); cursor: pointer; display: flex;
+  align-items: center; justify-content: center;
+  transition: all 0.15s;
+}
+.modal-close:hover { background: var(--border); color: var(--t1); }
+.modal-body {
+  flex: 1; overflow-y: auto; padding: 1rem 1.25rem;
+}
+
+/* ── Source tabs (in modal) ── */
+.source-tabs {
+  display: flex; gap: 0; padding: 0 1.25rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2); flex-shrink: 0;
+}
+.source-tab {
+  display: flex; align-items: center; gap: 0.4rem;
+  font-size: 0.78rem; padding: 0.55rem 1rem;
+  border: none; border-bottom: 2px solid transparent;
+  background: transparent; color: var(--t3); cursor: pointer;
+  transition: all 0.15s; font-family: inherit;
+}
+.source-tab.active {
+  color: var(--p); border-bottom-color: var(--p);
+  font-weight: 600; background: var(--surface);
+}
+.source-tab:hover:not(.active) { color: var(--t2); }
+.tab-icon { font-size: 0.9rem; }
+.tab-count {
+  font-size: 0.65rem; background: var(--surface-2); color: var(--t4);
+  padding: 1px 6px; border-radius: 10px; font-weight: 600;
+}
+.source-tab.active .tab-count { background: var(--p-bg); color: var(--p); }
+
+/* ── Document sources ── */
+.source-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.source-card {
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 0.6rem 0.8rem;
+  transition: border-color 0.15s;
+}
+.source-card:hover { border-color: color-mix(in srgb, var(--p) 40%, transparent); }
+.source-card-header {
+  display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.35rem;
+}
+.source-rank {
+  font-size: 0.66rem; font-weight: 700; color: var(--p);
+  background: color-mix(in srgb, var(--p) 12%, transparent);
+  padding: 2px 7px; border-radius: 5px; flex-shrink: 0;
+}
 .source-doc {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: var(--t2);
-  flex: 1;
-  overflow: hidden;
+  font-size: 0.8rem; font-weight: 600; color: var(--t2);
+  flex: 1; overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -896,4 +911,11 @@ const entitySummary = computed(() => {
 .fade-leave-to {
   opacity: 0;
 }
+
+/* ── Modal transitions ── */
+.modal-enter-active { transition: opacity 0.25s var(--ease-out); }
+.modal-leave-active { transition: opacity 0.2s var(--ease-in); }
+.modal-enter-from, .modal-leave-to { opacity: 0; }
+.modal-enter-from .sources-modal { transform: scale(0.95) translateY(12px); transition: transform 0.25s var(--ease-out); }
+.modal-leave-to .sources-modal { transform: scale(0.95) translateY(12px); transition: transform 0.2s var(--ease-in); }
 </style>
