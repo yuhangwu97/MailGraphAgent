@@ -9,6 +9,11 @@ venv/
 data/
 mailgraph.log
 *.db
+nohup.out
+*.log
+
+# Claude Code 本地配置/工具
+.claude/
 
 # Environment
 .env

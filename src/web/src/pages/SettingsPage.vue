@@ -1,18 +1,18 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { statusApi, type ServiceStatus } from '@/api'
 import ServiceStatusView from '@/components/settings/ServiceStatus.vue'
 
-const services = ref<ServiceStatus>({ ragflow: false, redis: false, mysql: true, minio: true })
+const services = ref<ServiceStatus>({ redis: false, neo4j: false, milvus: false })
 const tokens = ref({ prompt_tokens: 0, completion_tokens: 0 })
 const logLines = ref(50)
-const activeLogService = ref('ragflow')
+const activeLogService = ref('neo4j')
 const logContent = ref('')
 const logLoading = ref(false)
 
 const logServices = [
-  { key: 'ragflow', label: 'RAGFlow', container: 'mailgraph-ragflow' },
-  { key: 'mysql', label: 'MySQL', container: 'mailgraph-mysql' },
+  { key: 'neo4j', label: 'Neo4j', container: 'mailgraph-neo4j' },
+  { key: 'milvus', label: 'Milvus', container: 'mailgraph-milvus' },
   { key: 'redis', label: 'Redis', container: 'mailgraph-redis' },
 ]
 
@@ -38,7 +38,13 @@ async function loadLogs() {
   }
 }
 
-onMounted(refreshStatus)
+onMounted(() => {
+  refreshStatus()
+  loadLogs()
+})
+
+// 切换服务标签 / 行数时自动刷新，无需手动点刷新
+watch([activeLogService, logLines], loadLogs)
 </script>
 
 <template>

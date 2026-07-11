@@ -21,6 +21,6 @@ onMounted(() => {
 .main-content {
   flex: 1;
   padding: 1.5rem 2rem 2rem 2rem;
-  max-width: 1344px;
+  min-width: 0;
 }
 </style>

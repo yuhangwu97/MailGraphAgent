@@ -11,7 +11,7 @@ from pydantic import Field
 class Settings(BaseSettings):
     # ── OpenAI API ──
     openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
-    openai_base_url: str = Field(default="http://43.160.245.179:8080", alias="OPENAI_BASE_URL")
+    openai_base_url: str = Field(default="", alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-5.4", alias="OPENAI_MODEL")
     openai_review_model: str = Field(default="gpt-5.4", alias="OPENAI_REVIEW_MODEL")
     model_reasoning_effort: str = Field(default="xhigh", alias="MODEL_REASONING_EFFORT")
@@ -28,27 +28,22 @@ class Settings(BaseSettings):
     redis_db: int = Field(default=0, alias="REDIS_DB")
     redis_password: str = Field(default="", alias="REDIS_PASSWORD")
 
-    # ── RAGFlow ──
-    ragflow_base_url: str = Field(default="http://localhost:9380", alias="RAGFLOW_BASE_URL")
-    ragflow_api_key: str = Field(default="", alias="RAGFLOW_API_KEY")
-    # 空 = 用 RAGFlow 租户默认 embedding；否则须为 <model_name>@<provider> 格式
-    ragflow_embedding_model: str = Field(default="", alias="RAGFLOW_EMBEDDING_MODEL")
-    # RAGFlow 聊天模型，格式 <model_name>@<instance_name>@<provider_name>
-    ragflow_chat_model: str = Field(default="", alias="RAGFLOW_CHAT_MODEL")
+    # ── Neo4j (图谱持久化) ──
+    # 优先读 .env 的 NEO4J_URI；仍保留 host/port 供旧代码回退拼接。
+    neo4j_uri: str = Field(default="bolt://localhost:7687", alias="NEO4J_URI")
+    neo4j_host: str = Field(default="localhost", alias="NEO4J_HOST")
+    neo4j_port: int = Field(default=7687, alias="NEO4J_PORT")
+    neo4j_user: str = Field(default="neo4j", alias="NEO4J_USER")
+    neo4j_password: str = Field(default="mailgraph2024", alias="NEO4J_PASSWORD")
 
-    # ── RAGFlow GraphRAG ──
-    ragflow_dataset_name: str = Field(default="MailGraph", alias="RAGFLOW_DATASET_NAME")
-    # GraphRAG 抽取提示词方案: light(LightRAG, 省 token) | general(微软 GraphRAG, 含社区报告)
-    ragflow_graphrag_method: str = Field(default="light", alias="RAGFLOW_GRAPHRAG_METHOD")
-    # GraphRAG 要抽取的实体类型（跨文档统一建图）
-    ragflow_entity_types: list[str] = Field(
-        default=["organization", "person", "project"],
-        description="GraphRAG 抽取的实体类型",
-    )
-    # 实体消解开关：合并 dataset 内相似实体（跨文档去重/对齐）
-    ragflow_graphrag_resolution: bool = Field(default=True, alias="RAGFLOW_GRAPHRAG_RESOLUTION")
-    # 社区报告：light 方案通常不需要，关掉省 token
-    ragflow_graphrag_community: bool = Field(default=False, alias="RAGFLOW_GRAPHRAG_COMMUNITY")
+    # ── Milvus (向量持久化) ──
+    milvus_uri: str = Field(default="http://localhost:19530", alias="MILVUS_URI")
+    milvus_db_name: str = Field(default="mailgraph_lightrag", alias="MILVUS_DB_NAME")
+
+    # ── LightRAG Embedding ──
+    embedding_model: str = Field(default="text-embedding-v3", alias="EMBEDDING_MODEL")
+    embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
+
 
     # ── 应用配置 ──
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")
@@ -104,6 +99,16 @@ class Settings(BaseSettings):
         for directory in [self.data_dir, self.attachments_dir, "data/logs"]:
             Path(directory).mkdir(parents=True, exist_ok=True)
             logger.info(f"✓ 目录已创建/确认存在: {directory}")
+
+    def resolved_neo4j_uri(self) -> str:
+        """优先使用显式 NEO4J_URI；未显式配置时回退 host/port 拼接。"""
+        uri = (self.neo4j_uri or "").strip()
+        if uri and uri != "bolt://localhost:7687":
+            return uri
+        # 若 host/port 被显式改过则用它们拼接，否则默认 uri
+        if self.neo4j_host != "localhost" or self.neo4j_port != 7687:
+            return f"bolt://{self.neo4j_host}:{self.neo4j_port}"
+        return uri or "bolt://localhost:7687"
 
     def get_imap_config(self) -> dict:
         """获取 IMAP 连接配置"""

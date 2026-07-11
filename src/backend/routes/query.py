@@ -34,7 +34,7 @@ async def run_query(
     engine = await get_query_engine(account_id=account_id)
 
     if engine is None:
-        raise HTTPException(status_code=503, detail="Query engine unavailable — check RAGFlow connection")
+        raise HTTPException(status_code=503, detail="Query engine unavailable")
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -144,36 +144,21 @@ async def run_query(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-@router.post("/ragflow/retrieve")
-async def ragflow_retrieve(
-    body: dict,
-    account_id: str = Depends(get_account_id),
-):
-    """Direct RAGFlow semantic retrieval."""
-    from src.backend.deps import get_ragflow
-
-    rf = await get_ragflow(account_id=account_id)
-    if rf is None:
-        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
-    top_k = body.get("top_k", 10)
+@router.post("/knowledge/retrieve")
+async def lightrag_retrieve(body: dict):
+    """LightRAG knowledge graph retrieval."""
+    from src.backend.knowledge.lightrag_wrapper import query_mail
     query = body.get("query", "")
     loop = asyncio.get_running_loop()
-    chunks = await loop.run_in_executor(None, lambda: rf.retrieve_chunks(query, top_k=top_k))
-    return {"chunks": chunks}
+    result = await loop.run_in_executor(None, lambda: query_mail(query, mode="mix"))
+    return {"result": result}
 
 
-@router.post("/ragflow/chat")
-async def ragflow_chat(
-    body: dict,
-    account_id: str = Depends(get_account_id),
-):
-    """Direct RAGFlow native chat completion."""
-    from src.backend.deps import get_ragflow
-
-    rf = await get_ragflow(account_id=account_id)
-    if rf is None:
-        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
-    question = body.get("question", "")
+@router.post("/knowledge/chat")
+async def lightrag_chat(body: dict):
+    """LightRAG chat completion."""
+    from src.backend.knowledge.lightrag_wrapper import query_mail
+    query = body.get("query", body.get("question", ""))
     loop = asyncio.get_running_loop()
-    answer = await loop.run_in_executor(None, lambda: rf.chat_answer(question))
-    return answer
+    result = await loop.run_in_executor(None, lambda: query_mail(query))
+    return {"answer": result}

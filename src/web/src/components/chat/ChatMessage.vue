@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { marked } from 'marked'
 import type { ChatMessage as ChatMessageType, QueryResult } from '@/api'
+
+// Configure marked for GFM (tables, strikethrough, etc.)
+marked.setOptions({
+  breaks: true,
+  gfm: true,
+})
 
 const props = defineProps<{
   message: ChatMessageType
@@ -26,6 +33,36 @@ function scoreLevel(score: number): string {
   if (score > 0.3) return 'score-mid'
   return 'score-low'
 }
+
+// Render markdown content to HTML
+const renderedContent = computed(() => {
+  let raw = props.message.content || ''
+
+  // Detect and convert tab-separated tables to markdown table format
+  // Looks for consecutive lines with tabs that look like table rows
+  raw = raw.replace(/(?:^|\n)(([^\n]+\t[^\n]+\n)+)/g, (match: string) => {
+    const lines = match.trim().split('\n').filter(l => l.includes('\t'))
+    if (lines.length < 2) return match // need at least header + one row
+
+    const rows = lines.map(line => line.split('\t'))
+    const colCount = Math.max(...rows.map(r => r.length))
+    const normalized = rows.map(r => {
+      while (r.length < colCount) r.push('')
+      return r
+    })
+
+    // Build markdown table
+    const header = '| ' + normalized[0].map(c => c.trim()).join(' | ') + ' |'
+    const sep =    '| ' + normalized[0].map(() => '---').join(' | ') + ' |'
+    const body = normalized.slice(1).map(r =>
+      '| ' + r.map(c => c.trim().replace(/\n/g, '<br>')).join(' | ') + ' |'
+    ).join('\n')
+
+    return '\n' + header + '\n' + sep + '\n' + body + '\n'
+  })
+
+  return marked.parse(raw) as string
+})
 
 // Group chunks by doc_name for document sources
 const chunkGroups = computed(() => {
@@ -63,6 +100,11 @@ const entitySummary = computed(() => {
     </div>
 
     <div class="msg-body">
+      <!-- Role label (assistant only) -->
+      <div v-if="message.role === 'assistant'" class="msg-role-label assistant">
+        AI 助手
+      </div>
+
       <!-- Progress steps during streaming with animation -->
       <div v-if="progress?.length" class="progress-steps">
         <TransitionGroup name="step" tag="div" class="progress-list">
@@ -76,7 +118,7 @@ const entitySummary = computed(() => {
 
       <!-- Content -->
       <div class="msg-content" :class="message.role">
-        <div class="msg-text" v-text="message.content"></div>
+        <div class="msg-text" v-html="renderedContent"></div>
         <span v-if="streaming" class="cursor-bar"></span>
       </div>
 
@@ -95,7 +137,7 @@ const entitySummary = computed(() => {
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
             {{ relationships.length }} 关系
           </span>
-          <span class="result-stat">
+          <span v-if="result.total_duration_ms" class="result-stat">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
             {{ result.total_duration_ms }}ms
           </span>
@@ -193,8 +235,8 @@ const entitySummary = computed(() => {
                           {{ (g.maxScore * 100).toFixed(0) }}%
                         </span>
                       </div>
-                      <div v-for="(c, j) in g.chunks.slice(0, 3)" :key="j" class="source-chunk">
-                        <span class="chunk-preview">{{ (c.content || '').slice(0, 500) }}{{ (c.content || '').length > 500 ? '…' : '' }}</span>
+                      <div v-for="(c, j) in g.chunks.slice(0, 5)" :key="j" class="source-chunk">
+                        <span class="chunk-preview">{{ (c.content || '').slice(0, 1500) }}{{ (c.content || '').length > 1500 ? '…' : '' }}</span>
                       </div>
                     </div>
                   </div>
@@ -249,7 +291,7 @@ const entitySummary = computed(() => {
 .msg-wrapper {
   display: flex;
   gap: 0.85rem;
-  margin: 0.75rem 0;
+  margin: 1.2rem 0;
   align-items: flex-start;
   animation: msgFadeIn 0.3s ease-out;
 }
@@ -316,29 +358,61 @@ const entitySummary = computed(() => {
 /* ── Body ── */
 .msg-body { flex: 1; min-width: 0; }
 
+/* ── Role label ── */
+.msg-role-label {
+  font-size: 0.68rem;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-bottom: 0.5rem;
+  color: #1A6B59;
+  opacity: 0.7;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  line-height: 1;
+}
+.msg-role-label::before {
+  content: '';
+  display: inline-block;
+  width: 3px;
+  height: 0.95em;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #2DE1C2 0%, #1A6B59 100%);
+  box-shadow: 0 0 6px rgba(45, 225, 194, 0.5);
+}
+
 /* ── Content ── */
 .msg-content {
-  font-size: 1rem;
-  line-height: 1.8;
+  font-size: 0.9rem;
+  line-height: 1.6;
   color: var(--t2);
   padding: 0.1rem 0;
 }
-.msg-content.user {
-  background: var(--surface-2);
+.msg-content.assistant {
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 16px 16px 4px 16px;
+  border-left: 3px solid #2DE1C2;
+  border-radius: 5px 14px 14px 14px;
+  padding: 0.8rem 1rem;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.03);
+}
+.msg-content.user {
+  background: linear-gradient(135deg, #175A4A 0%, #1F6F5C 50%, #278A73 100%);
+  border: 1px solid rgba(23, 90, 74, 0.4);
+  border-radius: 14px 14px 5px 14px;
   padding: 0.8rem 1.2rem;
-  color: var(--t1);
+  color: #fff;
   max-width: 85%;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  box-shadow: 0 2px 12px rgba(23, 90, 74, 0.28);
   display: inline-block;
 }
 .msg-text {
-  white-space: pre-wrap;
+  white-space: normal;
   word-break: break-word;
 }
 .msg-text :deep(p) {
-  margin: 0.5rem 0;
+  margin: 0.35rem 0;
 }
 .msg-text :deep(p:first-child) {
   margin-top: 0;
@@ -346,23 +420,34 @@ const entitySummary = computed(() => {
 .msg-text :deep(p:last-child) {
   margin-bottom: 0;
 }
-.msg-text :deep(h1), .msg-text :deep(h2), .msg-text :deep(h3) {
-  margin: 1rem 0 0.5rem;
+.msg-text :deep(h1), .msg-text :deep(h2), .msg-text :deep(h3), .msg-text :deep(h4) {
+  margin: 1.2rem 0 0.5rem;
   line-height: 1.4;
   color: var(--t1);
+  font-weight: 700;
 }
-.msg-text :deep(h1) { font-size: 1.25rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
-.msg-text :deep(h2) { font-size: 1.1rem; }
-.msg-text :deep(h3) { font-size: 1rem; }
+.msg-text :deep(h1) { font-size: 1.3rem; border-bottom: 1.5px solid var(--border); padding-bottom: 0.4rem; letter-spacing: -0.01em; }
+.msg-text :deep(h2) { font-size: 1.15rem; }
+.msg-text :deep(h3) { font-size: 1.05rem; }
+.msg-text :deep(h4) { font-size: 0.95rem; }
+.msg-text :deep(strong) {
+  font-weight: 650;
+  color: var(--t1);
+}
+.msg-text :deep(em) {
+  font-style: italic;
+  color: var(--t2);
+}
 .msg-text :deep(ul), .msg-text :deep(ol) {
-  margin: 0.4rem 0;
-  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+  padding-left: 1.6rem;
 }
 .msg-text :deep(li) {
-  margin: 0.2rem 0;
+  margin: 0.25rem 0;
+  line-height: 1.7;
 }
 .msg-text :deep(li > ul), .msg-text :deep(li > ol) {
-  margin: 0.1rem 0;
+  margin: 0.15rem 0;
 }
 .msg-text :deep(code) {
   background: var(--surface-2);
@@ -409,26 +494,64 @@ const entitySummary = computed(() => {
   background: var(--surface-2);
   border-radius: 0 6px 6px 0;
 }
+.msg-text {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 .msg-text :deep(table) {
   border-collapse: collapse;
-  width: 100%;
-  margin: 0.6rem 0;
-  font-size: 0.85rem;
-  border-radius: 8px;
+  width: auto;
+  min-width: 100%;
+  margin: 0.4rem 0;
+  font-size: 0.75rem;
+  border-radius: 6px;
   overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  border: 1px solid var(--border);
+}
+.msg-text :deep(thead) {
+  border-bottom: 1px solid var(--border);
 }
 .msg-text :deep(th), .msg-text :deep(td) {
-  border: 1px solid var(--border);
-  padding: 0.45rem 0.7rem;
+  padding: 0.25rem 0.5rem;
   text-align: left;
+  border-right: 1px solid var(--border);
+  vertical-align: top;
+  line-height: 1.4;
 }
 .msg-text :deep(th) {
-  background: var(--surface-2);
-  font-weight: 600;
+  white-space: nowrap;
+}
+.msg-text :deep(td) {
+  white-space: normal;
+  word-break: break-word;
+  min-width: 80px;
+}
+.msg-text :deep(th:last-child), .msg-text :deep(td:last-child) {
+  border-right: none;
+}
+.msg-text :deep(th) {
+  background: #F4F3F0;
+  font-weight: 650;
+  color: var(--t1);
+  font-size: 0.7rem;
+  letter-spacing: 0.01em;
+}
+.msg-text :deep(td) {
   color: var(--t2);
+  border-bottom: 1px solid var(--border);
+}
+.msg-text :deep(tr:last-child td) {
+  border-bottom: none;
+}
+.msg-text :deep(tbody tr:hover) {
+  background: rgba(0,0,0,0.03);
 }
 .msg-text :deep(tr:nth-child(even)) {
-  background: var(--surface-2);
+  background: rgba(0,0,0,0.01);
+}
+.msg-text :deep(tbody tr:nth-child(even):hover) {
+  background: rgba(0,0,0,0.03);
 }
 .msg-text :deep(hr) {
   border: none;
@@ -443,6 +566,23 @@ const entitySummary = computed(() => {
 }
 .msg-text :deep(a:hover) {
   opacity: 0.8;
+}
+
+/* ── User bubble: keep markdown readable on the green background ── */
+.msg-content.user .msg-text :deep(strong),
+.msg-content.user .msg-text :deep(em),
+.msg-content.user .msg-text :deep(p),
+.msg-content.user .msg-text :deep(li) {
+  color: #fff;
+}
+.msg-content.user .msg-text :deep(a) {
+  color: #fff;
+  text-decoration-color: rgba(255, 255, 255, 0.6);
+}
+.msg-content.user .msg-text :deep(code) {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #fff;
 }
 
 /* ── Cursor bar ── */
@@ -530,13 +670,14 @@ const entitySummary = computed(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: 0.6rem;
-  padding: 0.5rem 0.6rem;
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
   gap: 0.5rem;
   flex-wrap: wrap;
-  background: var(--surface-2);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-left: 3px solid #2DE1C2;
+  border-radius: 0 10px 10px 10px;
   animation: fadeSlideUp 0.3s ease-out;
 }
 @keyframes fadeSlideUp {
@@ -590,10 +731,11 @@ const entitySummary = computed(() => {
 
 /* ── Trace panel (stays inline) ── */
 .trace-panel {
-  margin-top: 0.6rem;
+  margin-top: 0.5rem;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-left: 3px solid #2DE1C2;
+  border-radius: 0 12px 12px 12px;
   padding: 0.85rem 1rem;
   animation: fadeSlideUp 0.3s ease-out;
 }
@@ -715,7 +857,7 @@ const entitySummary = computed(() => {
   border: 1px solid var(--border);
   border-radius: var(--r-xl);
   box-shadow: var(--sh-lg);
-  width: 100%; max-width: 720px; max-height: 80vh;
+  width: 100%; max-width: 900px; max-height: 85vh;
   display: flex; flex-direction: column;
   overflow: hidden;
 }
@@ -748,7 +890,7 @@ const entitySummary = computed(() => {
 }
 .source-tab {
   display: flex; align-items: center; gap: 0.4rem;
-  font-size: 0.78rem; padding: 0.55rem 1rem;
+  font-size: 0.85rem; padding: 0.55rem 1rem;
   border: none; border-bottom: 2px solid transparent;
   background: transparent; color: var(--t3); cursor: pointer;
   transition: all 0.15s; font-family: inherit;
@@ -777,20 +919,18 @@ const entitySummary = computed(() => {
   display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.35rem;
 }
 .source-rank {
-  font-size: 0.66rem; font-weight: 700; color: var(--p);
+  font-size: 0.75rem; font-weight: 700; color: var(--p);
   background: color-mix(in srgb, var(--p) 12%, transparent);
-  padding: 2px 7px; border-radius: 5px; flex-shrink: 0;
+  padding: 3px 8px; border-radius: 5px; flex-shrink: 0;
 }
 .source-doc {
-  font-size: 0.8rem; font-weight: 600; color: var(--t2);
-  flex: 1; overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 0.88rem; font-weight: 600; color: var(--t2);
+  flex: 1; word-break: break-word;
 }
 .source-score {
-  font-size: 0.7rem;
+  font-size: 0.75rem;
   font-weight: 700;
-  padding: 2px 7px;
+  padding: 2px 8px;
   border-radius: 5px;
   flex-shrink: 0;
 }
@@ -805,9 +945,9 @@ const entitySummary = computed(() => {
   padding-bottom: 0;
 }
 .chunk-preview {
-  font-size: 0.75rem;
-  color: var(--t3);
-  line-height: 1.6;
+  font-size: 0.84rem;
+  color: var(--t2);
+  line-height: 1.65;
 }
 
 /* ── Graph source ── */
@@ -825,8 +965,8 @@ const entitySummary = computed(() => {
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: 0.7rem;
-  color: var(--t4);
+  font-size: 0.78rem;
+  color: var(--t3);
   font-weight: 600;
 }
 .section-label svg {
@@ -842,7 +982,7 @@ const entitySummary = computed(() => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 0.7rem;
+  font-size: 0.78rem;
   padding: 3px 10px;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -862,9 +1002,9 @@ const entitySummary = computed(() => {
 .entity-tag {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font-size: 0.72rem;
-  padding: 4px 9px;
+  gap: 5px;
+  font-size: 0.8rem;
+  padding: 5px 10px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -878,9 +1018,9 @@ const entitySummary = computed(() => {
 .entity-name { font-weight: 500; }
 .entity-type {
   color: var(--t4);
-  font-size: 0.66rem;
+  font-size: 0.72rem;
   background: var(--surface);
-  padding: 1px 5px;
+  padding: 1px 6px;
   border-radius: 3px;
 }
 

@@ -2,11 +2,10 @@
 import { ref, computed, onMounted } from 'vue'
 import { graphApi } from '@/api'
 import GraphView from '@/components/graph/GraphView.vue'
-import type { RawEntity, RawRelationship } from '@/components/graph/GraphView.vue'
 import { NODE_COLORS, LABEL_NAMES, LABEL_ICONS, colorOf } from '@/components/graph/graphTheme'
 
-const entities = ref<RawEntity[]>([])
-const relationships = ref<RawRelationship[]>([])
+const entities = ref<any[]>([])
+const relationships = ref<any[]>([])
 const buildLogs = ref<string[]>([])
 const building = ref(false)
 const entityTypes = ref<string[]>([])
@@ -70,6 +69,38 @@ function toggleType(t: string) {
   else selectedTypes.value.push(t)
 }
 
+// ── 实体归并（别名消歧）：先 dry-run 预览，人工确认后再 apply ──
+const resolving = ref(false)
+const resolvePreview = ref<Awaited<ReturnType<typeof graphApi.resolveEntities>> | null>(null)
+
+async function handleResolvePreview() {
+  resolving.value = true
+  try {
+    resolvePreview.value = await graphApi.resolveEntities(true)
+  } catch (e) {
+    console.error(e)
+  } finally {
+    resolving.value = false
+  }
+}
+
+async function handleResolveApply() {
+  resolving.value = true
+  try {
+    await graphApi.resolveEntities(false)
+    resolvePreview.value = null
+    await loadGraph()
+  } catch (e) {
+    console.error(e)
+  } finally {
+    resolving.value = false
+  }
+}
+
+function cancelResolve() {
+  resolvePreview.value = null
+}
+
 onMounted(loadGraph)
 </script>
 
@@ -100,6 +131,9 @@ onMounted(loadGraph)
             <span class="chip-count">{{ typeCounts[t] }}</span>
           </label>
         </div>
+        <button class="btn btn-ghost resolve-btn" :disabled="resolving || building" @click="handleResolvePreview">
+          🧬 {{ resolving ? '分析中…' : '实体归并' }}
+        </button>
         <button class="btn btn-primary build-btn" :disabled="building" @click="handleBuild">
           🔄 {{ building ? '建图中…' : '重建' }}
         </button>
@@ -109,6 +143,40 @@ onMounted(loadGraph)
     <!-- Build log -->
     <div v-if="buildLogs.length" class="log-box">
       <div v-for="(l, i) in buildLogs" :key="i">{{ l }}</div>
+    </div>
+
+    <!-- 实体归并预览（dry-run）→ 确认后 apply -->
+    <div v-if="resolvePreview" class="resolve-overlay" @click.self="cancelResolve">
+      <div class="resolve-panel">
+        <div class="resolve-head">
+          <span>🧬 实体归并预览</span>
+          <button class="resolve-x" @click="cancelResolve">✕</button>
+        </div>
+        <div class="resolve-summary">
+          将合并 <b>{{ resolvePreview.merged_groups }}</b> 组 /
+          <b>{{ resolvePreview.merged_entities }}</b> 个别名，
+          拒绝 <b>{{ resolvePreview.rejected }}</b> 个候选
+        </div>
+        <div v-if="resolvePreview.groups.length" class="resolve-list">
+          <div v-for="(g, i) in resolvePreview.groups" :key="i" class="resolve-item">
+            <span class="resolve-type">{{ g.type }}</span>
+            <span class="resolve-src">{{ g.merged.join('、') }}</span>
+            <span class="resolve-arrow">→</span>
+            <span class="resolve-canon">{{ g.canonical }}</span>
+          </div>
+        </div>
+        <div v-else class="resolve-empty">无可安全合并的实体（已通过双重校验，未发现明确别名）。</div>
+        <div class="resolve-actions">
+          <button class="btn btn-ghost" @click="cancelResolve">取消</button>
+          <button
+            class="btn btn-primary"
+            :disabled="resolving || !resolvePreview.groups.length"
+            @click="handleResolveApply"
+          >
+            {{ resolving ? '合并中…' : `确认合并（${resolvePreview.merged_entities}）` }}
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Graph (fills remaining space) -->
@@ -204,5 +272,49 @@ onMounted(loadGraph)
 }
 .legend-dot {
   width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+}
+
+/* 实体归并预览 */
+.resolve-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(4, 7, 15, 0.55); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+}
+.resolve-panel {
+  width: min(560px, 92vw); max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.45); overflow: hidden;
+}
+.resolve-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.9rem 1.1rem; font-weight: 700; color: var(--t1);
+  border-bottom: 1px solid var(--border);
+}
+.resolve-x {
+  border: none; background: transparent; color: var(--t4);
+  font-size: 1rem; cursor: pointer; line-height: 1;
+}
+.resolve-summary {
+  padding: 0.7rem 1.1rem; font-size: 0.8rem; color: var(--t3);
+  border-bottom: 1px solid var(--border);
+}
+.resolve-summary b { color: var(--p); }
+.resolve-list { overflow-y: auto; padding: 0.4rem 0; }
+.resolve-item {
+  display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  padding: 0.45rem 1.1rem; font-size: 0.8rem; color: var(--t2);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.resolve-type {
+  font-size: 0.66rem; color: var(--t4); background: var(--surface-2);
+  padding: 0.1rem 0.45rem; border-radius: 6px; flex-shrink: 0;
+}
+.resolve-src { color: var(--t3); }
+.resolve-arrow { color: var(--t4); }
+.resolve-canon { color: var(--t1); font-weight: 600; }
+.resolve-empty { padding: 1.4rem 1.1rem; font-size: 0.82rem; color: var(--t4); text-align: center; }
+.resolve-actions {
+  display: flex; justify-content: flex-end; gap: 0.6rem;
+  padding: 0.8rem 1.1rem; border-top: 1px solid var(--border);
 }
 </style>

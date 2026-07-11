@@ -18,7 +18,7 @@ const suggestions = [
     <div class="ch-logo">M</div>
     <div class="ch-title">你好，我是 MailGraph 助手</div>
     <div class="ch-sub">
-      基于 RAGFlow GraphRAG 跨文档图谱，用自然语言探索邮件里的<br>
+      基于 LightRAG 跨文档知识图谱，用自然语言探索邮件里的<br>
       客户、对接人、项目与内部负责人关系
     </div>
 

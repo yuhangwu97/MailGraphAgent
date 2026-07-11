@@ -68,19 +68,21 @@ function navigate(key: string) {
       <div class="status-row">
         <span
           class="status-dot"
-          :class="{ ok: statusStore.services.ragflow }"
-          title="RAGFlow"
-        >RAG</span>
-        <span class="status-dot-sep">·</span>
-        <span
-          class="status-dot"
           :class="{ ok: statusStore.services.redis }"
           title="Redis"
         >RDS</span>
         <span class="status-dot-sep">·</span>
-        <span class="status-dot ok" title="MySQL">SQL</span>
+        <span
+          class="status-dot"
+          :class="{ ok: statusStore.services.neo4j }"
+          title="Neo4j"
+        >NEO</span>
         <span class="status-dot-sep">·</span>
-        <span class="status-dot ok" title="MinIO">MIO</span>
+        <span
+          class="status-dot"
+          :class="{ ok: statusStore.services.milvus }"
+          title="Milvus"
+        >MLV</span>
       </div>
       <div class="version">v3.0</div>
     </div>

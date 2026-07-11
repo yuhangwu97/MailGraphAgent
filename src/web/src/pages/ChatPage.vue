@@ -10,9 +10,36 @@ const messagesEl = ref<HTMLElement | null>(null)
 const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
 const editingTitle = ref<string | null>(null)
 const titleInput = ref<HTMLInputElement | null>(null)
+const memoryWrap = ref<HTMLElement | null>(null)
 
 const hasMessages = computed(() => chatStore.messages.length > 0)
 const sessionCount = computed(() => chatStore.sessions.length)
+const showMemory = ref(false)
+const memoryEmpty = computed(() => {
+  const m = chatStore.memory
+  if (!m) return true
+  return !m.summary && !m.preferences?.length && !m.pinned_context?.length && !m.last_topics?.length
+})
+
+// Split preferences by Chinese/English semicolons for cleaner display
+const memoryPreferences = computed(() => {
+  const raw = chatStore.memory?.preferences ?? []
+  return raw.flatMap(p => p.split(/[；;]/).map(s => s.trim()).filter(Boolean))
+})
+
+// Parse summary into Q&A pairs
+const memoryQA = computed(() => {
+  const raw = chatStore.memory?.summary ?? ''
+  const pairs: { q: string; a: string }[] = []
+  // Match "用户问: ...；助手答: ..." or "用户问: ...；助手答: ..."
+  const regex = /用户问[：:]\s*(.*?)[；;]\s*助手答[：:]\s*(.*?)(?=用户问[：:]|$)/g
+  let m
+  while ((m = regex.exec(raw)) !== null) {
+    const a = m[2].trim()
+    pairs.push({ q: m[1].trim(), a: a.length > 200 ? a.slice(0, 200) + '…' : a })
+  }
+  return pairs
+})
 
 onMounted(async () => {
   await chatStore.fetchSessions()
@@ -80,12 +107,80 @@ async function handleSend(question: string) {
               <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
             </svg>
           </button>
-          <span v-if="chatStore.memory?.summary" class="memory-badge" :title="chatStore.memory.summary">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/>
-            </svg>
-            有记忆
-          </span>
+          <div v-if="!memoryEmpty" ref="memoryWrap" class="memory-trigger-wrap">
+            <button class="memory-btn" @click="showMemory = true" :class="{ active: showMemory }">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/>
+              </svg>
+              <span class="memory-btn-text">Agent 记忆</span>
+            </button>
+          </div>
+
+          <!-- Memory Modal (Teleport to body) -->
+          <Teleport to="body">
+            <Transition name="memory-modal">
+              <div v-if="showMemory" class="memory-overlay" @click.self="showMemory = false">
+                <div class="memory-modal">
+                  <div class="memory-modal-header">
+                    <div class="memory-modal-title">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/>
+                      </svg>
+                      <span>Agent Memory</span>
+                    </div>
+                    <button class="memory-modal-close" @click="showMemory = false">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                  </div>
+                  <div class="memory-modal-body">
+                    <!-- Preferences -->
+                    <div v-if="memoryPreferences.length" class="mem-section">
+                      <div class="mem-section-title">⭐ 最近关注</div>
+                      <div class="mem-tags">
+                        <span v-for="p in memoryPreferences" :key="p" class="mem-tag">{{ p }}</span>
+                      </div>
+                    </div>
+
+                    <!-- Conversation summary -->
+                    <div v-if="memoryQA.length" class="mem-section">
+                      <div class="mem-section-title">💬 会话摘要</div>
+                      <div class="mem-qa-list">
+                        <div v-for="(qa, i) in memoryQA" :key="i" class="mem-qa-item">
+                          <div class="mem-qa-q">Q: {{ qa.q }}</div>
+                          <div class="mem-qa-a">A: {{ qa.a }}</div>
+                        </div>
+                      </div>
+                    </div>
+                    <div v-else-if="chatStore.memory?.summary" class="mem-section">
+                      <div class="mem-section-title">💬 会话摘要</div>
+                      <p class="mem-summary">{{ chatStore.memory.summary }}</p>
+                    </div>
+
+                    <!-- Pinned context -->
+                    <div v-if="chatStore.memory?.pinned_context?.length" class="mem-section">
+                      <div class="mem-section-title">📌 固定上下文</div>
+                      <ul class="mem-list">
+                        <li v-for="c in chatStore.memory.pinned_context" :key="c">{{ c }}</li>
+                      </ul>
+                    </div>
+
+                    <!-- Last topics -->
+                    <div v-if="chatStore.memory?.last_topics?.length" class="mem-section">
+                      <div class="mem-section-title">🕐 最近话题</div>
+                      <div class="mem-tags">
+                        <span v-for="t in chatStore.memory.last_topics" :key="t" class="mem-tag">{{ t }}</span>
+                      </div>
+                    </div>
+
+                    <!-- Empty state -->
+                    <div v-if="!memoryPreferences.length && !chatStore.memory?.summary && !chatStore.memory?.pinned_context?.length && !chatStore.memory?.last_topics?.length" class="mem-empty">
+                      暂无记忆。随着对话进行，Agent 会记录关键信息。
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </Transition>
+          </Teleport>
         </div>
         <div class="header-actions">
           <button class="header-btn" @click="chatStore.createSession()" title="新对话">
@@ -296,26 +391,6 @@ async function handleSend(question: string) {
   font-family: inherit;
 }
 
-/* ── Memory badge ── */
-
-.memory-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: var(--text-xs);
-  font-weight: 500;
-  color: var(--p-text);
-  background: var(--p-bg);
-  padding: 0.15rem 0.55rem;
-  border-radius: 999px;
-  cursor: help;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.memory-badge svg {
-  opacity: 0.7;
-}
 
 /* ── Header action buttons ── */
 
@@ -382,7 +457,7 @@ async function handleSend(question: string) {
 
 .messages-list {
   width: 100%;
-  max-width: 768px;
+  max-width: 100%;
   margin: 0 auto;
   padding: var(--space-4) var(--space-6) var(--space-6);
 }
@@ -510,7 +585,7 @@ async function handleSend(question: string) {
 }
 
 .input-inner {
-  max-width: 768px;
+  max-width: 100%;
   margin: 0 auto;
   position: relative;
 }
@@ -559,4 +634,185 @@ async function handleSend(question: string) {
     max-width: 80px;
   }
 }
+</style>
+
+<!-- Non-scoped styles for Teleported memory modal -->
+<style>
+.memory-trigger-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.memory-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--p-text);
+  background: var(--p-bg);
+  border: 1px solid color-mix(in srgb, var(--p) 20%, transparent);
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.memory-btn:hover {
+  background: color-mix(in srgb, var(--p) 18%, transparent);
+  border-color: var(--p);
+}
+.memory-btn svg { opacity: 0.8; flex-shrink: 0; }
+.memory-btn-text { line-height: 1; }
+
+.memory-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+}
+
+.memory-modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  box-shadow: var(--sh-lg);
+  width: 100%;
+  max-width: 720px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.memory-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.memory-modal-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 650;
+  color: var(--t1);
+}
+.memory-modal-title svg { opacity: 0.7; color: var(--p); }
+
+.memory-modal-close {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--t3);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+.memory-modal-close:hover { background: var(--border); color: var(--t1); }
+
+.memory-modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem;
+}
+
+.mem-section {
+  margin-bottom: 1.2rem;
+}
+.mem-section:last-child { margin-bottom: 0; }
+
+.mem-section-title {
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--t1);
+  margin-bottom: 0.5rem;
+}
+
+.mem-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+.mem-tag {
+  font-size: 0.8rem;
+  color: var(--t2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.mem-qa-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+.mem-qa-item {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.65rem 0.85rem;
+}
+.mem-qa-q {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--t2);
+  margin-bottom: 0.25rem;
+  line-height: 1.5;
+}
+.mem-qa-a {
+  font-size: 0.8rem;
+  color: var(--t3);
+  line-height: 1.55;
+}
+
+.mem-summary {
+  font-size: 0.84rem;
+  color: var(--t2);
+  line-height: 1.6;
+  margin: 0;
+  word-break: break-word;
+}
+
+.mem-list {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+.mem-list li {
+  font-size: 0.84rem;
+  color: var(--t2);
+  line-height: 1.5;
+  margin: 0.15rem 0;
+}
+
+.mem-empty {
+  text-align: center;
+  color: var(--t4);
+  font-size: 0.85rem;
+  padding: 2rem 0;
+}
+
+.memory-modal-enter-active { transition: opacity 0.2s ease; }
+.memory-modal-leave-active { transition: opacity 0.15s ease; }
+.memory-modal-enter-from,
+.memory-modal-leave-to { opacity: 0; }
+.memory-modal-enter-from .memory-modal { transform: scale(0.96); transition: transform 0.2s ease; }
+.memory-modal-leave-to .memory-modal { transform: scale(0.96); transition: transform 0.15s ease; }
 </style>

@@ -26,10 +26,30 @@ def health_check(
         except Exception:
             pass
 
-    # RAGFlow check
-    from src.backend.deps import _ragflow_clients
+    # Neo4j check
+    neo4j_ok = False
+    try:
+        from src.backend.storage.neo4j_client import _get_driver
+        _get_driver().verify_connectivity()
+        neo4j_ok = True
+    except Exception:
+        pass
 
-    ragflow_ok = account_id in _ragflow_clients and _ragflow_clients[account_id] is not None
+    # Milvus check
+    # Milvus 的 HTTP /healthz 在 9091（metrics 端口），而 compose 只映射了 19530
+    # （gRPC 代理端口）；19530 上无 /healthz，v1 RESTful 又不稳定（间歇 502）。
+    # 用一次 TCP 连接探测代理端口是否在监听作为存活信号——快（~10ms）且可靠。
+    milvus_ok = False
+    try:
+        import socket
+        from urllib.parse import urlparse
+        from config.settings import get_settings
+
+        u = urlparse(get_settings().milvus_uri)
+        with socket.create_connection((u.hostname, u.port or 19530), timeout=3):
+            milvus_ok = True
+    except Exception:
+        pass
 
     store = get_account_store()
     try:
@@ -51,7 +71,7 @@ def health_check(
         store.close()
 
     return StatusResponse(
-        services=ServiceStatus(ragflow=ragflow_ok, redis=redis_ok),
+        services=ServiceStatus(redis=redis_ok, neo4j=neo4j_ok, milvus=milvus_ok),
         active_account_id=account_id,
         accounts=accounts,
     )
@@ -79,9 +99,9 @@ def service_logs(
 ):
     """Tail Docker service logs."""
     allowed = {
-        "ragflow": "mailgraph-ragflow",
-        "mysql": "mailgraph-mysql",
+        "neo4j": "mailgraph-neo4j",
         "redis": "mailgraph-redis",
+        "milvus": "mailgraph-milvus",
     }
     container = allowed.get(service)
     if not container:

@@ -304,43 +304,20 @@ export class ForceGraph {
     const W = this.W, H = this.H
 
     // backdrop
-    const bg = ctx.createLinearGradient(0, 0, W * 0.3, H)
-    bg.addColorStop(0, '#060B17')
-    bg.addColorStop(0.5, '#0B1024')
-    bg.addColorStop(1, '#0F182E')
+    const bg = ctx.createLinearGradient(0, 0, W * 0.4, H)
+    bg.addColorStop(0, '#0A0E1A')
+    bg.addColorStop(0.55, '#0E1424')
+    bg.addColorStop(1, '#131B30')
     ctx.fillStyle = bg
     ctx.fillRect(0, 0, W, H)
-
-    // hex grid pattern
-    this.drawHexGrid(ctx, W, H)
-
-    // dual radial glow
-    const gl1 = ctx.createRadialGradient(W * 0.3, H * 0.4, 0, W / 2, H / 2, Math.max(W, H) * 0.6)
-    gl1.addColorStop(0, 'rgba(45,225,194,0.04)')
-    gl1.addColorStop(1, 'rgba(10,14,26,0)')
-    ctx.fillStyle = gl1
+    // radial glow from center
+    const gl = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.7)
+    gl.addColorStop(0, 'rgba(45,225,194,0.06)')
+    gl.addColorStop(1, 'rgba(10,14,26,0)')
+    ctx.fillStyle = gl
     ctx.fillRect(0, 0, W, H)
-    const gl2 = ctx.createRadialGradient(W * 0.7, H * 0.6, 0, W / 2, H / 2, Math.max(W, H) * 0.5)
-    gl2.addColorStop(0, 'rgba(129,140,248,0.03)')
-    gl2.addColorStop(1, 'rgba(10,14,26,0)')
-    ctx.fillStyle = gl2
-    ctx.fillRect(0, 0, W, H)
-
-    // pulse wave from center
-    const pulsePhase = (this.time * 0.35) % (Math.PI * 2)
-    for (let i = 0; i < 3; i++) {
-      const r = ((this.time * 0.4 + i * 2.5) % 8) / 8 * Math.max(W, H) * 0.8
-      const a = Math.max(0, 0.03 - r / Math.max(W, H) * 0.03)
-      const pwave = ctx.createRadialGradient(W / 2, H / 2, r * 0.7, W / 2, H / 2, r)
-      pwave.addColorStop(0, 'rgba(45,225,194,0)')
-      pwave.addColorStop(0.7, `rgba(45,225,194,${a})`)
-      pwave.addColorStop(1, 'rgba(45,225,194,0)')
-      ctx.fillStyle = pwave
-      ctx.fillRect(0, 0, W, H)
-    }
 
     this.drawStars(ctx)
-    this.drawParticles(ctx)
 
     const hi = this.hoverNode
     const near = hi ? this.neighbors.get(hi.id) : null
@@ -477,56 +454,6 @@ export class ForceGraph {
         : `rgba(226,232,240,${alpha})`
       ctx.fillText(nd.name, p.x, ly)
       ctx.shadowBlur = 0
-    }
-  }
-
-  private particles: {x:number;y:number;vx:number;vy:number;r:number;a:number;phase:number}[] = []
-
-  private initParticles(W: number, H: number) {
-    this.particles = []
-    for (let i = 0; i < 50; i++) {
-      this.particles.push({
-        x: Math.random() * W, y: Math.random() * H,
-        vx: (Math.random() - 0.5) * 0.3, vy: (Math.random() - 0.5) * 0.3,
-        r: Math.random() * 1.5 + 0.5,
-        a: Math.random() * 0.4 + 0.1,
-        phase: Math.random() * Math.PI * 2,
-      })
-    }
-  }
-
-  private drawParticles(ctx: CanvasRenderingContext2D) {
-    if (!this.particles.length) this.initParticles(this.W, this.H)
-    ctx.globalCompositeOperation = 'lighter'
-    for (const p of this.particles) {
-      p.x += p.vx; p.y += p.vy
-      if (p.x < 0 || p.x > this.W) p.vx *= -1
-      if (p.y < 0 || p.y > this.H) p.vy *= -1
-      const tw = 0.5 + 0.5 * Math.sin(this.time * 0.8 + p.phase)
-      ctx.fillStyle = `rgba(45,225,194,${p.a * tw})`
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill()
-    }
-    ctx.globalCompositeOperation = 'source-over'
-  }
-
-  private drawHexGrid(ctx: CanvasRenderingContext2D, W: number, H: number) {
-    const size = 48
-    ctx.strokeStyle = 'rgba(45,225,194,0.04)'
-    ctx.lineWidth = 0.5
-    const h = size * Math.sqrt(3) / 2
-    for (let row = -1; row < H / h + 1; row++) {
-      for (let col = -1; col < W / (size * 1.5) + 1; col++) {
-        const x = col * size * 1.5
-        const y = row * h + (col % 2 === 1 ? h / 2 : 0)
-        ctx.beginPath()
-        for (let i = 0; i < 6; i++) {
-          const angle = Math.PI / 3 * i - Math.PI / 6
-          const px = x + size / 2 * Math.cos(angle)
-          const py = y + size / 2 * Math.sin(angle)
-          i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py)
-        }
-        ctx.closePath(); ctx.stroke()
-      }
     }
   }
 

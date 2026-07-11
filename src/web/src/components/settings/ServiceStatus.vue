@@ -4,10 +4,9 @@ import type { ServiceStatus } from '@/api'
 defineProps<{ services: ServiceStatus }>()
 
 const items = [
-  { key: 'ragflow' as const, name: 'RAGFlow', desc: '知识图谱引擎', port: '9380' },
   { key: 'redis' as const, name: 'Redis', desc: '进度缓存', port: '6379' },
-  { key: 'mysql' as const, name: 'MySQL', desc: '元数据存储', port: '3306' },
-  { key: 'minio' as const, name: 'MinIO', desc: '文件存储', port: '9000' },
+  { key: 'neo4j' as const, name: 'Neo4j', desc: '图谱存储', port: '7687' },
+  { key: 'milvus' as const, name: 'Milvus', desc: '向量存储', port: '19530' },
 ]
 </script>
 
@@ -23,7 +22,7 @@ const items = [
 
 <style scoped>
 .svc-grid {
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
 }
 
 .svc-card {

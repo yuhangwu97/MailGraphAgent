@@ -4,7 +4,7 @@
  * colors / labels / icons for every entity type.
  */
 
-/** Neon node colors tuned for a dark background (business + RAGFlow native types). */
+/** Neon node colors tuned for a dark background (business + LightRAG entity types). */
 export const NODE_COLORS: Record<string, string> = {
   // Business types
   Company: '#2DE1C2',    // emerald neon
@@ -14,7 +14,7 @@ export const NODE_COLORS: Record<string, string> = {
   Email: '#38BDF8',      // sky cyan
   Department: '#A78BFA', // violet
   Attachment: '#F59E0B', // orange
-  // RAGFlow GraphRAG native types
+  // LightRAG graph entity types
   Organization: '#2DE1C2',
   Person: '#FBBF24',
   Location: '#38BDF8',
