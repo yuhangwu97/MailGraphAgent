@@ -549,6 +549,26 @@ class MailCache:
                 continue
             yield mail
 
+    def claim_pending_mail(self) -> dict | None:
+        """原子领取一封待入库邮件：SPOP 出队后返回其内容。
+
+        多 worker 并发时，SPOP 保证一封邮件只会被一个 worker 领取到，不会重复处理。
+        正文已过期的（get_mail 为 None）跳过并继续领取下一封；队列取空时返回 None。
+        """
+        while True:
+            mid = self.r.spop(self._k("ingest_queue"))
+            if not mid:
+                return None
+            mail = self.get_mail(mid)
+            if mail is None:
+                continue  # 正文已过期，已被 SPOP 移除，继续取下一封
+            return mail
+
+    def requeue_pending(self, message_id: str) -> None:
+        """把已领取但处理中断的邮件放回队列，供后续重试。"""
+        if message_id:
+            self.r.sadd(self._k("ingest_queue"), message_id)
+
     def mark_ingested(self, message_id: str, doc_id: str = "", drop_body: bool = True,
                       att_doc_ids: list[str] | None = None):
         """标记已入库：出队、记录正文/附件 doc_id、可选删除正文（即用即删）"""

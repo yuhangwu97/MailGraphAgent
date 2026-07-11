@@ -293,6 +293,13 @@ async function refreshAll() {
   await Promise.all([refreshStats(), refreshQueue(), refreshDone(), refreshGraphStatus(), statusStore.refresh()])
 }
 
+// 手动刷新整个界面数据（KPI / 图谱状态 / 邮件列表 / 服务健康）
+const refreshing = ref(false)
+async function handleRefresh() {
+  refreshing.value = true
+  try { await refreshAll() } finally { refreshing.value = false }
+}
+
 // 状态带轮询：建图/拉取/解析进行中时加速刷新，空闲时低频刷新，避免长期占用后端
 let pollTimer: ReturnType<typeof setInterval> | null = null
 const isBusy = computed(() =>
@@ -311,7 +318,12 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 
 <template>
   <div class="workbench">
-    <h2>邮件工作台</h2>
+    <div class="wb-head">
+      <h2>邮件工作台</h2>
+      <button class="btn btn-secondary btn-sm refresh-btn" :disabled="refreshing" @click="handleRefresh">
+        🔄 {{ refreshing ? '刷新中…' : '界面刷新' }}
+      </button>
+    </div>
 
     <!-- KPI -->
     <div class="kpi-row">
