@@ -12,6 +12,9 @@ from src.backend.deps import (
     get_account_id,
     get_cache,
     enqueue_job_and_stream,
+    prep_then_ingest_stream,
+    run_pipeline_with_sse,
+    sse_from_queue,
 )
 from src.backend.schemas import (
     BrowseDir,
@@ -276,11 +279,26 @@ async def fetch_mails(
     body: FetchRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Pull mails from IMAP → clean → enqueue. SSE progress stream (runs on worker)."""
-    return StreamingResponse(
-        enqueue_job_and_stream("fetch", account_id, {"folder": body.folder, "limit": body.limit}),
-        media_type="text/event-stream",
-    )
+    """Pull mails from IMAP → clean → enqueue. 在 API 进程内跑（IMAP 属 IO 型，
+    不做 DeepDoc 解析，不会阻塞事件循环；也不占用只管解析的 worker）。"""
+    from src.backend.pipeline import Pipeline
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        task = asyncio.create_task(
+            run_pipeline_with_sse(
+                Pipeline(account_id).run_fetch,
+                body.folder,
+                body.limit,
+                queue=queue,
+            )
+        )
+        async for event in sse_from_queue(queue):
+            yield event
+        await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/ingest")
@@ -288,7 +306,7 @@ async def ingest_mails(
     body: IngestRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Process pending mails → LightRAG. SSE progress stream (runs on worker)."""
+    """建图：入队 ingest 任务，由 worker 消费 ingest_queue 做 DeepDoc 解析 + 建图。"""
     return StreamingResponse(
         enqueue_job_and_stream("ingest", account_id, {"limit": body.limit}),
         media_type="text/event-stream",
@@ -300,9 +318,11 @@ async def reprocess_mails(
     body: ReprocessRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Force re-process selected mails. SSE progress stream (runs on worker)."""
+    """强制重处理：API 侧重置+重拉入队（IO），再入队 ingest 交 worker 建图。"""
+    from src.backend.pipeline import Pipeline
+    pipe = Pipeline(account_id)
     return StreamingResponse(
-        enqueue_job_and_stream("reprocess", account_id, {"message_ids": body.message_ids}),
+        prep_then_ingest_stream(pipe.reprocess, (body.message_ids,), account_id),
         media_type="text/event-stream",
     )
 
@@ -312,11 +332,24 @@ async def index_files(
     body: IndexFilesRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Step 1: scan local mail files → extract headers into `indexed`. SSE progress (worker)."""
-    return StreamingResponse(
-        enqueue_job_and_stream("index", account_id, {"paths": body.paths}),
-        media_type="text/event-stream",
-    )
+    """Step 1：扫描本地邮件文件表头 → indexed。纯扫描不建图，在 API 进程内跑。"""
+    from src.backend.pipeline import Pipeline
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        task = asyncio.create_task(
+            run_pipeline_with_sse(
+                Pipeline(account_id).run_index_files,
+                body.paths,
+                queue=queue,
+            )
+        )
+        async for event in sse_from_queue(queue):
+            yield event
+        await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/parse-selected")
@@ -324,9 +357,11 @@ async def parse_selected_mails(
     body: ParseSelectedRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Step 2: read bodies of selected indexed mails → LightRAG vectorize. SSE progress (worker)."""
+    """Step 2：API 侧读选中邮件源文件 + 抽附件入队（IO），再入队 ingest 交 worker 建图。"""
+    from src.backend.pipeline import Pipeline
+    pipe = Pipeline(account_id)
     return StreamingResponse(
-        enqueue_job_and_stream("parse_selected", account_id, {"message_ids": body.message_ids}),
+        prep_then_ingest_stream(pipe.parse_selected, (body.message_ids,), account_id),
         media_type="text/event-stream",
     )
 

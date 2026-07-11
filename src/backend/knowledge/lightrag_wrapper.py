@@ -473,62 +473,60 @@ def insert_mail(text: str, mail_id: str) -> str:
 def get_doc_status_counts() -> dict:
     """返回 LightRAG 文档处理状态计数：{pending, processing, processed, failed, duplicate}。
 
-    只在 LightRAG 已初始化时读取——纯查状态不值得为它冷启动整套
-    Neo4j + Milvus 存储。未初始化则返回全 0（此时也确实还没有文档在处理）。
+    直接从 Redis 读 doc_status（RedisDocStatusStorage，key: `doc_status:<doc_id>`，
+    值为含 status 字段的 JSON）。这样 API 进程无需初始化整套 LightRAG，也能看到
+    **worker 进程**写入的实时状态——建图跑在 worker 里，API 只是展示。
 
     关键：LightRAG 检测到重复插入（同 file_path 再插一次）时，会造一条 `dup-xxx`
-    的合成记录并标成 FAILED（见 lightrag/pipeline.py）。这些不是真失败——原文档已
-    PROCESSED，内容也在图里。因此从 failed 里剔除这些 dup 标记，单列到 duplicate，
-    让工作台「失败」只反映真正的处理失败。
+    的合成记录并标成 FAILED。这些不是真失败——原文档已 PROCESSED、内容也在图里。
+    因此把 dup 标记从 failed 里剔除、单列 duplicate，让工作台「失败」只反映真失败。
     """
-    empty = {"pending": 0, "processing": 0, "processed": 0, "failed": 0, "duplicate": 0}
-    if _instance is None:
-        return empty
+    out = {"pending": 0, "processing": 0, "processed": 0, "failed": 0, "duplicate": 0}
     try:
-        counts = _run(_instance.get_processing_status())
-        out = dict(empty)
-        for k, v in (counts or {}).items():
-            key = str(k).lower()
-            if key in out:
-                out[key] = int(v)
-
-        # 从 failed 中分离出 dup 合成标记（doc_id 前缀 dup- 或 metadata.is_duplicate）
-        if out["failed"]:
-            from lightrag.base import DocStatus
-            failed_docs = _run(_instance.doc_status.get_docs_by_status(DocStatus.FAILED)) or {}
-            dup = 0
-            for doc_id, rec in failed_docs.items():
-                meta = getattr(rec, "metadata", None) or {}
-                if str(doc_id).startswith("dup-") or meta.get("is_duplicate"):
-                    dup += 1
-            out["duplicate"] = dup
-            out["failed"] = max(0, out["failed"] - dup)
-        return out
+        r = _get_lock_client()  # bytes 客户端，够用
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match=b"doc_status:*", count=500)
+            if keys:
+                for key, val in zip(keys, r.mget(keys)):
+                    if not val:
+                        continue
+                    try:
+                        rec = json.loads(val)
+                    except Exception:
+                        continue
+                    st = str(rec.get("status", "")).lower()
+                    kid = key.decode() if isinstance(key, bytes) else key
+                    is_dup = kid.startswith("doc_status:dup-") or bool(
+                        (rec.get("metadata") or {}).get("is_duplicate"))
+                    if st == "failed" and is_dup:
+                        out["duplicate"] += 1
+                    elif st in out:
+                        out[st] += 1
+            if cursor == 0:
+                break
     except Exception:
-        logger.warning("get_doc_status_counts failed", exc_info=True)
-        return empty
+        logger.warning("get_doc_status_counts (redis) failed", exc_info=True)
+    return out
 
 
 def get_pipeline_status() -> dict:
-    """返回 LightRAG 建图 pipeline 的实时状态：{busy, latest_message, job_name}。
+    """返回建图 pipeline 的实时状态：{busy, latest_message, job_name}。
 
-    busy=True 表示正在增量建图（抽取实体/关系/向量化）。未初始化视为空闲。
+    busy 由 Redis 里 doc_status 的 processing 计数推导（跨进程可见）——LightRAG 自带的
+    pipeline_status 存在**进程内**共享内存里，worker 的状态 API 进程读不到，故改用
+    Redis doc_status 作为跨进程的"是否在建图"信号。
     """
     idle = {"busy": False, "latest_message": "", "job_name": ""}
-    if _instance is None:
-        return idle
     try:
-        from lightrag.kg.shared_storage import get_namespace_data
-
-        data = _run(get_namespace_data("pipeline_status"))
-        if not data:
-            return idle
-        history = data.get("history_messages") or []
-        return {
-            "busy": bool(data.get("busy", False)),
-            "latest_message": str(data.get("latest_message") or (history[-1] if history else "")),
-            "job_name": str(data.get("job_name") or ""),
-        }
+        counts = get_doc_status_counts()
+        processing = counts.get("processing", 0)
+        pending = counts.get("pending", 0)
+        busy = processing > 0
+        msg = ""
+        if busy:
+            msg = f"建图中：{processing} 处理中，{pending} 排队"
+        return {"busy": busy, "latest_message": msg, "job_name": "lightrag" if busy else ""}
     except Exception:
         logger.warning("get_pipeline_status failed", exc_info=True)
         return idle

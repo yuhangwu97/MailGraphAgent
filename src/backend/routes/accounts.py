@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 def list_accounts(store=Depends(get_account_store)):
     try:
         accounts = store.list()
+        default_id = store.default_id()
     finally:
         store.close()
 
@@ -25,9 +26,22 @@ def list_accounts(store=Depends(get_account_store)):
             imap_port=a.get("imap_port", 993),
             email_user=a.get("email_user", ""),
             provider=a.get("provider", ""),
+            is_default=(a["id"] == default_id),
         )
         for a in accounts
     ]
+
+
+@router.post("/{account_id}/default", status_code=200)
+def set_default_account(account_id: str, store=Depends(get_account_store)):
+    """把该账号设为默认（无 X-Account-Id 时 / CLI 使用的账号）。"""
+    try:
+        if not store.get(account_id):
+            raise HTTPException(status_code=404, detail="Account not found")
+        store.set_default(account_id)
+    finally:
+        store.close()
+    return {"default_account_id": account_id}
 
 
 @router.get("/{account_id}", response_model=AccountOut)

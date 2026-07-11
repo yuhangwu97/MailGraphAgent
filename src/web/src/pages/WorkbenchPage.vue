@@ -530,6 +530,13 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 <style scoped>
 .workbench { max-width: 100%; }
 
+.wb-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 0.6rem; margin-bottom: 0.75rem;
+}
+.wb-head h2 { margin: 0; }
+.refresh-btn { flex-shrink: 0; white-space: nowrap; }
+
 /* ── KPI ── */
 .kpi-row {
   display: flex; gap: 0; margin-bottom: 1rem;

@@ -143,6 +143,49 @@ async def enqueue_job_and_stream(
         yield event
 
 
+async def prep_then_ingest_stream(
+    prep_fn, prep_args: tuple, account_id: str | None, ingest_params: dict | None = None,
+) -> AsyncGenerator[str, None]:
+    """先在 API 进程内跑「准备」(prep_fn，只入队不建图)，再入队 ingest 交给 worker 建图。
+
+    prep_fn 是 Pipeline 的准备方法（parse_selected / reprocess），在 API 线程池里跑（读源
+    文件 / 重拉 IMAP，属 IO 型），只把邮件塞进 ingest_queue。准备阶段只发 progress 事件，
+    最终的 complete 由 worker 的 ingest 建图阶段发出，前端看到的是一条连续的 SSE。
+    """
+    main_loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    _DONE = object()
+
+    def _prep() -> None:
+        def on_log(msg: str) -> None:
+            main_loop.call_soon_threadsafe(
+                queue.put_nowait, {"event": "progress", "data": {"msg": msg}})
+        err = None
+        try:
+            prep_fn(*prep_args, on_log=on_log)
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        main_loop.call_soon_threadsafe(queue.put_nowait, (_DONE, err))
+
+    threading.Thread(target=_prep, name="prep", daemon=True).start()
+
+    # 阶段 1：准备进度（只 progress；准备失败则发 error 并终止）
+    while True:
+        item = await queue.get()
+        if isinstance(item, tuple) and item[0] is _DONE:
+            err = item[1]
+            if err:
+                yield f"event: error\ndata: {json.dumps({'msg': err}, ensure_ascii=False)}\n\n"
+                return
+            break
+        data = json.dumps(item.get("data", {}), ensure_ascii=False)
+        yield f"event: {item.get('event', 'progress')}\ndata: {data}\n\n"
+
+    # 阶段 2：入队 ingest 给 worker，转发建图进度（含最终 complete）
+    async for event in enqueue_job_and_stream("ingest", account_id, ingest_params or {}):
+        yield event
+
+
 
 async def run_in_thread(fn, *args, **kwargs):
     """Run a synchronous function in a thread pool executor."""

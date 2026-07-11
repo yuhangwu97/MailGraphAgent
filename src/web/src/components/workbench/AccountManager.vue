@@ -108,11 +108,21 @@ onMounted(async () => {
         <span class="text-muted" style="font-size:0.65rem;">已保存的账号可删除，不影响已有数据</span>
       </div>
 
-      <!-- Existing accounts (delete) -->
+      <!-- Existing accounts (set default / delete) -->
       <div v-if="accountStore.accounts.length" class="existing-list">
         <div v-for="a in accountStore.accounts" :key="a.id" class="existing-row">
-          <span class="existing-info">{{ a.label || a.email_user }} · {{ a.email_user }} · {{ a.imap_server }}</span>
-          <button class="btn btn-danger-outline btn-sm" @click="accountStore.deleteAccount(a.id)">删除</button>
+          <span class="existing-info">
+            {{ a.label || a.email_user }} · {{ a.email_user }} · {{ a.imap_server }}
+            <span v-if="a.is_default" class="default-badge">默认</span>
+          </span>
+          <span class="existing-actions">
+            <button
+              v-if="!a.is_default"
+              class="btn btn-secondary btn-sm"
+              @click="accountStore.setDefault(a.id)"
+            >设为默认</button>
+            <button class="btn btn-danger-outline btn-sm" @click="accountStore.deleteAccount(a.id)">删除</button>
+          </span>
         </div>
       </div>
     </div>
@@ -167,7 +177,15 @@ onMounted(async () => {
 
 .existing-row:last-child { border-bottom: none; }
 
-.existing-info { color: var(--t3); }
+.existing-info { color: var(--t3); display: flex; align-items: center; gap: 0.4rem; }
+.existing-actions { display: flex; align-items: center; gap: 0.4rem; }
+
+.default-badge {
+  font-size: 0.62rem; font-weight: 700; color: var(--p);
+  background: color-mix(in srgb, var(--p) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--p) 40%, transparent);
+  padding: 0.05rem 0.4rem; border-radius: 9999px;
+}
 
 .btn-danger-outline {
   background: transparent; border: 1px solid var(--red); color: var(--red);

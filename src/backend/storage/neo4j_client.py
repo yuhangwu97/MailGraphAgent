@@ -84,10 +84,10 @@ def count_graph() -> dict:
     LightRAG 冷启动、且用有向 :DIRECTED-> 得到真实边数。
 
     ── 关于 workspace / 账号 ──
-    本系统【故意】用全局单一知识图谱：LightRAG 单例、单 workspace(base)，所有账号
-    的邮件汇入同一张图（跨账号统一检索）。这与 Redis 按账号隔离(mailgraph:{id}:)
-    不同，是有意为之，非缺陷。因此这里 MATCH (n) WHERE entity_id IS NOT NULL 不按
-    workspace 限定是安全的——全局只有一个 workspace。
+    本系统用全局单一知识图谱：LightRAG 单例、单 workspace(base)，所有账号的邮件汇入
+    同一张图（跨账号统一检索）。邮件/会话数据（Redis）现在同样全局共享，账号仅作为
+    IMAP 登录凭据。因此这里 MATCH (n) WHERE entity_id IS NOT NULL 不按 workspace
+    限定是安全的——全局只有一个 workspace。
 
     连接失败（Neo4j 未起）时返回 0，让前端优雅降级。
     """

@@ -28,6 +28,7 @@ class AccountOut(BaseModel):
     imap_port: int
     email_user: str
     provider: str
+    is_default: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════

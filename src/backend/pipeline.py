@@ -371,10 +371,9 @@ class Pipeline:
         finally:
             cache.close()
 
-        log(f"已解析入队 {queued} 封，开始向量化 + GraphRAG 建图...")
-        stats = self.run_ingest(on_log=on_log)
-        stats["queued"] = queued
-        return stats
+        log(f"已解析入队 {queued} 封，待建图...")
+        # 只做「准备+入队」：建图由 worker 的 ingest 任务统一处理（见路由 prep_then_ingest_stream）
+        return {"queued": queued}
 
     # ══════════════════════════════════════════════
     # 强制重新处理（绕过幂等）
@@ -420,15 +419,12 @@ class Pipeline:
                             if self._store_fetched_mail(uid, msg, folder,
                                                         cache, cleaner, attach_root) is not None:
                                 requeued += 1
-            log(f"重新入队 {requeued} 封，开始重新建图...")
+            log(f"重新入队 {requeued} 封，待建图...")
         finally:
             cache.close()
 
-        # 3) 重新 ingest（走既有队列逻辑）
-        stats = self.run_ingest(on_log=on_log)
-        stats["reset"] = reset_n
-        stats["requeued"] = requeued
-        return stats
+        # 只做「准备+入队」：建图由 worker 的 ingest 任务统一处理（见路由 prep_then_ingest_stream）
+        return {"reset": reset_n, "requeued": requeued}
 
 
 def _safe(s: str) -> str:

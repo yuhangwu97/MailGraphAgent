@@ -4,9 +4,20 @@
 
 const BASE = '/api'
 
+// ── Active account context ──
+// 后端按 X-Account-Id 头区分账户数据；这里保存当前账户 id，由 account store 保持同步，
+// 每个 REST / SSE 请求都带上，缺失时后端 fallback 到默认（第一个）账户。
+let activeAccountId: string | null = null
+export function setActiveAccountId(id: string | null) {
+  activeAccountId = id
+}
+function accountHeaders(): Record<string, string> {
+  return activeAccountId ? { 'X-Account-Id': activeAccountId } : {}
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    headers: { 'Content-Type': 'application/json', ...accountHeaders(), ...options?.headers },
     ...options,
   })
   if (!res.ok) {
@@ -32,7 +43,7 @@ export function sseStream(
 
   fetch(`${BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...accountHeaders() },
     body: JSON.stringify(body),
     signal: controller.signal,
   }).then(async (res) => {
@@ -94,6 +105,7 @@ export interface Account {
   imap_port: number
   email_user: string
   provider: string
+  is_default?: boolean
 }
 
 export const accountsApi = {
@@ -104,6 +116,7 @@ export const accountsApi = {
     email_user: string; email_pass: string; provider: string
   }) => request<Account>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/accounts/${id}`, { method: 'DELETE' }),
+  setDefault: (id: string) => request<{ default_account_id: string }>(`/accounts/${id}/default`, { method: 'POST' }),
   migrateFromEnv: () => request<{ migrated: boolean; account_count: number }>('/accounts/migrate-from-env', { method: 'POST' }),
 }
 
