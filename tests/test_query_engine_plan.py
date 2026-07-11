@@ -30,6 +30,9 @@ class FakeCache:
     def message_ids_for_docs(self, doc_ids):
         return {self.doc_map[d] for d in doc_ids if d in self.doc_map}
 
+    def get_mail_state(self, message_id):
+        return {"message_id": message_id} if message_id in {"m1", "m2"} else {}
+
     def query_stats(self, **kwargs):
         self.last_kwargs = kwargs
         allowed = set(kwargs.get("message_ids") or ["m1", "m2"])
@@ -153,17 +156,18 @@ def test_query_uses_langgraph_when_available_and_keeps_contract():
     assert result["error"] == ""
 
 
-class FakeRAGFlow:
-    def retrieve_chunks(self, query: str, top_k: int = 10):
-        return [
-            {"doc_id": "doc-m1", "doc_name": "mail_m1.md", "content": "合同预算正文", "score": 0.9},
-            {"doc_id": "doc-other", "doc_name": "mail_other.md", "content": "无关正文", "score": 0.8},
-        ]
+def fake_retrieve_sources(query: str, mode: str = "mix", top_k: int = 20):
+    return [
+        {"doc_id": "doc-m1", "doc_name": "mail_m1.md", "content": "合同预算正文", "score": 0.9},
+        {"doc_id": "doc-other", "doc_name": "mail_other.md", "content": "无关正文", "score": 0.8},
+    ]
 
 
-def test_hybrid_retrieval_filters_chunks_by_matched_message_id():
+def test_hybrid_retrieval_filters_chunks_by_matched_message_id(monkeypatch):
+    from src.backend.knowledge import lightrag_wrapper
+
+    monkeypatch.setattr(lightrag_wrapper, "retrieve_mail_sources", fake_retrieve_sources)
     engine = FakeQueryEngine()
-    engine.rf = FakeRAGFlow()
     engine._cache = FakeCache()
 
     chunks = engine._retrieve_hybrid_chunks("合同", ["m1"])
@@ -172,9 +176,11 @@ def test_hybrid_retrieval_filters_chunks_by_matched_message_id():
     assert chunks[0]["doc_name"] == "mail_m1.md"
 
 
-def test_hybrid_count_uses_topic_message_id_intersection():
+def test_hybrid_count_uses_topic_message_id_intersection(monkeypatch):
+    from src.backend.knowledge import lightrag_wrapper
+
+    monkeypatch.setattr(lightrag_wrapper, "retrieve_mail_sources", fake_retrieve_sources)
     engine = FakeQueryEngine()
-    engine.rf = FakeRAGFlow()
     cache = FakeCache()
     engine._cache = cache
     plan = QueryPlan(

@@ -127,8 +127,16 @@ export interface BrowseFile {
   path: string; name: string; size: number; ext: string
 }
 
+export interface BrowseDir {
+  path: string; name: string
+}
+
 export interface BrowseResponse {
-  dir: string; files: BrowseFile[]
+  dir: string; parent: string | null; dirs: BrowseDir[]; files: BrowseFile[]
+}
+
+export interface PickResponse {
+  paths: string[]; canceled: boolean
 }
 
 export interface MailDetail extends MailItem {
@@ -156,7 +164,10 @@ export interface PaginatedMails {
 
 export const mailsApi = {
   stats: () => request<MailStats>('/mails/stats'),
-  pending: () => request<MailItem[]>('/mails/pending'),
+  pending: (params?: { page?: number; page_size?: number }) => {
+    const p = params || {}
+    return request<PaginatedMails>(`/mails/pending?page=${p.page ?? 1}&page_size=${p.page_size ?? 50}`)
+  },
   done: (params?: { page?: number; page_size?: number }) => {
     const p = params || {}
     return request<PaginatedMails>(`/mails/done?page=${p.page ?? 1}&page_size=${p.page_size ?? 20}`)
@@ -176,10 +187,11 @@ export const mailsApi = {
     sseStream('/mails/reprocess', { message_ids: messageIds }, handlers),
 
   // ── File import (.eml/.msg/.pst/.ost) ──
-  browse: (dir: string) => request<BrowseResponse>(`/mails/browse?dir=${encodeURIComponent(dir)}`),
-  indexed: (params?: { page?: number; page_size?: number }) => {
+  pick: (mode: 'folder' | 'files' = 'folder') => request<PickResponse>(`/mails/pick?mode=${mode}`),
+  browse: (dir?: string) => request<BrowseResponse>(`/mails/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`),
+  indexed: (params?: { page?: number; page_size?: number; status?: 'pending' | 'done' | 'all' }) => {
     const p = params || {}
-    return request<PaginatedMails>(`/mails/indexed?page=${p.page ?? 1}&page_size=${p.page_size ?? 50}`)
+    return request<PaginatedMails>(`/mails/indexed?status=${p.status ?? 'pending'}&page=${p.page ?? 1}&page_size=${p.page_size ?? 50}`)
   },
   indexFiles: (paths: string[], handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/index', { paths }, handlers),
@@ -241,15 +253,25 @@ export const queryApi = {
 // Graph API
 // ═══════════════════════════════════════════════════════════════
 
+export interface GraphStatus {
+  graph: { entities: number; relationships: number }
+  docs: { pending: number; processing: number; processed: number; failed: number; duplicate?: number }
+  pipeline: { busy: boolean; latest_message: string; job_name: string }
+}
+
 export const graphApi = {
   entities: (page = 1, pageSize = 500) =>
     request<{ entities: any[]; page: number }>(`/graph/entities?page=${page}&page_size=${pageSize}`),
   relationships: (page = 1, pageSize = 1000) =>
     request<{ relationships: any[]; page: number }>(`/graph/relationships?page=${page}&page_size=${pageSize}`),
+  status: () => request<GraphStatus>('/graph/status'),
   build: (timeout: number, handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/graph/build', { timeout }, handlers),
   visualize: (entityTypes: string[] | null) =>
     request<{ html: string }>('/graph/visualize', { method: 'POST', body: JSON.stringify({ entity_types: entityTypes }) }),
+  resolveEntities: (dryRun: boolean) =>
+    request<{ dry_run: boolean; groups: Array<{ type: string; canonical: string; merged: string[]; error?: string }>; merged_groups: number; merged_entities: number; rejected: number }>(
+      `/graph/resolve-entities?dry_run=${dryRun}`, { method: 'POST' }),
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -257,7 +279,7 @@ export const graphApi = {
 // ═══════════════════════════════════════════════════════════════
 
 export interface ServiceStatus {
-  ragflow: boolean; redis: boolean; mysql: boolean; minio: boolean
+  redis: boolean; neo4j: boolean; milvus: boolean
 }
 
 export interface StatusResponse {

@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "marked": "^18.0.6",
     "pinia": "^2.1.7",
     "vis-data": "^8.0.4",
     "vis-network": "^10.1.0",

@@ -114,9 +114,22 @@ class BrowseFile(BaseModel):
     ext: str = ""
 
 
+class BrowseDir(BaseModel):
+    path: str
+    name: str
+
+
 class BrowseResponse(BaseModel):
     dir: str
+    parent: str | None = None
+    dirs: list[BrowseDir] = Field(default_factory=list)
     files: list[BrowseFile] = Field(default_factory=list)
+
+
+class PickResponse(BaseModel):
+    """原生文件对话框选择结果。"""
+    paths: list[str] = Field(default_factory=list)
+    canceled: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -222,10 +235,9 @@ class GraphVisualizeRequest(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 class ServiceStatus(BaseModel):
-    ragflow: bool
     redis: bool
-    mysql: bool = True
-    minio: bool = True
+    neo4j: bool = False
+    milvus: bool = False
 
 
 class TokenUsage(BaseModel):

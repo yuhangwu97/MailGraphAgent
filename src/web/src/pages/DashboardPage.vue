@@ -13,7 +13,10 @@ const projects = ref<any[]>([])
 const search = ref('')
 const loading = ref(true)
 
-const PEOPLE_TYPES = ['Contact', 'Employee', 'Person']
+// LightRAG 存储的 entity_type 统一为小写去空格，故一律按小写比较。
+// 人员相关类型放宽匹配（person / contact / employee 都算联系人）。
+const PEOPLE_TYPES = ['person', 'contact', 'employee']
+const etype = (e: any) => String(e?.type || '').toLowerCase()
 
 onMounted(async () => {
   try {
@@ -26,8 +29,8 @@ onMounted(async () => {
     const entities = entRes.entities || []
     const rels = relRes.relationships || []
     graphNodes.value = entities.length
-    projectCount.value = entities.filter((e: any) => e.type === 'Project').length
-    contactCount.value = entities.filter((e: any) => ['Contact', 'Employee'].includes(e.type)).length
+    projectCount.value = entities.filter((e: any) => etype(e) === 'project').length
+    contactCount.value = entities.filter((e: any) => PEOPLE_TYPES.includes(etype(e))).length
 
     // 实体按 id 与 name 双键索引，关系边的端点可能用其中任一标识
     const byKey = new Map<string, any>()
@@ -61,17 +64,17 @@ onMounted(async () => {
     const clean = (s: string) => (s || '').replace(/<[^>]*>/g, '')
 
     projects.value = entities
-      .filter((e: any) => e.type === 'Project')
+      .filter((e: any) => etype(e) === 'project')
       .map((p: any) => {
         const neighbors = neighborsOf(p)
         return {
           name: clean(p.name),
           description: clean((p.description || '') + '').slice(0, 200),
           people: neighbors
-            .filter((n: any) => PEOPLE_TYPES.includes(n.type))
+            .filter((n: any) => PEOPLE_TYPES.includes(etype(n)))
             .map((n: any) => ({ name: clean(n.name) })),
           companies: neighbors
-            .filter((n: any) => n.type === 'Company')
+            .filter((n: any) => etype(n) === 'organization')
             .map((n: any) => ({ name: clean(n.name) })),
         }
       })

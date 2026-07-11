@@ -80,6 +80,17 @@ class MailCache:
                 return 0.0
         return dt.timestamp()
 
+    def _doc_ids_from_state(self, data: dict) -> list[str]:
+        """从状态哈希取出所有知识库文档 id（正文 + 附件）。
+
+        兼容旧字段名 ragflow_doc_id / ragflow_att_doc_ids。
+        """
+        primary = data.get("knowledge_doc_id") or data.get("ragflow_doc_id", "") or ""
+        atts = (data.get("knowledge_att_doc_ids")
+                or data.get("ragflow_att_doc_ids", "") or "")
+        ids = [primary] + atts.split(",")
+        return [d for d in ids if d]
+
     def _remove_indexes_for_state(self, pipe, message_id: str, data: dict):
         status = data.get("status") or "pending"
         pipe.srem(self._status_key(status), message_id)
@@ -95,9 +106,8 @@ class MailCache:
         except (TypeError, ValueError):
             att_count = 0
         pipe.srem(self._attachment_key(att_count > 0), message_id)
-        for doc_id in [data.get("ragflow_doc_id", "")] + (data.get("ragflow_att_doc_ids", "") or "").split(","):
-            if doc_id:
-                pipe.delete(self._doc_key(doc_id))
+        for doc_id in self._doc_ids_from_state(data):
+            pipe.delete(self._doc_key(doc_id))
 
     def _index_state(self, pipe, message_id: str, data: dict):
         status = data.get("status") or "pending"
@@ -115,9 +125,8 @@ class MailCache:
         except (TypeError, ValueError):
             att_count = 0
         pipe.sadd(self._attachment_key(att_count > 0), message_id)
-        for doc_id in [data.get("ragflow_doc_id", "")] + (data.get("ragflow_att_doc_ids", "") or "").split(","):
-            if doc_id:
-                pipe.set(self._doc_key(doc_id), message_id)
+        for doc_id in self._doc_ids_from_state(data):
+            pipe.set(self._doc_key(doc_id), message_id)
 
     def _replace_indexes(self, message_id: str, data: dict):
         old = self.get_mail_state(message_id)
@@ -128,7 +137,7 @@ class MailCache:
         pipe.execute()
 
     def message_ids_for_docs(self, doc_ids: list[str]) -> set[str]:
-        """Resolve RAGFlow document ids back to message_ids via ingest indexes."""
+        """Resolve knowledge-base document ids back to message_ids via ingest indexes."""
         mids = set()
         for doc_id in doc_ids:
             if not doc_id:
@@ -262,6 +271,12 @@ class MailCache:
         return uids
 
     def get_unprocessed_count(self) -> int:
+        # 优先用 status 索引集 (SCARD O(1))：failed + pending
+        failed_key = self._status_key("failed")
+        pending_key = self._status_key("pending")
+        if self.r.exists(failed_key) or self.r.exists(pending_key):
+            return int(self.r.scard(failed_key)) + int(self.r.scard(pending_key))
+        # 回退：无索引集时全量扫描一次
         count = 0
         for key in self.r.scan_iter(match=self._k("mail", "*")):
             if self.r.type(key) != "hash":
@@ -272,7 +287,14 @@ class MailCache:
         return count
 
     def get_stats(self) -> dict:
-        stats = {"done": 0, "failed": 0, "skipped": 0, "processing": 0, "pending": 0, "indexed": 0}
+        statuses = ["done", "failed", "skipped", "processing", "pending", "indexed"]
+        stats = {s: 0 for s in statuses}
+        # 优先用 status 索引集 (SCARD O(1))；任一索引集存在即认为索引可用
+        if any(self.r.exists(self._status_key(s)) for s in statuses):
+            for s in statuses:
+                stats[s] = int(self.r.scard(self._status_key(s)))
+            return stats
+        # 回退：无索引集时全量扫描一次
         for key in self.r.scan_iter(match=self._k("mail", "*")):
             if self.r.type(key) != "hash":
                 continue
@@ -533,8 +555,8 @@ class MailCache:
         key = self._k("mail", message_id)
         old = self.get_mail_state(message_id)
         data = {**old, "message_id": message_id, "status": "done",
-                "ragflow_doc_id": doc_id,
-                "ragflow_att_doc_ids": ",".join(att_doc_ids or []),
+                "knowledge_doc_id": doc_id,
+                "knowledge_att_doc_ids": ",".join(att_doc_ids or []),
                 "updated_at": str(time.time())}
         pipe = self.r.pipeline()
         if old:
@@ -542,8 +564,8 @@ class MailCache:
         pipe.srem(self._k("ingest_queue"), message_id)
         pipe.hset(key, mapping={
             "message_id": message_id,
-            "status": "done", "ragflow_doc_id": doc_id,
-            "ragflow_att_doc_ids": ",".join(att_doc_ids or []),
+            "status": "done", "knowledge_doc_id": doc_id,
+            "knowledge_att_doc_ids": ",".join(att_doc_ids or []),
             "updated_at": data["updated_at"],
         })
         pipe.setex(self._k("mail", message_id, "done"), 30 * 86400, "1")
@@ -554,7 +576,7 @@ class MailCache:
         self._index_done_uid(key)
 
     def get_mail_state(self, message_id: str) -> dict:
-        """取一封邮件的处理状态哈希（uid/folder/status/ragflow_doc_id 等）"""
+        """取一封邮件的处理状态哈希（uid/folder/status/knowledge_doc_id 等）"""
         return self.r.hgetall(self._k("mail", message_id))
 
     def count_done_mails(self) -> int:
@@ -582,7 +604,7 @@ class MailCache:
         """列出已入库(done)邮件的元数据（正文已释放，用于强制重新处理）。
 
         返回含 message_id / subject / from_addr / date / uid / folder /
-        ragflow_doc_id。按 updated_at 倒序。
+        knowledge_doc_id。按 updated_at 倒序。
         """
         prefix_len = len(self._prefix) + len("mail:")
         mails = []

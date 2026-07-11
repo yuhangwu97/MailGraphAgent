@@ -31,7 +31,30 @@ async def lifespan(app: FastAPI):
     """Startup / shutdown."""
     logger.info("MailGraph API starting (prod=%s) ...", _PROD_MODE)
     yield
-    logger.info("MailGraph API shutting down")
+    # ── Shutdown: close pooled connections ──
+    logger.info("MailGraph API shutting down — cleaning up connections ...")
+
+    # Close Neo4j driver
+    try:
+        from src.backend.storage.neo4j_client import close_driver
+        close_driver()
+        logger.info("Neo4j driver closed")
+    except Exception as e:
+        logger.warning("Failed to close Neo4j driver: %s", e)
+
+    # Close QueryEngine MailCache instances
+    try:
+        from src.backend.deps import _query_engines
+        for aid, engine in list(_query_engines.items()):
+            try:
+                if hasattr(engine, 'close'):
+                    engine.close()
+            except Exception:
+                pass
+        _query_engines.clear()
+        logger.info("QueryEngine caches closed")
+    except Exception as e:
+        logger.warning("Failed to close QueryEngine caches: %s", e)
 
 
 app = FastAPI(

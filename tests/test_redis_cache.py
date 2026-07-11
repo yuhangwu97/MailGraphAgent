@@ -94,6 +94,9 @@ class FakeRedis:
     def smembers(self, key):
         return set(self.sets.get(key, set()))
 
+    def scard(self, key):
+        return len(self.sets.get(key, set()))
+
     def exists(self, key):
         return int(key in self.hashes or key in self.strings or key in self.sets or key in self.zsets)
 
@@ -163,8 +166,8 @@ def test_store_mail_queues_body_and_mark_ingested_clears_it(monkeypatch):
     assert cache.get_mail("mid-1") is None
     state = cache.get_mail_state("mid-1")
     assert state["status"] == "done"
-    assert state["ragflow_doc_id"] == "doc-1"
-    assert state["ragflow_att_doc_ids"] == "att-1"
+    assert state["knowledge_doc_id"] == "doc-1"
+    assert state["knowledge_att_doc_ids"] == "att-1"
     assert fake.exists(cache._k("mail", "mid-1", "done"))
     assert fake.smembers(cache._k("done_uids", "INBOX")) == {"101"}
     assert fake.get(cache._k("idx", "doc", "doc-1")) == "mid-1"

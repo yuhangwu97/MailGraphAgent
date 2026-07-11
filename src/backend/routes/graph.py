@@ -1,121 +1,62 @@
-"""GraphRAG knowledge graph endpoints."""
-
-from __future__ import annotations
-
+"""Knowledge graph endpoints — Neo4j via LightRAG."""
 import asyncio
-import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
-
-from src.backend.deps import get_account_id, get_ragflow, sse_from_queue
-from src.backend.schemas import GraphBuildRequest, GraphVisualizeRequest
+from fastapi import APIRouter, Query
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/graph", tags=["graph"])
 
 
 @router.get("/entities")
-async def entities(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(500, ge=1, le=2000),
-    account_id: str = Depends(get_account_id),
-    rf=Depends(get_ragflow),
-):
-    """List graph entities with pagination."""
-    if rf is None:
-        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
+async def entities(page: int = Query(1, ge=1), page_size: int = Query(500, ge=1, le=2000)):
+    from src.backend.storage.neo4j_client import get_all_entities
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None, lambda: rf.get_graph_entities(page=page, page_size=page_size)
-    )
+    result = await loop.run_in_executor(None, lambda: get_all_entities(limit=page_size))
     return {"entities": result, "page": page, "page_size": page_size}
 
 
 @router.get("/relationships")
-async def relationships(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(1000, ge=1, le=5000),
-    account_id: str = Depends(get_account_id),
-    rf=Depends(get_ragflow),
-):
-    """List graph relationships with pagination."""
-    if rf is None:
-        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
+async def relationships(page: int = Query(1, ge=1), page_size: int = Query(1000, ge=1, le=5000)):
+    from src.backend.storage.neo4j_client import get_all_relationships
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        None, lambda: rf.get_graph_relationships(page=page, page_size=page_size)
-    )
+    result = await loop.run_in_executor(None, lambda: get_all_relationships(limit=page_size))
     return {"relationships": result, "page": page, "page_size": page_size}
 
 
-@router.post("/build")
-async def build_graph(
-    body: GraphBuildRequest = GraphBuildRequest(),
-    account_id: str = Depends(get_account_id),
-    rf=Depends(get_ragflow),
-):
-    """Trigger GraphRAG knowledge graph build. SSE progress stream."""
-    if rf is None:
-        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
+@router.get("/status")
+async def graph_status():
+    """知识图谱综合状态：图谱规模 + LightRAG 文档处理进度 + pipeline 实时状态。
 
-    queue: asyncio.Queue = asyncio.Queue()
-
-    async def event_stream():
-        loop = asyncio.get_running_loop()
-
-        def _run():
-            try:
-                msgs = []
-
-                def on_progress(msg: str):
-                    msgs.append(msg)
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait,
-                        {"event": "progress", "data": {"msg": msg}},
-                    )
-
-                result = rf.build_graph(timeout=body.timeout, on_progress=on_progress)
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    {"event": "complete", "data": result},
-                )
-            except Exception as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    {"event": "error", "data": {"msg": str(exc)}},
-                )
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
-
-        import asyncio as _asyncio
-        task = _asyncio.create_task(loop.run_in_executor(None, _run))
-        async for event in sse_from_queue(queue):
-            yield event
-        await task
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-@router.post("/visualize")
-async def visualize(
-    body: GraphVisualizeRequest = GraphVisualizeRequest(),
-    rf=Depends(get_ragflow),
-):
-    """Generate pyvis graph HTML for the given entity type filter."""
-    if rf is None:
-        raise HTTPException(status_code=503, detail="RAGFlow unavailable")
+    切到 LightRAG 后新增可见的建图侧状态，供工作台状态带展示。所有读取都在
+    executor 里跑（Neo4j 计数 / LightRAG 状态均为同步阻塞调用）；任一后端不可用
+    时对应字段优雅降级为 0/空闲，不阻塞整体响应。
+    """
+    def _collect() -> dict:
+        from src.backend.storage.neo4j_client import count_graph
+        from src.backend.knowledge.lightrag_wrapper import (
+            get_doc_status_counts,
+            get_pipeline_status,
+        )
+        return {
+            "graph": count_graph(),
+            "docs": get_doc_status_counts(),
+            "pipeline": get_pipeline_status(),
+        }
 
     loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _collect)
 
-    def _build():
-        from src.backend.graph_viz import build_pyvis_network_from_ragflow
 
-        return build_pyvis_network_from_ragflow(
-            rf, entity_types_filter=body.entity_types if body.entity_types else None
-        )
+@router.post("/resolve-entities")
+async def resolve_entities(dry_run: bool = Query(False, description="只返回归并预案，不写库")):
+    """实体归并（别名消歧）：把跨邮件指向同一现实实体的节点合并。
 
-    html = await loop.run_in_executor(None, _build)
-    return {"html": html}
+    LightRAG 只按同名合并，"赵阳/赵工"、"华远/华远物流"会被拆成多个节点。此接口
+    用 LLM 在同类型内保守聚类后调 amerge_entities（同步更新图谱 + 向量库）。
+    dry_run=true 时只返回预案供预览，不改数据。
+    """
+    from src.backend.knowledge.lightrag_wrapper import resolve_entity_aliases
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: resolve_entity_aliases(dry_run=dry_run))
+

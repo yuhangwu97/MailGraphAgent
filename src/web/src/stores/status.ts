@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { statusApi, type ServiceStatus } from '@/api'
 
 export const useStatusStore = defineStore('status', () => {
-  const services = ref<ServiceStatus>({ ragflow: false, redis: false, mysql: true, minio: true })
+  const services = ref<ServiceStatus>({ redis: false, neo4j: false, milvus: false })
   const activeAccountId = ref<string | null>(null)
   const loading = ref(false)
 
@@ -14,7 +14,7 @@ export const useStatusStore = defineStore('status', () => {
       services.value = status.services
       activeAccountId.value = status.active_account_id
     } catch {
-      services.value = { ragflow: false, redis: false, mysql: true, minio: true }
+      services.value = { redis: false, neo4j: false, milvus: false }
     } finally {
       loading.value = false
     }

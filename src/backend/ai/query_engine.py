@@ -4,7 +4,7 @@
 接收自然语言问题，通过 LLM 意图分类路由到不同后端：
 
   stat_query     → MailCache（Redis 计数/列表/发件人排名/成功率）
-  content_query  → RAGFlow GraphRAG（语义检索 + 图谱 + 生成）
+  content_query  → LightRAG（语义检索 + 图谱 + 生成）
 
 意图由 LLM 做语义槽位提取——自然语言时间描述（"近三天"、"上周"）、
 状态描述（"失败"、"待处理"）、发件人过滤等自动转为结构化查询参数。
@@ -271,7 +271,7 @@ class QueryResult:
 class QueryEngine:
     """智能查询引擎 — LLM 意图分类 → 路由分发 → 执行"""
 
-    def __init__(self, ragflow_client=None, account_id: str | None = None):
+    def __init__(self, account_id: str | None = None):
         cfg = get_settings()
         self.llm = OpenAI(
             api_key=cfg.openai_api_key,
@@ -279,7 +279,6 @@ class QueryEngine:
             timeout=60.0,
         )
         self.model = cfg.openai_model
-        self.rf = ragflow_client
         self._account_id = account_id
         self._cache = None
         self._query_graph = None
@@ -297,6 +296,16 @@ class QueryEngine:
                 logger.warning("MailCache 初始化失败: %s", e)
                 self._cache = False
         return self._cache if self._cache is not False else None
+
+    def close(self):
+        """关闭 MailCache 连接。"""
+        if self._cache and self._cache is not False:
+            try:
+                self._cache.close()
+            except Exception:
+                pass
+            self._cache = None
+        self._query_graph = None
 
     def _call_llm(self, prompt: str, max_tokens: int = 500,
                   system: str | None = None) -> str:
@@ -529,6 +538,15 @@ class QueryEngine:
         if plan.filters.sender and group_by is None and not result.get("_sender_filtered"):
             result = self._filter_by_sender(result, plan.filters.sender)
 
+        # sender 命中 0：发件人索引只覆盖 from_addr/from_name，此人可能是
+        # 收件人或正文里提及/协作的人。不要断言"此人未发送/负责任何邮件"，
+        # 回落到语义检索（content/hybrid），从图谱/正文里找出与此人相关的邮件。
+        if plan.filters.sender and group_by is None and result.get("total", 0) == 0:
+            fallback = self._fallback_sender_to_semantic(
+                question, plan, start_time, context)
+            if fallback is not None:
+                return fallback
+
         # 按聚合类型生成回答
         answer = self._format_stat_answer(question, result, tr, plan, context)
 
@@ -578,6 +596,59 @@ class QueryEngine:
             "items": filtered,
             "matched_ids": [i["message_id"] for i in filtered],
         }
+
+    def _fallback_sender_to_semantic(self, question: str, plan: QueryPlan,
+                                     start_time: float,
+                                     context: dict | None = None) -> dict | None:
+        """stat+sender 命中 0 时的兜底：把人名当正文实体走语义检索。
+
+        发件人索引只覆盖 from_addr/from_name，收件人和正文里提及/协作的人
+        统计不到。此时不应断言"此人未发送/负责任何邮件"，而是把 sender 挪到
+        topic，回落到 content（无其他约束）或 hybrid（尚有时间/状态/附件约束），
+        让 LightRAG 从图谱/正文里找出与此人相关的邮件。返回 None 表示放弃兜底。
+        """
+        person = plan.filters.sender
+        semantic = plan.model_copy(deep=True)
+        semantic.filters.sender = None
+        semantic.filters.topic = person
+
+        has_other_constraints = bool(
+            semantic.filters.statuses
+            or semantic.filters.has_attachment is not None
+            or semantic.time_range
+        )
+        note = {
+            "name": "发件人零命中，回落语义检索",
+            "icon": "🔄",
+            "content": f"「{person}」不在发件人中，可能是收件人或正文提及的人；改用语义检索",
+            "status": "warning", "color": "#F59E0B",
+            "duration_ms": int((time.time() - start_time) * 1000),
+        }
+        try:
+            if has_other_constraints:
+                semantic.route = "hybrid"
+                semantic.aggregation = semantic.aggregation or "list"
+                result = self._execute_hybrid_query(
+                    question, semantic, start_time, context=context)
+            else:
+                semantic.route = "content"
+                semantic.aggregation = None
+                # 原问题（"X发了哪些邮件"）暗示发送，会把 LightRAG 引向"X不是发件人"。
+                # 重述成以人物为中心的问法，让语义召回/合成聚焦此人的相关往来。
+                reframed = (
+                    f"「{person}」在邮件往来中涉及哪些事项、扮演什么角色、"
+                    f"与谁协作？请列出与「{person}」相关的邮件要点。"
+                )
+                result = self._execute_content_query(
+                    question, semantic, start_time, context=context,
+                    retrieval_question=reframed)
+        except Exception as e:
+            logger.warning("发件人零命中回落语义检索失败: %s", e)
+            return None
+
+        # 把回落说明放到 trace 最前面，让用户看到路由从 stat 改成了语义检索
+        result["trace"] = [note] + list(result.get("trace", []))
+        return result
 
     def _trace_summary(self, plan: QueryPlan, result: dict) -> str:
         parts = [f"路由: {plan.route}", f"聚合: {plan.aggregation}"]
@@ -790,10 +861,10 @@ class QueryEngine:
         topic = plan.filters.topic or question
         chunks, topic_ids = self._retrieve_topic_message_ids(topic)
         if not topic_ids:
-            # 即使 topic_ids 为空，也不要传空集合（会导致交集恒为 0）。
-            # 传 None 保留其他过滤条件（时间、附件等），让 chunks 提供主题证据。
+            # hybrid 的核心是“主题命中 message_id ∩ 元数据过滤”。
+            # 若主题没有可归属 message_id，不能把主题条件静默放宽成“所有邮件”。
             stat_result = self._execute_stat_query_with_message_ids(
-                question, plan, start_time, message_ids=None,
+                question, plan, start_time, message_ids=set(),
                 hybrid=True, context=context)
             stat_result["chunks"] = chunks
             stat_result["answer"] = self._format_hybrid_answer(
@@ -805,7 +876,7 @@ class QueryEngine:
                 f"主题：{topic}，未检索到相关证据"
             )
             stat_result["trace"].append({
-                "name": "混合查询主题命中（RAGFlow chunks → message_id）",
+                "name": "混合查询主题命中（LightRAG chunks → message_id）",
                 "icon": "✨",
                 "content": trace_content,
                 "status": "warning" if chunk_count else "fail",
@@ -828,7 +899,7 @@ class QueryEngine:
         total_dur = int((time.time() - start_time) * 1000)
         trace = list(stat_result.get("trace", []))
         trace.append({
-            "name": "混合查询主题命中（RAGFlow chunks → message_id）",
+            "name": "混合查询主题命中（LightRAG chunks → message_id）",
             "icon": "✨",
             "content": f"主题命中 {len(topic_ids)} 封，元数据交集 {len(matched_ids)} 封，证据 {len(chunks)} 段",
             "status": "ok" if matched_ids else "warning",
@@ -847,7 +918,7 @@ class QueryEngine:
         return stat_result
 
     def _execute_stat_query_with_message_ids(self, question: str, plan: QueryPlan,
-                                             start_time: float, message_ids: set[str],
+                                             start_time: float, message_ids: set[str] | None,
                                              hybrid: bool = False,
                                              context: dict | None = None) -> dict:
         plan = self._sanitize_plan(plan)
@@ -906,16 +977,14 @@ class QueryEngine:
         }
 
     def _retrieve_topic_message_ids(self, topic: str) -> tuple[list[dict], set[str]]:
-        if not self.rf:
+        # LightRAG 结构化检索：返回带来源（file_path=message_id）的 chunk
+        try:
+            from src.backend.knowledge.lightrag_wrapper import retrieve_mail_sources
+            chunks = retrieve_mail_sources(topic, mode="mix", top_k=20)
+            if not chunks:
+                return [], set()
+        except Exception:
             return [], set()
-
-        # 增大 top_k 提升召回率，避免被单一项目邮件占满结果集
-        chunks = self.rf.retrieve_chunks(topic, top_k=50)
-        if not chunks:
-            return [], set()
-
-        # 多样性去重：每个文档最多保留 3 个 chunk，避免单项目垄断
-        chunks = self._diversify_chunks(chunks, max_per_doc=3)
 
         cache = self._get_cache()
         doc_ids = set()
@@ -927,6 +996,17 @@ class QueryEngine:
             mid = self._chunk_message_id(chunk)
             if mid:
                 mids.add(mid)
+        # 优先用 file_path/metadata 得到的 message_id；doc_id 可能是 LightRAG
+        # 为 Milvus 主键生成的短哈希，只有 Redis 能确认或形态像 Message-ID 时才采信。
+        for doc_id in doc_ids:
+            if doc_id.startswith("<") and ">" in doc_id:
+                mids.add(doc_id)
+            elif cache is not None:
+                try:
+                    if cache.get_mail_state(doc_id):
+                        mids.add(doc_id)
+                except Exception:
+                    pass
         if cache is not None and doc_ids:
             mids.update(cache.message_ids_for_docs(list(doc_ids)))
         return chunks, mids
@@ -959,6 +1039,8 @@ class QueryEngine:
         for c in chunks:
             haystack = " ".join([
                 str(c.get("doc_id", "")),
+                str(c.get("file_path", "")),
+                str(c.get("chunk_id", "")),
                 str(c.get("document_id", "")),
                 str(c.get("doc_name", "")),
                 str(c.get("content", ""))[:500],
@@ -968,13 +1050,26 @@ class QueryEngine:
         return filtered
 
     def _chunk_doc_id(self, chunk: dict) -> str:
-        for key in ("doc_id", "document_id", "document_id_id"):
+        for key in ("doc_id", "document_id", "document_id_id", "full_doc_id"):
             value = chunk.get(key)
             if value:
                 return str(value)
         return ""
 
     def _chunk_message_id(self, chunk: dict) -> str:
+        for key in ("message_id", "mail_id"):
+            value = chunk.get(key)
+            if value:
+                return str(value)
+        for key in ("file_path",):
+            value = str(chunk.get(key) or "")
+            if value.startswith("<") and ">:" in value:
+                return value.split(">:", 1)[0] + ">"
+            if value and not value.startswith("mail-"):
+                return value.split(":", 1)[0]
+        doc_id = str(chunk.get("doc_id") or "")
+        if doc_id.startswith("<") and ">" in doc_id:
+            return doc_id
         metadata = chunk.get("metadata") or {}
         if isinstance(metadata, dict) and metadata.get("message_id"):
             return str(metadata["message_id"])
@@ -999,7 +1094,7 @@ class QueryEngine:
 用户问题：{question}
 主题：{topic}
 
-RAGFlow 检索到 {len(chunks)} 段与"{topic}"相关的邮件正文：
+LightRAG 检索到 {len(chunks)} 段与"{topic}"相关的邮件正文：
 {evidence}
 
 请根据以上内容直接回答用户问题。列出相关邮件及其要点（日期、发件人、关键信息）。
@@ -1033,7 +1128,7 @@ RAGFlow 检索到 {len(chunks)} 段与"{topic}"相关的邮件正文：
 候选邮件预览：
 {preview}
 
-RAGFlow chunk 证据：
+LightRAG chunk 证据：
 {evidence or "无"}
 
 如果 chunk 证据为空或无法确认来自候选邮件，请明确说这是基于候选邮件元数据的判断；不要编造正文细节。"""
@@ -1089,12 +1184,15 @@ RAGFlow chunk 证据：
 
     def _execute_content_query(self, question: str, plan: QueryPlan,
                                start_time: float,
-                               context: dict | None = None) -> dict:
+                               context: dict | None = None,
+                               retrieval_question: str | None = None) -> dict:
         # content_query → 宽域检索 + LLM 总结
-        # 注意：检索只用原始问题，避免 memory/history 污染语义搜索
+        # 注意：检索只用原始问题，避免 memory/history 污染语义搜索。
+        # retrieval_question：可选的重述问题，用于语义召回/合成（如把"王芳发了哪些邮件"
+        # 重述为以人物为中心的问法），显示层仍保留用户原始 question。
         context_text = self._context_prompt(context)
         answer, trace, entities, relationships, chunks = \
-            self._native_query(question, context_text)
+            self._native_query(retrieval_question or question, context_text)
         total_dur = int((time.time() - start_time) * 1000)
         rows = self._to_rows(entities, relationships)
         return {
@@ -1113,37 +1211,109 @@ RAGFlow chunk 证据：
         }
 
     # ═══════════════════════════════════════════
-    # RAGFlow 内容查询（不变）
+    # LightRAG 内容查询
     # ═══════════════════════════════════════════
+
+    # 语义回答语气：人物/主题类问题要正面陈述其相关邮件，而不是强调"此人非发件人"。
+    _SEMANTIC_ANSWER_STYLE = (
+        "回答的第一句必须直接陈述该人物/主题在邮件中参与的事项或相关事实，"
+        "严禁以否定判断开头（如“某人并未发送任何邮件”“未被记录为发件人”“没有相关记录”）。"
+        "用户关心的是这个人物/主题涉及了什么，而非其是否为发件人——即使此人只是收件人或仅被提及，"
+        "也要正面、具体地陈述与其相关的邮件内容、承担的任务与协作关系。"
+        "只有当上下文里确实找不到任何相关信息时，才说明缺少信息。"
+    )
 
     def _native_query(self, question: str, context_text: str = ""):
         t0 = time.time()
+        entities: list = []
+        relationships: list = []
+        chunks: list = []
+        hop2_added = 0
 
-        # 宽域检索：只用原始问题做语义搜索，避免 memory/history 污染
-        chunks = self.rf.retrieve_chunks(question, top_k=50)
-        chunks = self._diversify_chunks(chunks, max_per_doc=3)
+        # 1) 结构化召回：语义（向量）+ 图谱（遍历）一体，取回 entities/relationships/chunks
+        try:
+            from src.backend.knowledge.lightrag_wrapper import retrieve_mail_graph
+            retrieved = retrieve_mail_graph(question, mode="mix", top_k=20)
+            entities = retrieved.get("entities", [])
+            relationships = retrieved.get("relationships", [])
+            chunks = retrieved.get("chunks", [])
+        except Exception:
+            logger.warning("结构化召回失败", exc_info=True)
 
-        if not chunks:
+        # 2) 二跳扩展：沿命中实体的一跳邻居再拉一圈，补充图谱上下文。
+        #    走 LightRAG 原生 get_knowledge_graph（workspace 安全、不耦合内部 schema），
+        #    而非手写 Cypher。
+        if entities:
+            try:
+                from src.backend.knowledge.lightrag_wrapper import expand_entity_neighbors
+                seed_ids = [e["name"] for e in entities[:8] if e.get("name")]
+                neigh = expand_entity_neighbors(seed_ids, max_nodes=60)
+                entities, relationships, hop2_added = self._merge_graph(
+                    entities, relationships, neigh)
+            except Exception:
+                logger.warning("二跳邻居扩展失败", exc_info=True)
+
+        # 3) LLM 合成答案（LightRAG mix：图遍历 + 向量 + 生成）
+        answer = ""
+        try:
+            from src.backend.knowledge.lightrag_wrapper import query_mail
+            answer = query_mail(question, mode="mix",
+                                user_prompt=self._SEMANTIC_ANSWER_STYLE)
+        except Exception:
+            logger.warning("LightRAG 合成失败", exc_info=True)
+
+        # 兜底：合成不可用但已有检索证据 → 用 chunks/实体自行总结，绝不丢弃已召回的证据
+        if (not answer or len(answer) <= 20) and (chunks or entities):
+            answer = self._summarize(question, entities, relationships, chunks)
+
+        dur = int((time.time() - t0) * 1000)
+
+        if not answer or len(answer) <= 20:
             trace = [{
-                "name": "RAGFlow 检索无结果", "icon": "✨",
-                "content": "RAGFlow 未检索到任何相关文档",
+                "name": "LightRAG 无结果", "icon": "🧠",
+                "content": "知识图谱中未找到相关信息",
                 "status": "fail", "color": "#EF4444",
-                "duration_ms": int((time.time() - t0) * 1000),
+                "duration_ms": dur,
             }]
-            return "未找到相关信息，请尝试其他关键词或先导入邮件数据。", trace, [], [], []
+            return "未找到相关信息，请先导入邮件数据。", trace, entities, relationships, chunks
 
-        # LLM 总结时引入上下文记忆，帮助理解用户意图
-        enriched_question = question
-        if context_text:
-            enriched_question = f"{context_text}\n\n当前用户问题：{question}"
-        answer = self._summarize(enriched_question, [], [], chunks)
+        hop_note = f"，二跳邻居 +{hop2_added}" if hop2_added else ""
         trace = [{
-            "name": "RAGFlow 宽域检索+LLM 总结", "icon": "✨",
-            "content": f"检索 {len(chunks)} 段文档，LLM 总结回答",
+            "name": "LightRAG 语义 + 图谱检索", "icon": "🧠",
+            "content": f"向量召回 {len(chunks)} 段 · 实体 {len(entities)} · 关系 {len(relationships)}{hop_note}",
+            "detail": f"实体 {len(entities)} / 关系 {len(relationships)} / 证据 {len(chunks)}",
             "status": "ok", "color": "#8B5CF6",
-            "duration_ms": int((time.time() - t0) * 1000),
+            "duration_ms": dur,
         }]
-        return answer, trace, [], [], chunks
+        return answer, trace, entities, relationships, chunks
+
+    def _merge_graph(self, entities: list, relationships: list, neigh: dict) -> tuple:
+        """合并二跳邻居实体/关系并去重。返回 (entities, relationships, 新增实体数)。"""
+        ent_by_id: dict = {}
+        for e in entities:
+            key = str(e.get("id") or e.get("name") or "")
+            if key:
+                ent_by_id.setdefault(key, e)
+
+        added = 0
+        for e in neigh.get("entities", []):
+            key = str(e.get("id") or e.get("name") or "")
+            if key and key not in ent_by_id:
+                ent_by_id[key] = e
+                added += 1
+
+        rel_seen = {
+            (str(r.get("source_id")), str(r.get("target_id")))
+            for r in relationships
+        }
+        merged_rels = list(relationships)
+        for r in neigh.get("relationships", []):
+            k = (str(r.get("source_id")), str(r.get("target_id")))
+            if k not in rel_seen:
+                rel_seen.add(k)
+                merged_rels.append(r)
+
+        return list(ent_by_id.values()), merged_rels, added
 
     def _summarize(self, question: str, entities: list,
                    relationships: list, chunks: list) -> str:

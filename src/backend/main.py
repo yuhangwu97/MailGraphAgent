@@ -1,7 +1,7 @@
 """
 MailGraphAgent 主程序 - CLI 入口
 ================================
-子命令：fetch(拉取→Redis) / ingest(Redis→RAGFlow GraphRAG) /
+子命令：fetch(拉取→Redis) / ingest(Redis→LightRAG 知识图谱) /
         full-pipeline(fetch+ingest) / web(前端) / check(系统检查)
 """
 import logging
@@ -70,7 +70,7 @@ def fetch_emails(
 
 
 # ════════════════════════════════════════════════════════════════════
-# ingest：Redis → RAGFlow GraphRAG（原文 + 附件，单遍建图）
+# ingest：Redis → LightRAG 知识图谱（原文 + 附件，增量建图）
 # ════════════════════════════════════════════════════════════════════
 
 
@@ -79,8 +79,8 @@ def ingest_emails(
     limit: Optional[int] = typer.Option(None, help="限制本次导入数量"),
     account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
 ):
-    """把暂存的邮件（原文 + 附件）导入 RAGFlow，GraphRAG 跨文档建图"""
-    log_section("📚 知识图谱导入 (GraphRAG)")
+    """把暂存的邮件（原文 + 附件）导入 LightRAG，增量跨文档建图"""
+    log_section("📚 知识图谱导入 (LightRAG)")
     try:
         stats = Pipeline(account).run_ingest(limit=limit,
                                              on_log=lambda m: console.print(f"  {m}"))
@@ -144,7 +144,6 @@ def start_web(
     reload: bool = typer.Option(True, help="开发模式自动重载"),
 ):
     """启动 FastAPI Web 服务"""
-    import subprocess
     import uvicorn
 
     log_section("🌐 启动 Web 服务 (FastAPI + Vue SPA)")
@@ -180,7 +179,8 @@ def system_check():
     for name, ok in [
         ("IMAP 邮箱用户", bool(settings.email_user)),
         ("IMAP 邮箱密码", bool(settings.email_pass)),
-        ("RAGFlow URL", bool(settings.ragflow_base_url)),
+        ("Neo4j URI", bool(settings.resolved_neo4j_uri())),
+        ("Milvus URI", bool(settings.milvus_uri)),
         ("OpenAI API Key (query 用)", bool(settings.openai_api_key)),
     ]:
         status = "[green]✓[/green]" if ok else "[red]✗[/red]"
@@ -205,13 +205,11 @@ def system_check():
         console.print(f"  [red]✗[/red] Redis 连接 ({e})")
 
     try:
-        from src.backend.attachment.ragflow_client import get_ragflow_client
-        rf = get_ragflow_client()
-        ds = rf.get_or_create_dataset(settings.ragflow_dataset_name)
-        console.print("  [green]✓[/green] RAGFlow 连接" if ds
-                      else "  [yellow]⚠[/yellow] RAGFlow 连接异常")
+        from src.backend.storage.neo4j_client import _get_driver
+        _get_driver().verify_connectivity()
+        console.print("  [green]✓[/green] Neo4j 连接")
     except Exception as e:
-        console.print(f"  [red]✗[/red] RAGFlow 连接 ({e})")
+        console.print(f"  [red]✗[/red] Neo4j 连接 ({e})")
 
     console.print(f"\n[bold]数据目录:[/bold] {settings.data_dir}")
     log_success("系统检查完成！")

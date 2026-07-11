@@ -1,0 +1,23 @@
+# 运行时数据 / 卷（compose 里挂 ./data）
+data/
+# 本地虚拟环境（镜像内重装）
+.venv/
+venv/
+# VCS 与工具
+.git/
+.gitignore
+.claude/
+# 前端（由 src/web 独立镜像构建）
+node_modules/
+src/web/node_modules/
+src/web/dist/
+# Python 缓存
+**/__pycache__/
+*.pyc
+*.pyo
+# 密钥与日志（运行时经 env_file/挂载注入，不烘进镜像）
+.env
+nohup.out
+*.log
+# 计划/临时
+*.md.bak
