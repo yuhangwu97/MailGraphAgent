@@ -19,6 +19,11 @@ const PEOPLE_TYPES = ['person', 'contact', 'employee']
 const etype = (e: any) => String(e?.type || '').toLowerCase()
 
 onMounted(async () => {
+  await loadDashboard()
+})
+
+async function loadDashboard() {
+  loading.value = true
   try {
     const [stats, entRes, relRes] = await Promise.all([
       mailsApi.stats(),
@@ -83,7 +88,7 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
-})
+}
 
 const filtered = () => {
   if (!search.value) return projects.value
@@ -99,14 +104,19 @@ const filtered = () => {
         <h2>项目看板</h2>
         <p class="page-desc">基于邮件内容自动识别的项目、人员与组织关系</p>
       </div>
-      <div class="search-wrap" v-if="projects.length > 0">
-        <SvgIcon name="search" :size="15" class="search-icon" />
-        <input
-          v-model="search"
-          type="text"
-          placeholder="搜索项目..."
-          class="search-input-inline"
-        />
+      <div class="head-actions">
+        <div class="search-wrap" v-if="projects.length > 0">
+          <SvgIcon name="search" :size="15" class="search-icon" />
+          <input
+            v-model="search"
+            type="text"
+            placeholder="搜索项目..."
+            class="search-input-inline"
+          />
+        </div>
+        <button class="btn btn-secondary btn-sm refresh-btn" :disabled="loading" @click="loadDashboard">
+          🔄 {{ loading ? '刷新中…' : '界面刷新' }}
+        </button>
       </div>
     </div>
 
@@ -169,6 +179,12 @@ const filtered = () => {
   position: relative;
   flex-shrink: 0;
 }
+
+.head-actions {
+  display: flex; align-items: center; gap: 0.6rem;
+  flex-shrink: 0;
+}
+.refresh-btn { flex-shrink: 0; white-space: nowrap; }
 
 .search-icon {
   position: absolute; left: 10px; top: 50%; transform: translateY(-50%);

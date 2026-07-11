@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -13,6 +14,8 @@ import os
 import re
 import threading
 from pathlib import Path
+
+import redis
 
 try:
     from lightrag import LightRAG, QueryParam
@@ -83,6 +86,51 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 def _run(coro):
     """在 LightRAG 专用 loop 上执行协程并阻塞返回结果。"""
     return asyncio.run_coroutine_threadsafe(coro, _get_loop()).result()
+
+
+# ── 跨进程 LightRAG 写入锁 ────────────────────────────────────────────
+# LightRAG 的写入是"读实体→合并→写回"，其内部锁(multiprocessing/asyncio)只对
+# 同一父进程 fork 的 worker 有效；用 `python -m src.backend.worker` 起的多个独立
+# 进程之间没有共享锁，并发写同一实体会丢更新/产生重复节点。用 Redis 分布式锁把
+# 图谱写入串行化——解析(DeepDoc)与查询仍并行，只有真正的写入被串行化。
+_LIGHTRAG_WRITE_LOCK_KEY = "mailgraph:lightrag:write"
+_lock_client: redis.Redis | None = None
+_lock_client_lock = threading.Lock()
+
+
+def _get_lock_client() -> redis.Redis:
+    global _lock_client
+    if _lock_client is None:
+        with _lock_client_lock:
+            if _lock_client is None:
+                cfg = get_settings()
+                _lock_client = redis.Redis(
+                    host=cfg.redis_host, port=cfg.redis_port, db=cfg.redis_db,
+                    password=cfg.redis_password or None,
+                )
+    return _lock_client
+
+
+@contextlib.contextmanager
+def lightrag_write_lock(timeout: int = 1800, blocking_timeout: int = 1800):
+    """获取跨进程的 LightRAG 写入锁（Redis），串行化图谱/向量写入。
+
+    timeout: 持锁自动过期秒数（持锁进程若崩溃，锁到期自动释放，避免死锁）。
+    blocking_timeout: 等待获取锁的最长秒数。
+    """
+    lock = _get_lock_client().lock(
+        _LIGHTRAG_WRITE_LOCK_KEY, timeout=timeout,
+        blocking=True, blocking_timeout=blocking_timeout,
+    )
+    if not lock.acquire():
+        raise TimeoutError("acquire LightRAG write lock timed out")
+    try:
+        yield
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
 
 
 def _get_llm_func():
@@ -415,7 +463,9 @@ def insert_mail(text: str, mail_id: str) -> str:
     except Exception:
         # 查状态失败不阻断插入，交给 LightRAG 自身去重兜底
         logger.debug("doc status precheck failed for %s", mail_id[:50], exc_info=True)
-    _run(rag.ainsert(input=text, ids=doc_id, file_paths=mail_id))
+    # 跨进程写入锁：多个 worker 并发时串行化图谱/向量写入，避免实体合并竞争
+    with lightrag_write_lock():
+        _run(rag.ainsert(input=text, ids=doc_id, file_paths=mail_id))
     logger.info("LightRAG inserted: %s", mail_id[:50])
     return mail_id
 
@@ -878,11 +928,12 @@ def resolve_entity_aliases(dry_run: bool = False, on_log=None) -> dict:
         log(f"  归并[{etype}] {sources} → {canonical}")
         if not dry_run:
             try:
-                _run(rag.amerge_entities(
-                    source_entities=sources,
-                    target_entity=canonical,
-                    merge_strategy={"description": "concatenate", "entity_type": "keep_first"},
-                ))
+                with lightrag_write_lock():
+                    _run(rag.amerge_entities(
+                        source_entities=sources,
+                        target_entity=canonical,
+                        merge_strategy={"description": "concatenate", "entity_type": "keep_first"},
+                    ))
                 for s in sources:
                     existing.discard(s)  # 已并走，避免后续组重复引用
             except Exception as e:

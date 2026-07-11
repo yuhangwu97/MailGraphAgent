@@ -45,3 +45,12 @@ echo ""
 echo "全部已启动 →  前端 http://localhost:5173   后端 http://localhost:8000"
 echo "Ctrl+C 停止全部。"
 wait
+
+# 终端 1 —— 后端 API
+# .venv/bin/uvicorn src.backend.app:app --reload --host 0.0.0.0 --port 8000
+
+# 终端 2 —— worker(你选中的那行就是它)
+# .venv/bin/python -m src.backend.worker
+
+# 终端 3 —— 前端
+# cd src/web && npm run dev

@@ -169,17 +169,23 @@ class Pipeline:
         stats = {"total": 0, "uploaded": 0, "failed": 0, "attachments": 0, "att_failed": 0}
 
         try:
-            pending = list(cache.iter_pending_mails())
-            if limit:
-                pending = pending[:limit]
-            stats["total"] = len(pending)
-            if not pending:
+            # 原子领取消费：多个 worker 可同时跑 run_ingest，靠 SPOP 保证一封邮件
+            # 只被一个 worker 处理（并行分担解析），不会重复入库。
+            initial = len(cache.list_pending_ingest())
+            if initial == 0:
                 log("ingest 队列为空")
                 return stats
+            stats["total"] = min(initial, limit) if limit else initial
+            log(f"ingest {initial} 封邮件到 LightRAG（多 worker 并行分担）...")
 
-            log(f"ingest {len(pending)} 封邮件到 LightRAG...")
-
-            for i, mail in enumerate(pending):
+            i = 0
+            while True:
+                if limit and i >= limit:
+                    break
+                mail = cache.claim_pending_mail()   # 原子领取：多 worker 不会拿到同一封
+                if mail is None:
+                    break                            # 队列已被各 worker 取空
+                i += 1
                 mid = mail.get("message_id", "")
                 subj = (mail.get("subject") or "(无主题)")[:50]
                 try:
@@ -198,7 +204,7 @@ class Pipeline:
                             cache.mark_ingest_failed(
                                 mid, f"LightRAG body insert failed: {e}", drop_body=False)
                             logger.error("LightRAG body insert failed for %s: %s", mid, e)
-                            log(f"  [{i+1}] ✗ {subj}: 正文入库失败，已标记 failed")
+                            log(f"  [{i}] ✗ {subj}: 正文入库失败，已标记 failed")
                             continue
 
                     # 2) 附件 → DeepDoc 解析后也入 LightRAG
@@ -224,7 +230,7 @@ class Pipeline:
                                     stats["att_failed"] += 1
                                     logger.error(
                                         "LightRAG attachment insert failed (%s): %s", att_doc_id, e)
-                                    log(f"  [{i+1}] ⚠ 附件入库失败：{att.get('filename', '')}")
+                                    log(f"  [{i}] ⚠ 附件入库失败：{att.get('filename', '')}")
 
                     # 正文（及成功的附件）已入库，记录 doc_id → message_id 供证据归属
                     cache.mark_ingested(mid, doc_id=body_doc_id,
@@ -232,14 +238,14 @@ class Pipeline:
                     _cleanup_attachments(mail, only_paths=uploaded_paths)
                     stats["uploaded"] += 1
                     if mail_att_failed:
-                        log(f"  [{i+1}] ⚠ {subj}（正文已入库，{mail_att_failed} 个附件失败，已保留待重试）")
+                        log(f"  [{i}] ⚠ {subj}（正文已入库，{mail_att_failed} 个附件失败，已保留待重试）")
                     else:
-                        log(f"  [{i+1}] ✓ {subj}")
+                        log(f"  [{i}] ✓ {subj}")
                 except Exception as e:
                     stats["failed"] += 1
                     if mid:
                         cache.mark_ingest_failed(mid, str(e), drop_body=False)
-                    logger.error(f"  [{i+1}] ✗ {subj}: {e}")
+                    logger.error(f"  [{i}] ✗ {subj}: {e}")
         finally:
             cache.close()
 
