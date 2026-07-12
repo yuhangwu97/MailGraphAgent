@@ -255,6 +255,39 @@ class IMAPClient:
                 logger.error(f"UID {uid}: 解析失败 - {e}")
         return result
 
+    def fetch_internaldates(
+        self, uids: list[str], folder: str = "INBOX",
+    ) -> dict[str, float]:
+        """一条 UID FETCH 批量取 INTERNALDATE，返回 {uid: epoch 秒}。只取元数据、不下正文。
+
+        用于按真实收信时间排序：UID 未必与日期同序（QQ 老邮件也会有很大的 UID），
+        不能用 UID 位置当新旧。uids 为服务器升序，用 min:max 一条命令取回即可。
+        用 imaplib.Internaldate2tuple 解析，避免 strptime %b 的 locale 依赖。
+        """
+        if not uids:
+            return {}
+        conn = self.connect()
+        conn.select(folder, readonly=True)
+
+        uid_arg = f"{uids[0]}:{uids[-1]}"
+        status, data = conn.uid("FETCH", uid_arg, "(INTERNALDATE)")
+        result: dict[str, float] = {}
+        if status != "OK" or not data:
+            logger.warning(f"批量取 INTERNALDATE 失败 (status={status})")
+            return result
+
+        for item in data:
+            raw = item if isinstance(item, (bytes, bytearray)) else (
+                item[0] if isinstance(item, tuple) and item else b"")
+            m = re.search(rb"UID (\d+)", raw or b"")
+            if not m:
+                continue
+            t = imaplib.Internaldate2tuple(raw)
+            if not t:
+                continue
+            result[m.group(1).decode()] = time.mktime(t)
+        return result
+
     def fetch_batch(
         self,
         uids: list[str],

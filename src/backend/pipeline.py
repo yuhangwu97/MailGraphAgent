@@ -68,15 +68,20 @@ class Pipeline:
                     log("未找到邮件")
                     return 0
 
-                # 去重：先剔除该 folder 下已入库的 UID，再取最新 limit 封，
-                # 保证每次都推进 backlog（否则最新 N 封若都已入库会永远捞不到老邮件）
+                # 去重：先剔除该 folder 下已入库的 UID
                 processed_uids = cache.get_processed_uids(folder)
                 uids = [u for u in uids if u not in processed_uids]
                 if not uids:
                     log("没有新邮件（均已入库）")
                     return 0
-                uids = uids[-limit:]
-                log(f"拉取 {len(uids)} 封邮件...")
+
+                # 按真实收信时间(INTERNALDATE)取最新 limit 封。不能用 uids[-limit:]：
+                # UID 未必与日期同序（如 QQ 老邮件也有很大的 UID，取 UID 尾部会捞到老邮件）。
+                # 每次取最新的未入库 N 封，同样能推进 backlog（最新的入库后下次自然轮到次新的）。
+                dates = client.fetch_internaldates(uids, folder=folder)
+                uids.sort(key=lambda u: dates.get(u, 0.0), reverse=True)
+                uids = uids[:limit]
+                log(f"拉取 {len(uids)} 封邮件（按收信时间取最新）...")
 
                 for uid, msg in client.fetch_batch(uids, folder=folder):
                     parsed = self._store_fetched_mail(uid, msg, folder, cache, cleaner, attach_root)
