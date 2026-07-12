@@ -22,20 +22,23 @@ defineEmits<{
   'chat-analyze': [name: string]
 }>()
 
-const entityTags = computed(() => {
-  const tags: { icon: string; label: string; count: number; names: string }[] = []
-  const add = (icon: string, label: string, items: NeighborEntity[]) => {
-    if (items.length) tags.push({ icon, label, count: items.length, names: items.map(i => i.name).join('、') })
+const entityLines = computed(() => {
+  const lines: { icon: string; text: string }[] = []
+  const add = (icon: string, items: NeighborEntity[]) => {
+    if (!items.length) return
+    const names = items.slice(0, 4).map(i => i.name)
+    const suffix = items.length > 4 ? ` 等${items.length}个` : ''
+    lines.push({ icon, text: names.join('、') + suffix })
   }
-  add('👥', '人员', props.people)
-  add('🏢', '公司', props.companies)
-  add('📋', '任务', props.tasks)
-  add('📅', '事件', props.events)
-  add('📄', '文档', props.documents)
-  add('⚙️', '系统', props.systems)
-  add('📍', '地点', props.locations)
-  add('📦', '其他', props.otherNeighbors)
-  return tags
+  add('👥', props.people)
+  add('🏢', props.companies)
+  add('📋', props.tasks)
+  add('📅', props.events)
+  add('📄', props.documents)
+  add('⚙️', props.systems)
+  add('📍', props.locations)
+  add('📦', props.otherNeighbors)
+  return lines
 })
 </script>
 
@@ -71,19 +74,15 @@ const entityTags = computed(() => {
     <!-- Fallback description when no AI summary -->
     <p v-else class="pc-desc">{{ description || '图谱中暂无该项目的描述信息。' }}</p>
 
-    <!-- Entity tags -->
+    <!-- Entity lines -->
     <div class="pc-meta">
-      <div class="pc-tags">
-        <span
-          v-for="tag in entityTags"
-          :key="tag.label"
-          class="pc-tag"
-          :title="tag.names"
-        >
-          {{ tag.icon }} {{ tag.label }} {{ tag.count }}
-        </span>
+      <div v-if="entityLines.length" class="pc-entity-lines">
+        <div v-for="line in entityLines" :key="line.icon" class="pc-entity-line">
+          <span class="pc-el-icon">{{ line.icon }}</span>
+          <span class="pc-el-text">{{ line.text }}</span>
+        </div>
       </div>
-      <div v-if="!entityTags.length" class="pc-meta-item empty">
+      <div v-else class="pc-meta-item empty">
         <SvgIcon name="user" :size="13" />
         <span>暂无关联实体</span>
       </div>
@@ -196,35 +195,36 @@ const entityTags = computed(() => {
 
 /* Meta */
 .pc-meta {
-  padding-top: 0.55rem;
+  padding-top: 0.5rem;
   border-top: 1px solid var(--border-light);
 }
 
-.pc-tags {
+.pc-entity-lines {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.3rem;
+  flex-direction: column;
+  gap: 0.22rem;
 }
 
-.pc-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  font-size: 0.68rem;
-  font-weight: 500;
+.pc-entity-line {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+.pc-el-icon {
+  flex-shrink: 0;
+  font-size: 0.7rem;
+  width: 18px;
+  text-align: center;
+}
+
+.pc-el-text {
   color: var(--t3);
-  background: var(--surface-2);
-  border: 1px solid var(--border-light);
-  padding: 0.12rem 0.45rem;
-  border-radius: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  cursor: default;
-  transition: background 0.12s, border-color 0.12s;
-}
-
-.pc-tag:hover {
-  background: var(--p-bg);
-  border-color: color-mix(in srgb, var(--p) 30%, transparent);
 }
 
 .pc-meta-item {
