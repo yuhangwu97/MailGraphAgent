@@ -127,6 +127,7 @@ export const accountsApi = {
 export interface MailStats {
   total: number; done: number; pending: number
   failed: number; skipped: number; ingested: number; indexed: number
+  processing?: number
 }
 
 export interface MailItem {
@@ -177,6 +178,10 @@ export interface PaginatedMails {
 
 export const mailsApi = {
   stats: () => request<MailStats>('/mails/stats'),
+  list: (params?: { filter?: 'all' | 'todo' | 'done'; page?: number; page_size?: number }) => {
+    const p = params || {}
+    return request<PaginatedMails>(`/mails/list?filter=${p.filter ?? 'all'}&page=${p.page ?? 1}&page_size=${p.page_size ?? 200}`)
+  },
   pending: (params?: { page?: number; page_size?: number }) => {
     const p = params || {}
     return request<PaginatedMails>(`/mails/pending?page=${p.page ?? 1}&page_size=${p.page_size ?? 50}`)
@@ -305,4 +310,59 @@ export const statusApi = {
   health: () => request<StatusResponse>('/status'),
   tokens: () => request<{ prompt_tokens: number; completion_tokens: number }>('/usage/tokens'),
   logs: (service: string, lines = 50) => request<{ log: string }>(`/logs/${service}?lines=${lines}`),
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Project API
+// ═══════════════════════════════════════════════════════════════
+
+export interface ProjectSummary {
+  overview: string
+  stage: string
+  key_dates: string
+  core_people: string[]
+}
+
+export interface ProjectReport {
+  overview: string
+  stage: string
+  contract: string
+  key_dates: string
+  core_people: string
+  companies: string
+  recent_activity: string
+}
+
+export interface ProjectAnalysis {
+  project_name: string
+  summary: ProjectSummary | null
+  report: ProjectReport | null
+  generated_at: number
+  cached: boolean
+}
+
+export interface ProjectItem {
+  name: string
+  description: string
+  people: { name: string }[]
+  companies: { name: string }[]
+  ai_summary: ProjectSummary | null
+}
+
+export interface PaginatedProjects {
+  projects: ProjectItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export const projectsApi = {
+  list: (page = 1, pageSize = 20) =>
+    request<PaginatedProjects>(`/projects?page=${page}&page_size=${pageSize}`),
+
+  getAnalysis: (name: string) =>
+    request<ProjectAnalysis>(`/projects/${encodeURIComponent(name)}/analysis`),
+
+  analyze: (name: string, handlers: Parameters<typeof sseStream>[2]) =>
+    sseStream(`/projects/${encodeURIComponent(name)}/analyze`, {}, handlers),
 }
