@@ -147,9 +147,15 @@ async def list_projects(
 
             projects.append(ProjectItem(
                 name=_clean(p["name"]),
-                description=_clean(p.get("description", ""))[:200],
+                description=_clean(p.get("description", ""))[:400],
                 people=p.get("people", []),
                 companies=p.get("companies", []),
+                tasks=p.get("tasks", []),
+                events=p.get("events", []),
+                documents=p.get("documents", []),
+                systems=p.get("systems", []),
+                locations=p.get("locations", []),
+                other_neighbors=p.get("other_neighbors", []),
                 ai_summary=ProjectSummary(**ai_summary) if ai_summary else None,
             ))
 

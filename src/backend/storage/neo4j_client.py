@@ -141,8 +141,9 @@ def get_all_relationships(limit: int = 1000) -> list[dict]:
 def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
     """Return paginated project entities with neighbor info.
 
-    Each project dict: {id, name, type, description, people, companies}
-    People/companies are derived from DIRECTED relationships.
+    Each project dict: {id, name, type, description, people, companies,
+                         tasks, events, documents, systems, locations, other_neighbors}
+    All neighbor types are derived from DIRECTED relationships.
     Returns: {projects: list[dict], total: int}
     """
     skip = max(0, (page - 1) * page_size)
@@ -174,8 +175,6 @@ def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
                 "name": eid,
                 "type": "project",
                 "description": r["description"],
-                "people": [],
-                "companies": [],
             })
 
     if not projects:
@@ -199,11 +198,26 @@ def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
         "       coalesce(a.description, '') AS target_desc"
     )
 
+    # Entity type → field name + label mapping
+    TYPE_MAP = {
+        "person": ("people", "人员"),
+        "contact": ("people", "人员"),
+        "employee": ("people", "人员"),
+        "organization": ("companies", "公司"),
+        "task": ("tasks", "任务"),
+        "event": ("events", "事件"),
+        "document": ("documents", "文档"),
+        "system": ("systems", "系统"),
+        "location": ("locations", "地点"),
+    }
+
     with driver.session() as session:
         rels = session.run(rels_q, pids=project_ids)
+        # Initialize neighbor buckets
+        NEIGHBOR_FIELDS = ["people", "companies", "tasks", "events", "documents", "systems", "locations", "other_neighbors"]
         by_project: dict[str, dict[str, list]] = {}
         for p in projects:
-            by_project[p["name"]] = {"people": [], "companies": []}
+            by_project[p["name"]] = {f: [] for f in NEIGHBOR_FIELDS}
 
         seen = set()
         for r in rels:
@@ -214,19 +228,20 @@ def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
                     continue
             neighbor = r["target_id"] if r["source_id"] == proj_name else r["source_id"]
             ntype = (r["target_type"] or "").lower()
+            ntype_orig = r["target_type"] or ""
             key = f"{proj_name}|{neighbor}"
             if key in seen:
                 continue
             seen.add(key)
 
-            PEOPLE_TYPES = {"person", "contact", "employee"}
-            if ntype in PEOPLE_TYPES:
-                by_project[proj_name]["people"].append({"name": neighbor})
-            elif ntype == "organization":
-                by_project[proj_name]["companies"].append({"name": neighbor})
+            field, _ = TYPE_MAP.get(ntype, ("other_neighbors", "其他"))
+            by_project[proj_name][field].append({
+                "name": neighbor,
+                "type": ntype_orig,
+            })
 
         for p in projects:
-            p["people"] = by_project[p["name"]]["people"]
-            p["companies"] = by_project[p["name"]]["companies"]
+            for f in NEIGHBOR_FIELDS:
+                p[f] = by_project[p["name"]][f]
 
     return {"projects": projects, "total": int(total)}

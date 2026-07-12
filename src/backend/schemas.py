@@ -287,11 +287,22 @@ class ProjectAnalysisOut(BaseModel):
     cached: bool = True
 
 
+class NeighborEntity(BaseModel):
+    name: str
+    type: str = ""
+
+
 class ProjectItem(BaseModel):
     name: str
     description: str = ""
-    people: list[dict] = Field(default_factory=list)
-    companies: list[dict] = Field(default_factory=list)
+    people: list[NeighborEntity] = Field(default_factory=list)
+    companies: list[NeighborEntity] = Field(default_factory=list)
+    tasks: list[NeighborEntity] = Field(default_factory=list)
+    events: list[NeighborEntity] = Field(default_factory=list)
+    documents: list[NeighborEntity] = Field(default_factory=list)
+    systems: list[NeighborEntity] = Field(default_factory=list)
+    locations: list[NeighborEntity] = Field(default_factory=list)
+    other_neighbors: list[NeighborEntity] = Field(default_factory=list)
     ai_summary: ProjectSummary | None = None
 
 

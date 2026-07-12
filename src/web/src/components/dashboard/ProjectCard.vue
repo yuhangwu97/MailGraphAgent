@@ -1,12 +1,19 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import SvgIcon from '@/components/SvgIcon.vue'
-import type { ProjectSummary } from '@/api'
+import type { ProjectSummary, NeighborEntity } from '@/api'
 
-defineProps<{
+const props = defineProps<{
   name: string
   description: string
-  people: { name: string }[]
-  companies: { name: string }[]
+  people: NeighborEntity[]
+  companies: NeighborEntity[]
+  tasks: NeighborEntity[]
+  events: NeighborEntity[]
+  documents: NeighborEntity[]
+  systems: NeighborEntity[]
+  locations: NeighborEntity[]
+  otherNeighbors: NeighborEntity[]
   aiSummary: ProjectSummary | null
 }>()
 
@@ -14,6 +21,22 @@ defineEmits<{
   'view-report': [name: string]
   'chat-analyze': [name: string]
 }>()
+
+const entityTags = computed(() => {
+  const tags: { icon: string; label: string; count: number; names: string }[] = []
+  const add = (icon: string, label: string, items: NeighborEntity[]) => {
+    if (items.length) tags.push({ icon, label, count: items.length, names: items.map(i => i.name).join('、') })
+  }
+  add('👥', '人员', props.people)
+  add('🏢', '公司', props.companies)
+  add('📋', '任务', props.tasks)
+  add('📅', '事件', props.events)
+  add('📄', '文档', props.documents)
+  add('⚙️', '系统', props.systems)
+  add('📍', '地点', props.locations)
+  add('📦', '其他', props.otherNeighbors)
+  return tags
+})
 </script>
 
 <template>
@@ -48,15 +71,21 @@ defineEmits<{
     <!-- Fallback description when no AI summary -->
     <p v-else class="pc-desc">{{ description || '图谱中暂无该项目的描述信息。' }}</p>
 
-    <!-- People / Companies -->
+    <!-- Entity tags -->
     <div class="pc-meta">
-      <div class="pc-meta-item" :class="{ empty: !people.length }">
-        <SvgIcon name="user" :size="13" />
-        <span>{{ people.map(p => p.name).join('、') || '暂无关联人员' }}</span>
+      <div class="pc-tags">
+        <span
+          v-for="tag in entityTags"
+          :key="tag.label"
+          class="pc-tag"
+          :title="tag.names"
+        >
+          {{ tag.icon }} {{ tag.label }} {{ tag.count }}
+        </span>
       </div>
-      <div v-if="companies.length" class="pc-meta-item">
-        <SvgIcon name="building" :size="13" />
-        <span>{{ companies.map(c => c.name).join('、') }}</span>
+      <div v-if="!entityTags.length" class="pc-meta-item empty">
+        <SvgIcon name="user" :size="13" />
+        <span>暂无关联实体</span>
       </div>
     </div>
 
@@ -167,9 +196,35 @@ defineEmits<{
 
 /* Meta */
 .pc-meta {
-  display: flex; flex-direction: column; gap: 0.3rem;
   padding-top: 0.55rem;
   border-top: 1px solid var(--border-light);
+}
+
+.pc-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.pc-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--t3);
+  background: var(--surface-2);
+  border: 1px solid var(--border-light);
+  padding: 0.12rem 0.45rem;
+  border-radius: 5px;
+  white-space: nowrap;
+  cursor: default;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.pc-tag:hover {
+  background: var(--p-bg);
+  border-color: color-mix(in srgb, var(--p) 30%, transparent);
 }
 
 .pc-meta-item {

@@ -341,11 +341,22 @@ export interface ProjectAnalysis {
   cached: boolean
 }
 
+export interface NeighborEntity {
+  name: string
+  type: string
+}
+
 export interface ProjectItem {
   name: string
   description: string
-  people: { name: string }[]
-  companies: { name: string }[]
+  people: NeighborEntity[]
+  companies: NeighborEntity[]
+  tasks: NeighborEntity[]
+  events: NeighborEntity[]
+  documents: NeighborEntity[]
+  systems: NeighborEntity[]
+  locations: NeighborEntity[]
+  other_neighbors: NeighborEntity[]
   ai_summary: ProjectSummary | null
 }
 
