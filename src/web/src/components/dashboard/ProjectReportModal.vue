@@ -15,16 +15,36 @@ defineEmits<{
   'chat-analyze': [name: string]
 }>()
 
+function formatContent(val: string): string {
+  if (!val) return ''
+  val = val.trim()
+  // Try parse as JSON — if array/object, format to readable text
+  if (val.startsWith('[') || val.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(val)
+      if (Array.isArray(parsed)) {
+        return parsed.map((item: any) => {
+          if (typeof item === 'object' && item.name) {
+            return item.role ? item.name + '（' + item.role + '）' : item.name
+          }
+          return String(item)
+        }).join('\n')
+      }
+    } catch { /* not valid JSON, display as-is */ }
+  }
+  return val
+}
+
 const sections = computed(() => {
   if (!props.report) return []
   return [
-    { icon: '📌', label: '一句话概述', content: props.report.overview },
-    { icon: '📈', label: '项目阶段/状态', content: props.report.stage },
-    { icon: '💰', label: '合同与金额', content: props.report.contract },
-    { icon: '📅', label: '关键时间节点', content: props.report.key_dates },
-    { icon: '👥', label: '核心人员', content: props.report.core_people },
-    { icon: '🏢', label: '相关公司/组织', content: props.report.companies },
-    { icon: '📝', label: '近期关键动态', content: props.report.recent_activity },
+    { icon: '📌', label: '一句话概述', content: formatContent(props.report.overview) },
+    { icon: '📈', label: '项目阶段/状态', content: formatContent(props.report.stage) },
+    { icon: '💰', label: '合同与金额', content: formatContent(props.report.contract) },
+    { icon: '📅', label: '关键时间节点', content: formatContent(props.report.key_dates) },
+    { icon: '👥', label: '核心人员', content: formatContent(props.report.core_people) },
+    { icon: '🏢', label: '相关公司/组织', content: formatContent(props.report.companies) },
+    { icon: '📝', label: '近期关键动态', content: formatContent(props.report.recent_activity) },
   ].filter(s => s.content)
 })
 </script>

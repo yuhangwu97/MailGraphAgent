@@ -26,16 +26,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 # 7-dimension analysis prompt template
-ANALYSIS_PROMPT = """请基于知识图谱中的邮件数据，对项目「{project_name}」进行多维度分析。用中文回答，严格按以下7个字段输出JSON格式（不要输出markdown代码块，只输出纯JSON）：
+ANALYSIS_PROMPT = """请基于知识图谱中的邮件数据，对项目「{project_name}」进行多维度分析。用中文回答，严格按以下7个字段输出JSON格式（不要输出markdown代码块，只输出纯JSON）。
+
+【重要】所有字段的值必须是纯文本字符串，不要使用数组或嵌套对象，用中文自然描述即可。
 
 {{
   "overview": "一句话概述该项目的核心内容（50字以内）",
   "stage": "项目当前所处阶段（如：前期沟通/方案设计/开发中/测试/已上线/收尾/暂停/未知）",
   "contract": "合同中提到的金额、签约方等关键信息（如未发现合同信息则填'图谱中未发现合同相关信息'）",
-  "key_dates": "关键时间节点（截止日期、里程碑、最近活跃时间等）",
-  "core_people": "核心参与人员及其角色",
-  "companies": "相关公司/组织及其参与方式",
-  "recent_activity": "近期关键动态摘要（最近几封邮件的要点）"
+  "key_dates": "关键时间节点，用中文分号分隔列表描述，如：2026-07-09合同签署；2026-08-01项目启动；2026-10-31项目截止",
+  "core_people": "核心参与人员及其角色，每人一行用换行符分隔，如：张明（项目经理，负责整体协调）；王芳（技术负责人，主导方案设计）",
+  "companies": "相关公司/组织及其参与方式，用中文分号分隔，如：上海速达供应链（客户方，提出需求）；北京智联科技（实施方，负责开发交付）",
+  "recent_activity": "近期关键动态摘要，用中文自然段落描述最近几封邮件的要点和相关进展"
 }}
 
 项目名：{project_name}
@@ -46,6 +48,27 @@ ANALYSIS_PROMPT = """请基于知识图谱中的邮件数据，对项目「{proj
 
 def _clean(s: str) -> str:
     return re.sub(r"<[^>]*>", "", s or "")
+
+
+def _normalize_field(value) -> str:
+    """Convert arrays/objects to readable Chinese text for display."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name", "")
+                role = item.get("role", "")
+                parts.append(f"{name}（{role}）" if role else name)
+            elif isinstance(item, str):
+                parts.append(item)
+            else:
+                parts.append(str(item))
+        return "；".join(parts)
+    if isinstance(value, dict):
+        return str(value)
+    return str(value) if value else ""
 
 
 def _parse_analysis_response(text: str) -> dict | None:
@@ -196,13 +219,13 @@ async def analyze_project(name: str, body: AnalyzeRequest = AnalyzeRequest()):
 
                 # Build structured report
                 report = {
-                    "overview": parsed.get("overview", ""),
-                    "stage": parsed.get("stage", ""),
-                    "contract": parsed.get("contract", ""),
-                    "key_dates": parsed.get("key_dates", ""),
-                    "core_people": parsed.get("core_people", ""),
-                    "companies": parsed.get("companies", ""),
-                    "recent_activity": parsed.get("recent_activity", ""),
+                    "overview": _normalize_field(parsed.get("overview", "")),
+                    "stage": _normalize_field(parsed.get("stage", "")),
+                    "contract": _normalize_field(parsed.get("contract", "")),
+                    "key_dates": _normalize_field(parsed.get("key_dates", "")),
+                    "core_people": _normalize_field(parsed.get("core_people", "")),
+                    "companies": _normalize_field(parsed.get("companies", "")),
+                    "recent_activity": _normalize_field(parsed.get("recent_activity", "")),
                 }
                 summary = _build_summary(report)
 
