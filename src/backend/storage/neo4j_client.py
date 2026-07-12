@@ -136,3 +136,97 @@ def get_all_relationships(limit: int = 1000) -> list[dict]:
                 "weight": r["weight"],
             })
     return rels
+
+
+def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
+    """Return paginated project entities with neighbor info.
+
+    Each project dict: {id, name, type, description, people, companies}
+    People/companies are derived from DIRECTED relationships.
+    Returns: {projects: list[dict], total: int}
+    """
+    skip = max(0, (page - 1) * page_size)
+
+    # Count total projects
+    count_q = (
+        "MATCH (n) WHERE n.entity_id IS NOT NULL AND n.entity_type = 'project' "
+        "RETURN count(n) AS c"
+    )
+
+    # Fetch page of projects
+    projects_q = (
+        "MATCH (n) WHERE n.entity_id IS NOT NULL AND n.entity_type = 'project' "
+        "RETURN n.entity_id AS id, "
+        "       coalesce(n.description, '') AS description "
+        "ORDER BY toLower(n.entity_id) "
+        "SKIP $skip LIMIT $limit"
+    )
+
+    driver = _get_driver()
+    with driver.session() as session:
+        total = session.run(count_q).single()["c"]
+        result = session.run(projects_q, skip=skip, limit=int(page_size))
+        projects = []
+        for r in result:
+            eid = r["id"]
+            projects.append({
+                "id": eid,
+                "name": eid,
+                "type": "project",
+                "description": r["description"],
+                "people": [],
+                "companies": [],
+            })
+
+    if not projects:
+        return {"projects": [], "total": int(total)}
+
+    # Fetch relationships for this page's projects only
+    project_ids = [p["name"] for p in projects]
+    rels_q = (
+        "MATCH (a)-[r:DIRECTED]->(b) "
+        "WHERE a.entity_id IN $pids AND b.entity_id IS NOT NULL "
+        "RETURN a.entity_id AS source_id, "
+        "       b.entity_id AS target_id, "
+        "       b.entity_type AS target_type, "
+        "       coalesce(b.description, '') AS target_desc "
+        "UNION "
+        "MATCH (a)-[r:DIRECTED]->(b) "
+        "WHERE b.entity_id IN $pids AND a.entity_id IS NOT NULL "
+        "RETURN b.entity_id AS source_id, "
+        "       a.entity_id AS target_id, "
+        "       a.entity_type AS target_type, "
+        "       coalesce(a.description, '') AS target_desc"
+    )
+
+    with driver.session() as session:
+        rels = session.run(rels_q, pids=project_ids)
+        by_project: dict[str, dict[str, list]] = {}
+        for p in projects:
+            by_project[p["name"]] = {"people": [], "companies": []}
+
+        seen = set()
+        for r in rels:
+            proj_name = r["source_id"]
+            if proj_name not in by_project:
+                proj_name = r["target_id"]
+                if proj_name not in by_project:
+                    continue
+            neighbor = r["target_id"] if r["source_id"] == proj_name else r["source_id"]
+            ntype = (r["target_type"] or "").lower()
+            key = f"{proj_name}|{neighbor}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            PEOPLE_TYPES = {"person", "contact", "employee"}
+            if ntype in PEOPLE_TYPES:
+                by_project[proj_name]["people"].append({"name": neighbor})
+            elif ntype == "organization":
+                by_project[proj_name]["companies"].append({"name": neighbor})
+
+        for p in projects:
+            p["people"] = by_project[p["name"]]["people"]
+            p["companies"] = by_project[p["name"]]["companies"]
+
+    return {"projects": projects, "total": int(total)}
