@@ -109,19 +109,16 @@ function doIndex() {
 }
 
 // ── Unified mail list ──
-const activeTab = ref<'queue' | 'done'>('queue')
+type MailFilter = 'all' | 'todo' | 'done'
+const filter = ref<MailFilter>('all')
 const search = ref('')
 
-// Queue = IMAP pending + file indexed
-const queueMails = ref<MailItem[]>([])
-const queueTotal = ref(0)
-
-// Done
-const doneMails = ref<MailItem[]>([])
-const doneTotal = ref(0)
+// 统一列表（所有状态，服务端按日期倒序分页）
+const mails = ref<MailItem[]>([])
+const total = ref(0)
 const selectedIds = ref<Set<string>>(new Set())
 
-const PAGE_SIZE = 100
+const PAGE_SIZE = 200
 
 // Status metadata
 const STATUS_META: Record<string, { label: string; cls: string }> = {
@@ -155,32 +152,40 @@ function isImapMail(m: MailItem): boolean {
   return !m.source_type || m.source_type === 'imap'
 }
 
-// Filter queue by search only
-const filteredQueue = computed(() => {
+// 完成态归一：done/skipped = 已完成，其余 = 未完成
+function isDoneMail(m: MailItem): boolean {
+  return m.status === 'done' || m.status === 'skipped'
+}
+
+// 过滤器 chips（计数来自 KPI 统计）
+const filterChips = computed(() => {
+  const k = kpi.value
+  const done = (k.done || 0) + (k.skipped || 0)
+  const todo = (k.pending || 0) + (k.indexed || 0) + (k.failed || 0) + (k.processing || 0)
+  return [
+    { key: 'all' as MailFilter, label: '全部', count: done + todo },
+    { key: 'todo' as MailFilter, label: '未完成', count: todo },
+    { key: 'done' as MailFilter, label: '已完成', count: done },
+  ]
+})
+
+function setFilter(f: MailFilter) {
+  if (filter.value === f) return
+  filter.value = f
+  selectedIds.value = new Set()
+  refreshList()
+}
+
+// 当前可见（在当前页做搜索过滤）
+const visibleMails = computed(() => {
   const q = search.value.trim().toLowerCase()
-  if (!q) return queueMails.value
-  return queueMails.value.filter(m =>
+  if (!q) return mails.value
+  return mails.value.filter(m =>
     (m.subject || '').toLowerCase().includes(q) ||
     (m.from_addr || '').toLowerCase().includes(q) ||
     (m.from_name || '').toLowerCase().includes(q)
   )
 })
-
-// Filter done by search
-const filteredDone = computed(() => {
-  const q = search.value.trim().toLowerCase()
-  if (!q) return doneMails.value
-  return doneMails.value.filter(m =>
-    (m.subject || '').toLowerCase().includes(q) ||
-    (m.from_addr || '').toLowerCase().includes(q) ||
-    (m.from_name || '').toLowerCase().includes(q)
-  )
-})
-
-// Current visible mails
-const visibleMails = computed(() =>
-  activeTab.value === 'queue' ? filteredQueue.value : filteredDone.value
-)
 
 // Selection
 const allSelected = computed(() =>
@@ -210,87 +215,63 @@ const processLogs = ref<string[]>([])
 async function handleProcess() {
   const ids = [...selectedIds.value]
   if (!ids.length) return
+  const byId = (id: string) => mails.value.find(x => x.message_id === id)
+  const isTerminal = (m: MailItem) => ['done', 'skipped', 'failed'].includes(m.status)
 
-  // Split selected by source
-  const fileIds = ids.filter(id => {
-    const m = [...queueMails.value, ...doneMails.value].find(x => x.message_id === id)
-    return m && isFileMail(m)
-  })
-  const imapSelected = ids.filter(id => {
-    const m = [...queueMails.value, ...doneMails.value].find(x => x.message_id === id)
-    return m && isImapMail(m) && (m.status === 'pending' || m.status === 'indexed')
-  })
+  // 已完成/已跳过/失败 → 重新处理；未完成的文件邮件 → 解析入库；
+  // 未完成的 IMAP → ingest（处理整个待入库队列）
+  const reprocessIds = ids.filter(id => { const m = byId(id); return !!m && isTerminal(m) })
+  const fileIds = ids.filter(id => { const m = byId(id); return !!m && !isTerminal(m) && isFileMail(m) })
+  const imapTodo = ids.some(id => { const m = byId(id); return !!m && !isTerminal(m) && isImapMail(m) })
 
   processing.value = true; processLogs.value = []
+  const promises: Promise<void>[] = []
 
-  if (activeTab.value === 'queue') {
-    // Process queue mails
-    const promises: Promise<void>[] = []
-
-    if (imapSelected.length) {
-      // IMAP pending: use ingest (processes all pending)
-      promises.push(new Promise<void>((resolve) => {
-        mailsApi.ingest(null, {
-          onProgress(d: any) { processLogs.value.push('[IMAP] ' + (d.msg || JSON.stringify(d))) },
-          onComplete() { resolve() },
-          onError(m: string) { processLogs.value.push('[IMAP] 错误: ' + m); resolve() },
-        })
-      }))
-    }
-
-    if (fileIds.length) {
-      promises.push(new Promise<void>((resolve) => {
-        mailsApi.parseSelected(fileIds, {
-          onProgress(d: any) { processLogs.value.push('[文件] ' + (d.msg || JSON.stringify(d))) },
-          onComplete() { resolve() },
-          onError(m: string) { processLogs.value.push('[文件] 错误: ' + m); resolve() },
-        })
-      }))
-    }
-
-    await Promise.all(promises)
-  } else {
-    // Reprocess done mails
-    await new Promise<void>((resolve) => {
-      mailsApi.reprocess(ids, {
-        onProgress(d: any) { processLogs.value.push(d.msg || JSON.stringify(d)) },
+  if (imapTodo) {
+    promises.push(new Promise<void>((resolve) => {
+      mailsApi.ingest(null, {
+        onProgress(d: any) { processLogs.value.push('[IMAP] ' + (d.msg || JSON.stringify(d))) },
         onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('错误: ' + m); resolve() },
+        onError(m: string) { processLogs.value.push('[IMAP] 错误: ' + m); resolve() },
       })
-    })
+    }))
+  }
+  if (fileIds.length) {
+    promises.push(new Promise<void>((resolve) => {
+      mailsApi.parseSelected(fileIds, {
+        onProgress(d: any) { processLogs.value.push('[文件] ' + (d.msg || JSON.stringify(d))) },
+        onComplete() { resolve() },
+        onError(m: string) { processLogs.value.push('[文件] 错误: ' + m); resolve() },
+      })
+    }))
+  }
+  if (reprocessIds.length) {
+    promises.push(new Promise<void>((resolve) => {
+      mailsApi.reprocess(reprocessIds, {
+        onProgress(d: any) { processLogs.value.push('[重处理] ' + (d.msg || JSON.stringify(d))) },
+        onComplete() { resolve() },
+        onError(m: string) { processLogs.value.push('[重处理] 错误: ' + m); resolve() },
+      })
+    }))
   }
 
+  await Promise.all(promises)
   processing.value = false
   selectedIds.value = new Set()
   refreshAll()
 }
 
 // ── Data fetching ──
-async function refreshQueue() {
+async function refreshList() {
   try {
-    // Fetch both pending and indexed in parallel
-    const [pendingR, indexedR] = await Promise.all([
-      mailsApi.pending({ page: 1, page_size: PAGE_SIZE }),
-      mailsApi.indexed({ page: 1, page_size: PAGE_SIZE, status: 'pending' }),
-    ])
-    const merged = [...(pendingR?.items || []), ...(indexedR?.items || [])]
-    // Sort by date descending
-    merged.sort((a, b) => (b.date || '').localeCompare(a.date || ''))
-    queueMails.value = merged
-    queueTotal.value = (pendingR?.total || 0) + (indexedR?.total || 0)
-  } catch (e) { console.error(e) }
-}
-
-async function refreshDone() {
-  try {
-    const r = await mailsApi.done({ page: 1, page_size: PAGE_SIZE })
-    doneMails.value = r?.items || []
-    doneTotal.value = r?.total || 0
+    const r = await mailsApi.list({ filter: filter.value, page: 1, page_size: PAGE_SIZE })
+    mails.value = r?.items || []
+    total.value = r?.total || 0
   } catch (e) { console.error(e) }
 }
 
 async function refreshAll() {
-  await Promise.all([refreshStats(), refreshQueue(), refreshDone(), refreshGraphStatus(), statusStore.refresh()])
+  await Promise.all([refreshStats(), refreshList(), refreshGraphStatus(), statusStore.refresh()])
 }
 
 // 手动刷新整个界面数据（KPI / 图谱状态 / 邮件列表 / 服务健康）
@@ -432,22 +413,16 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 
     <!-- ── Unified Mail List ── -->
     <div class="list-panel">
-      <!-- Panel header: tabs + search -->
+      <!-- Panel header: 状态过滤器 + search -->
       <div class="list-panel-header">
         <div class="tabs">
           <button
-            :class="['tab', { active: activeTab === 'queue' }]"
-            @click="activeTab = 'queue'"
+            v-for="c in filterChips" :key="c.key"
+            :class="['tab', { active: filter === c.key }]"
+            @click="setFilter(c.key)"
           >
-            待处理
-            <span class="tab-count">{{ queueTotal }}</span>
-          </button>
-          <button
-            :class="['tab', { active: activeTab === 'done' }]"
-            @click="activeTab = 'done'"
-          >
-            已入库
-            <span class="tab-count">{{ doneTotal }}</span>
+            {{ c.label }}
+            <span class="tab-count">{{ c.count }}</span>
           </button>
         </div>
         <input
@@ -456,7 +431,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
           placeholder="搜索…"
         />
         <span v-if="search" class="search-hint">
-          {{ visibleMails.length }} / {{ activeTab === 'queue' ? queueMails.length : doneMails.length }}
+          {{ visibleMails.length }} / {{ mails.length }}
         </span>
       </div>
 
@@ -469,7 +444,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
           :disabled="processing || selectedIds.size === 0"
           @click="handleProcess"
         >
-          {{ processing ? '处理中…' : (activeTab === 'queue' ? '解析入库' : '重新处理') }}
+          {{ processing ? '处理中…' : '处理所选' }}
           <span v-if="selectedIds.size" class="btn-count">{{ selectedIds.size }}</span>
         </button>
       </div>
@@ -516,12 +491,10 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
       </table>
 
       <div v-else class="empty">
-        <template v-if="activeTab === 'queue'">
-          {{ search ? '没有匹配的邮件' : '暂无待处理邮件。请拉取邮箱或导入文件。' }}
-        </template>
-        <template v-else>
-          {{ search ? '没有匹配的邮件' : '暂无已入库邮件。' }}
-        </template>
+        {{ search ? '没有匹配的邮件'
+           : filter === 'todo' ? '暂无未完成邮件。请拉取邮箱或导入文件。'
+           : filter === 'done' ? '暂无已完成邮件。'
+           : '暂无邮件。请拉取邮箱或导入文件。' }}
       </div>
     </div>
   </div>

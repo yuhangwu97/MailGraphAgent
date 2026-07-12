@@ -51,6 +51,7 @@ def mail_stats(cache=Depends(get_cache)):
             pending=s.get("pending", 0),
             failed=s.get("failed", 0),
             skipped=s.get("skipped", 0),
+            processing=s.get("processing", 0),
             ingested=s.get("ingested", 0),
             indexed=s.get("indexed", 0),
         )
@@ -106,6 +107,29 @@ def pending_mails(
             items.append(_to_mail_item(mail))
     return PaginatedMailResponse(
         items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/list", response_model=PaginatedMailResponse)
+def list_all_mails(
+    filter: str = Query("all", pattern="^(all|todo|done)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    cache=Depends(get_cache),
+):
+    """统一邮件列表：所有状态合并、按日期倒序、分页。
+
+    filter: all=全部 | todo=未完成(未处理/待入库/处理中/失败) | done=已完成(已入库/已跳过)。
+    """
+    if cache is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    offset = (page - 1) * page_size
+    mails, total = cache.list_mails(filter=filter, limit=page_size, offset=offset)
+    return PaginatedMailResponse(
+        items=[_to_indexed_item(m) for m in mails],
         total=total,
         page=page,
         page_size=page_size,

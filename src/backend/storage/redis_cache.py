@@ -731,6 +731,40 @@ class MailCache:
         mails.sort(key=lambda m: m.get("date", ""), reverse=True)
         return mails[offset:offset + limit]
 
+    # filter → 参与的原始 status 值；"all" 走 idx:date 全量分页
+    _MAIL_FILTERS = {
+        "todo": ("pending", "processing", "indexed", "failed"),  # 未完成
+        "done": ("done", "skipped"),                             # 已完成（含已跳过）
+    }
+
+    def list_mails(self, filter: str = "all", limit: int = 100, offset: int = 0) -> tuple[list[dict], int]:
+        """统一邮件列表：所有状态合并、按日期倒序、分页。返回 (items, total)。
+
+        filter: all=全部；todo=未完成(未处理/待入库/处理中/失败)；done=已完成(已入库/已跳过)。
+        items 为 mail:{id} 哈希（含 status/subject/from/date/source_type/attachment_count…）。
+        """
+        date_key = self._date_key()
+        if filter in self._MAIL_FILTERS:
+            idset: set[str] = set()
+            for s in self._MAIL_FILTERS[filter]:
+                idset |= set(self.r.smembers(self._status_key(s)))
+            scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
+            scored.sort(key=lambda x: x[1], reverse=True)  # 按日期倒序
+            total = len(scored)
+            page_ids = [mid for mid, _ in scored[offset:offset + limit]]
+        else:
+            total = self.r.zcard(date_key)
+            page_ids = self.r.zrevrange(date_key, offset, offset + limit - 1)
+
+        items: list[dict] = []
+        for mid in page_ids:
+            h = self.r.hgetall(self._k("mail", mid))
+            if not h:
+                continue
+            h["message_id"] = mid
+            items.append(h)
+        return items, total
+
     # ── 抓取进度 ──
 
     def get_fetch_progress(self, folder: str, year: int, month: int) -> dict | None:
