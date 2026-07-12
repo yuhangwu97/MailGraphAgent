@@ -181,6 +181,28 @@ async def list_projects(
         store.close()
 
 
+@router.delete("/{name:path}")
+async def delete_project(name: str):
+    """Delete a project from Neo4j and its cached analysis from Redis."""
+    from src.backend.storage.neo4j_client import delete_project as neo4j_delete
+
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, lambda: neo4j_delete(name))
+
+    # Also clean up cached analysis and history in Redis
+    store = ProjectAnalysisStore()
+    try:
+        store.delete(name)
+        store.delete_history(name)
+    finally:
+        store.close()
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    return {"deleted": True, "project_name": name}
+
+
 @router.get("/{name:path}/analysis", response_model=ProjectAnalysisOut)
 async def get_analysis(name: str):
     """Get cached project analysis. Returns 404 if not cached."""

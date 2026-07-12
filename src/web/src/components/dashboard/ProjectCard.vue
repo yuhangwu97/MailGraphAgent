@@ -21,6 +21,7 @@ defineEmits<{
   'view-report': [name: string]
   'chat-analyze': [name: string]
   reanalyze: [name: string]
+  delete: [name: string]
 }>()
 
 const entityLines = computed(() => {
@@ -121,6 +122,16 @@ const entityLines = computed(() => {
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>
         Chat 分析
+      </button>
+      <button
+        class="pc-btn pc-btn-delete"
+        @click.stop="$emit('delete', name)"
+        title="删除项目"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+        </svg>
       </button>
     </div>
   </div>
@@ -300,5 +311,19 @@ const entityLines = computed(() => {
   background: var(--surface-2);
   border-color: var(--p);
   color: var(--p);
+}
+
+.pc-btn-delete {
+  background: transparent;
+  border-color: transparent;
+  color: var(--t5);
+  padding: 0.3rem 0.45rem;
+  margin-left: auto;
+}
+
+.pc-btn-delete:hover {
+  background: #FEF2F2;
+  border-color: #FECACA;
+  color: #DC2626;
 }
 </style>

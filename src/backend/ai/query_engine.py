@@ -284,8 +284,13 @@ class QueryEngine:
         self._query_graph = None
         self._progress_cb = None
 
-    def _emit_progress(self, msg: str):
-        """Thread-safe: call the progress callback if set."""
+    def _emit_progress(self, msg: str | dict):
+        """Thread-safe: call the progress callback if set.
+
+        Strings are wrapped as ``{"msg": ...}`` progress markers.
+        Dicts are passed through directly (used for ``{"token": ...}``
+        streaming events).
+        """
         if self._progress_cb:
             try:
                 self._progress_cb(msg)
@@ -332,6 +337,45 @@ class QueryEngine:
             logger.error("LLM 调用失败: %s", e)
             return "{}"
 
+    def _call_llm_stream(self, prompt: str, max_tokens: int = 1500,
+                         system: str | None = None):
+        """Stream LLM response token by token via _emit_progress.
+
+        Yields nothing — tokens are emitted through self._progress_cb as
+        ``{"token": "..."}`` events.  Returns the full answer string.
+        """
+        chunks: list[str] = []
+        try:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            stream = self.llm.chat.completions.create(
+                model=self.model,
+                temperature=0.3,
+                messages=messages,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            buf = ""
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if not delta or not delta.content:
+                    continue
+                token = delta.content
+                buf += token
+                chunks.append(token)
+                # Emit every ~12 CJK chars or on whitespace for natural pacing
+                if len(buf) >= 12 or token in ' \t\n\r':
+                    self._emit_progress({"token": buf})
+                    buf = ""
+            if buf:
+                self._emit_progress({"token": buf})
+        except Exception as e:
+            logger.error("LLM 流式调用失败: %s", e)
+            return ""
+        return "".join(chunks)
+
     def _call_llm_json_schema(self, prompt: str, system: str,
                               schema: dict, max_tokens: int = 600) -> str:
         """Call the model with strict JSON schema when the provider supports it."""
@@ -347,6 +391,80 @@ class QueryEngine:
             response_format={"type": "json_schema", "json_schema": schema},
         )
         return resp.choices[0].message.content or ""
+
+    @staticmethod
+    def _build_rag_context(chunks: list[dict], entities: list[dict]) -> str:
+        """Build a compact context string from retrieved chunks and entities."""
+        parts: list[str] = []
+
+        # Entity overview
+        if entities:
+            type_counts: dict[str, int] = {}
+            for e in entities:
+                t = e.get("type", "Entity")
+                type_counts[t] = type_counts.get(t, 0) + 1
+            summary = "、".join(f"{t}×{c}" for t, c in sorted(type_counts.items(), key=lambda x: -x[1]))
+            parts.append(f"相关实体（{summary}）：")
+            for e in entities[:30]:
+                desc = (e.get("description", "") or "").split("<SEP>")[0][:120]
+                parts.append(f"  - [{e.get('type', 'Entity')}] {e.get('name', '')}" +
+                             (f"：{desc}" if desc else ""))
+
+        # Chunk evidence
+        if chunks:
+            parts.append(f"\n邮件正文证据（{len(chunks)} 段）：")
+            for i, c in enumerate(chunks[:20], 1):
+                content = (c.get("content", "") or "")[:1000]
+                doc = c.get("doc_name", "") or c.get("doc_id", "") or ""
+                doc = doc[:50]
+                parts.append(f"\n--- [{i}] {doc} ---\n{content}")
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def _build_rag_prompt(question: str, context: str, hint: str = "",
+                          history: str = "") -> str:
+        """Build the final RAG prompt, adapting dimensions to query type.
+
+        ``history`` is the recent conversation context (user/assistant turns)
+        used to resolve pronouns and follow-up references like "她" or "那个项目".
+        """
+        if hint == "person":
+            guide = (
+                "按以下维度组织回答：\n"
+                "1) 基本信息（身份/角色/背景）\n"
+                "2) 参与项目（列出项目名及具体职责）\n"
+                "3) 关键协作人（与谁协作、什么关系）\n"
+                "4) 近期动态（最近在做什么）\n"
+                "每个维度 2-4 句话，引用邮件编号作为依据。"
+            )
+        elif hint == "project":
+            guide = (
+                "按以下维度组织回答：\n"
+                "1) 项目概况（目标/金额/周期）\n"
+                "2) 当前阶段与进度\n"
+                "3) 核心参与人员及分工\n"
+                "4) 关键风险与近期事项\n"
+                "每个维度 2-4 句话，引用邮件编号作为依据。"
+            )
+        else:
+            guide = (
+                "用中文，列出相关事实、项目、人员和具体细节，"
+                "引用邮件编号作为依据。不要省略比较重要的信息。"
+            )
+
+        # Prepend recent conversation so the model can resolve "她", "那个项目", etc.
+        hist_block = ""
+        if history:
+            hist_block = f"对话历史（用于理解代词和省略指代）：\n{history}\n\n"
+
+        return (
+            f"请根据以下邮件数据回答用户问题。\n{guide}\n\n"
+            f"{hist_block}"
+            f"用户问题：{question}\n\n"
+            f"{context}\n\n"
+            f"请回答："
+        )
 
     def _context_prompt(self, context: dict | None) -> str:
         if not context:
@@ -1277,21 +1395,28 @@ LightRAG chunk 证据：
         })
 
         # 2) 二跳扩展：沿命中实体的一跳邻居再拉一圈，补充图谱上下文。
+        seed_names: set[str] = set()
         if entities:
             t2 = time.time()
             try:
                 from src.backend.knowledge.lightrag_wrapper import expand_entity_neighbors
-                seed_ids = [e["name"] for e in entities[:8] if e.get("name")]
-                neigh = expand_entity_neighbors(seed_ids, max_nodes=60)
+                seed_names = {e["name"] for e in entities[:8] if e.get("name")}
+                neigh = expand_entity_neighbors(list(seed_names), max_nodes=60)
                 entities, relationships, hop2_added = self._merge_graph(
                     entities, relationships, neigh)
+                # Prune: only keep expanded entities that are directly connected
+                # to at least one seed entity. This prevents 3-hop noise like
+                # "王芳" → "吴宇航" → "战斗暴龙兽" from polluting the source panel.
+                pruned = self._prune_graph(entities, relationships, seed_names)
+                entities, relationships = pruned["entities"], pruned["relationships"]
+                hop2_kept = len(entities) - len(seed_names)
                 dur2 = int((time.time() - t2) * 1000)
                 trace.append({
                     "name": "实体邻居扩展", "icon": "🔗",
-                    "content": f"二跳邻居 +{hop2_added} 个实体",
+                    "content": f"二跳邻居 +{hop2_kept} 个（过滤前 {hop2_added}）",
                     "detail": f"扩展后共 {len(entities)} 实体 · {len(relationships)} 关系",
-                    "status": "ok" if hop2_added else "info",
-                    "color": "#6366F1" if hop2_added else "#94A3B8",
+                    "status": "ok" if hop2_kept else "info",
+                    "color": "#6366F1" if hop2_kept else "#94A3B8",
                     "duration_ms": dur2,
                 })
             except Exception:
@@ -1300,16 +1425,36 @@ LightRAG chunk 证据：
         # 3) 为 chunks 补充 doc_name（邮件主题），让前端来源面板可读
         self._enrich_chunk_doc_names(chunks)
 
-        # 4) LLM 合成答案（LightRAG mix：图遍历 + 向量 + 生成）
+        # Detect query focus from seed entities to pick the right answer template
+        type_counts: dict[str, int] = {}
+        for e in entities:
+            t = (e.get("type") or "").lower()
+            type_counts[t] = type_counts.get(t, 0) + 1
+        dominant = max(type_counts, key=type_counts.get) if type_counts else ""
+        query_hint = ""
+        if dominant == "person":
+            query_hint = "person"
+        elif dominant == "project":
+            query_hint = "project"
+
+        # 4) 流式 LLM 合成：用已检索的 chunks/entities 构建 RAG 上下文，
+        # 直接调用 LLM streaming API，绕过 LightRAG aquery 的非流式生成。
         answer = ""
         self._emit_progress("✍️ 正在生成回答…")
         t3 = time.time()
         try:
-            from src.backend.knowledge.lightrag_wrapper import query_mail
-            answer = query_mail(question, mode="mix",
-                                user_prompt=self._SEMANTIC_ANSWER_STYLE)
+            rag_ctx = self._build_rag_context(chunks, entities)
+            prompt = self._build_rag_prompt(
+                question, rag_ctx, hint=query_hint,
+                history=context_text,  # conversation history for pronoun resolution
+            )
+            answer = self._call_llm_stream(
+                prompt,
+                max_tokens=2500,
+                system=self._SEMANTIC_ANSWER_STYLE,
+            )
         except Exception:
-            logger.warning("LightRAG 合成失败", exc_info=True)
+            logger.warning("流式 LLM 合成失败", exc_info=True)
         dur3 = int((time.time() - t3) * 1000)
 
         trace.append({
@@ -1417,6 +1562,40 @@ LightRAG chunk 证据：
                 merged_rels.append(r)
 
         return list(ent_by_id.values()), merged_rels, added
+
+    @staticmethod
+    def _prune_graph(entities: list, relationships: list,
+                     seed_names: set[str]) -> dict:
+        """Remove expanded entities that aren't directly connected to any seed.
+
+        The 2-hop expansion can pull in entities that are 3+ hops away
+        (seed → neighbor → unrelated), polluting the source panel.  This
+        keeps only entities that are either seeds themselves or appear as
+        an endpoint of a relationship where the other endpoint is a seed.
+        """
+        if not seed_names:
+            return {"entities": entities, "relationships": relationships}
+
+        # Determine which entities are connected to seeds
+        connected: set[str] = seed_names.copy()
+        for r in relationships:
+            src = str(r.get("source_id") or "")
+            tgt = str(r.get("target_id") or "")
+            if src in seed_names and tgt:
+                connected.add(tgt)
+            if tgt in seed_names and src:
+                connected.add(src)
+
+        # Keep only entities in the connected set
+        kept_entities = [e for e in entities
+                         if str(e.get("name") or e.get("id") or "") in connected]
+
+        # Keep only relationships where both endpoints are in the connected set
+        kept_rels = [r for r in relationships
+                     if str(r.get("source_id") or "") in connected
+                     and str(r.get("target_id") or "") in connected]
+
+        return {"entities": kept_entities, "relationships": kept_rels}
 
     def _summarize(self, question: str, entities: list,
                    relationships: list, chunks: list) -> str:

@@ -152,7 +152,7 @@ class ConversationStore:
             "result": result or {},
             "created_at": now,
         }
-        self.r.rpush(self._k("messages", session_id), json.dumps(msg, ensure_ascii=False))
+        self.r.rpush(self._k("messages", session_id), json.dumps(msg, ensure_ascii=False, default=str))
         self.touch_session(session_id)
         self.r.hincrby(self._k("session", session_id), "message_count", 1)
         if role == "user":

@@ -143,6 +143,75 @@ async def enqueue_job_and_stream(
         yield event
 
 
+async def multi_job_stream(
+    job_type: str, account_id: str | None, message_ids: list[str],
+) -> AsyncGenerator[str, None]:
+    """逐封入队独立 job，一个 SSE 流跟踪所有 job 的 progress/complete/error。
+
+    每封邮件一个 ingest_one job：worker 崩了只丢一封，不影响其他。
+    """
+    from src.backend import jobqueue
+
+    main_loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    total = len(message_ids)
+    completed = 0
+    job_ids: list[str] = []
+
+    # 先订阅 → 再入队（避免漏首帧）
+    pubsubs: list["redis.client.PubSub"] = []
+    for mid in message_ids:
+        jid = jobqueue.new_job_id()
+        job_ids.append(jid)
+        ps = jobqueue.subscribe_progress(jid)
+        pubsubs.append(ps)
+
+    # 入队所有 job
+    for i, mid in enumerate(message_ids):
+        jobqueue.enqueue_job(job_type, account_id or "",
+                             {"message_id": mid}, job_id=job_ids[i])
+
+    # 后台线程读所有 Redis pub/sub channel → 汇入一个 queue
+    def _reader() -> None:
+        import time as _time
+        deadline = _time.time() + 7200  # 2h 超时
+        remaining = set(range(total))
+        try:
+            while remaining and _time.time() < deadline:
+                for idx in list(remaining):
+                    msg = pubsubs[idx].get_message(timeout=0.1)
+                    if msg and msg.get("type") == "message":
+                        try:
+                            payload = json.loads(msg["data"])
+                            event_type = payload.get("event", "progress")
+                            data = payload.get("data", {})
+                            # 加上 job 序号，方便前端区分
+                            data["job_idx"] = idx + 1
+                            data["job_total"] = total
+                            main_loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                {"event": event_type, "data": data},
+                            )
+                            if event_type in ("complete", "error"):
+                                remaining.discard(idx)
+                        except Exception:
+                            pass
+                _time.sleep(0.05)
+        finally:
+            for ps in pubsubs:
+                try:
+                    ps.close()
+                except Exception:
+                    pass
+            main_loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+    threading.Thread(target=_reader, name=f"multi-job-{job_type}", daemon=True).start()
+
+    async for event in sse_from_queue(queue):
+        yield event
+
+
 async def prep_then_ingest_stream(
     prep_fn, prep_args: tuple, account_id: str | None, ingest_params: dict | None = None,
 ) -> AsyncGenerator[str, None]:

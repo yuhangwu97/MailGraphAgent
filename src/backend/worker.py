@@ -18,6 +18,7 @@ logger = logging.getLogger("mailgraph.worker")
 # fetch/index/parse_selected/reprocess 都在 API 侧做「准备+入队」，不进 worker。
 _DISPATCH = {
     "ingest": "run_ingest",
+    "ingest_one": "run_ingest_one",
 }
 
 

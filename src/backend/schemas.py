@@ -91,6 +91,7 @@ class FetchRequest(BaseModel):
 
 class IngestRequest(BaseModel):
     limit: int | None = None
+    message_ids: list[str] | None = None
 
 
 class ReprocessRequest(BaseModel):

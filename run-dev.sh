@@ -52,5 +52,4 @@ wait
 # 终端 2 —— worker(你选中的那行就是它)
 # .venv/bin/python -m src.backend.worker
 
-# 终端 3 —— 前端
-# cd src/web && npm run dev
+# 终端 3 —— 前端cd src/web && npm run dev

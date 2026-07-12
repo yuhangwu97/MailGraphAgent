@@ -253,6 +253,21 @@ async function handleChatAnalyze(name: string) {
     router.push({ path: '/chat', query: { prompt } })
   }
 }
+
+async function handleDelete(name: string) {
+  if (!confirm(`确定要删除项目「${name}」吗？此操作将从知识图谱中移除该项目及其关联缓存，不可撤销。`)) return
+  try {
+    await projectsApi.delete(name)
+    // Reload current page; if last item on last page, go back one page
+    const newTotal = totalProjects.value - 1
+    const maxPage = Math.max(1, Math.ceil(newTotal / PAGE_SIZE))
+    const page = Math.min(currentPage.value, maxPage)
+    await loadProjects(page)
+  } catch (e: any) {
+    console.error('Failed to delete project:', e)
+    alert(`删除失败：${e.message || '未知错误'}`)
+  }
+}
 </script>
 
 <template>
@@ -325,6 +340,7 @@ async function handleChatAnalyze(name: string) {
           @view-report="handleViewReport"
           @chat-analyze="handleChatAnalyze"
           @reanalyze="handleReanalyze"
+          @delete="handleDelete"
         />
       </div>
 

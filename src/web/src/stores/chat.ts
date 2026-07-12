@@ -146,6 +146,7 @@ export const useChatStore = defineStore('chat', () => {
           }
         },
         onComplete(data: any) {
+          console.log('[chat] onComplete called, keys:', Object.keys(data || {}).join(', '), 'entities:', data?.entities?.length, 'chunks:', data?.chunks?.length)
           result = data as QueryResult
           streamResult.value = result
           if (result.answer) {
@@ -159,16 +160,20 @@ export const useChatStore = defineStore('chat', () => {
         },
         onDone() {
           const finalAnswer = fullAnswer || '未找到相关信息。'
+          const savedResult = streamResult.value ?? result
+          console.log('[chat] onDone: streamResult has', streamResult.value?.entities?.length, 'entities,', streamResult.value?.chunks?.length, 'chunks. savedResult:', !!savedResult)
           const assistantMsg: ChatMessage = {
             id: 'local_' + Date.now(),
             role: 'assistant',
             content: finalAnswer,
-            result: result ?? undefined,
+            result: savedResult ?? undefined,
             created_at: Date.now() / 1000,
           }
           messages.value.push(assistantMsg)
 
-          conversationsApi.addMessage(sid, 'assistant', finalAnswer, result ?? undefined)
+          // Persist assistant message (fire-and-forget with error logging)
+          conversationsApi.addMessage(sid, 'assistant', finalAnswer, savedResult ?? undefined)
+            .catch(e => console.error('Failed to save assistant message:', e))
           conversationsApi.updateMemory(question, finalAnswer)
           loadMemory()
 

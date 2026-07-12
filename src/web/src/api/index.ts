@@ -76,7 +76,10 @@ export function sseStream(
             else if (eventType === 'complete') handlers.onComplete?.(data)
             else if (eventType === 'error') handlers.onError?.(data.msg || String(data))
             else if (eventType === 'done') { handlers.onDone?.(); streamDone = true }
-            else if (eventType === 'result') handlers.onComplete?.(data)
+            else if (eventType === 'result') {
+              console.log('[SSE] result event parsed, keys:', Object.keys(data).join(', '), 'entities:', data?.entities?.length, 'chunks:', data?.chunks?.length)
+              handlers.onComplete?.(data)
+            }
             else handlers.onProgress?.(data)
           } catch (e) {
             console.warn('SSE parse error for event', eventType, e)
@@ -201,8 +204,8 @@ export const mailsApi = {
 
   fetch: (folder: string, limit: number, handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/fetch', { folder, limit }, handlers),
-  ingest: (limit: number | null, handlers: Parameters<typeof sseStream>[2]) =>
-    sseStream('/mails/ingest', { limit }, handlers),
+  ingest: (limit: number | null, handlers: Parameters<typeof sseStream>[2], messageIds?: string[]) =>
+    sseStream('/mails/ingest', { limit, message_ids: messageIds || null }, handlers),
   reprocess: (messageIds: string[], handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/reprocess', { message_ids: messageIds }, handlers),
 
@@ -385,6 +388,9 @@ export interface AnalysisHistory {
 export const projectsApi = {
   list: (page = 1, pageSize = 20) =>
     request<PaginatedProjects>(`/projects?page=${page}&page_size=${pageSize}`),
+
+  delete: (name: string) =>
+    request<{ deleted: boolean; project_name: string }>(`/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
   getAnalysis: (name: string) =>
     request<ProjectAnalysis>(`/projects/${encodeURIComponent(name)}/analysis`),

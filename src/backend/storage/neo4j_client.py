@@ -245,3 +245,25 @@ def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
                 p[f] = by_project[p["name"]][f]
 
     return {"projects": projects, "total": int(total)}
+
+
+def delete_project(project_name: str) -> bool:
+    """Delete a project node and its DIRECTED relationships from Neo4j.
+
+    Only removes the project node itself — neighboring entities (people,
+    companies, tasks, etc.) are preserved because they may belong to other
+    projects.  Returns True if a node was deleted, False if none matched.
+    """
+    driver = _get_driver()
+    with driver.session() as session:
+        # Delete all DIRECTED relationships connected to this project, then the node
+        result = session.run(
+            "MATCH (n {entity_id: $name, entity_type: 'project'}) "
+            "DETACH DELETE n "
+            "RETURN count(n) AS deleted",
+            name=project_name,
+        ).single()
+        deleted = result["deleted"] if result else 0
+        if deleted:
+            logger.info("Deleted project '%s' from Neo4j (%d node(s))", project_name, deleted)
+        return deleted > 0

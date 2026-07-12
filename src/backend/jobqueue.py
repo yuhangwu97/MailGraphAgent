@@ -21,6 +21,7 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 JOBS_KEY = "mailgraph:jobs"
+EVENTS_CHANNEL = "mailgraph:events"
 
 # BRPOP 的阻塞时长（秒）。必须 < 客户端 socket_timeout，否则 socket 读超时会与
 # 服务端阻塞计时同时到点、先抛 TimeoutError（redis-py 8 默认 socket_timeout=5）。
@@ -29,7 +30,7 @@ BRPOP_TIMEOUT = 5
 # worker 只做一件事：消费 ingest_queue 做 DeepDoc 解析 + 建图。
 # 其余动作（fetch 拉取 / index 扫表头 / parse_selected 读源文件 / reprocess 重拉）都属
 # IO/轻量「准备」，在 API 进程内跑、把邮件塞进 ingest_queue，再入队 ingest 交给 worker。
-JOB_TYPES = {"ingest"}
+JOB_TYPES = {"ingest", "ingest_one"}
 
 _client_singleton: redis.Redis | None = None
 _client_lock = threading.Lock()
@@ -103,6 +104,15 @@ def publish_progress(job_id: str, event: str, data: dict | None = None) -> None:
     """worker 侧：向进度频道发布一个事件。"""
     payload = {"event": event, "data": data or {}}
     _client().publish(progress_channel(job_id), json.dumps(payload))
+
+
+def publish_event(event: str, data: dict | None = None) -> None:
+    """向全局事件频道发布一个事件（供前端 SSE 事件流消费）。"""
+    payload = {"event": event, "data": data or {}}
+    try:
+        _client().publish(EVENTS_CHANNEL, json.dumps(payload))
+    except Exception:
+        logger.warning("failed to publish global event: %s", event, exc_info=True)
 
 
 def subscribe_progress(job_id: str) -> "redis.client.PubSub":

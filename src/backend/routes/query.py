@@ -76,8 +76,12 @@ async def run_query(
             try:
                 _emit("progress", {"msg": "🔍 正在分析问题…"})
 
-                def _on_progress(msg: str):
-                    _emit("progress", {"msg": msg})
+                def _on_progress(msg):
+                    # dict → passthrough (token streaming); str → wrap as progress msg
+                    if isinstance(msg, dict):
+                        _emit("progress", msg)
+                    else:
+                        _emit("progress", {"msg": str(msg)})
 
                 result = engine.query(body.question, context=context,
                                       progress_cb=_on_progress)
@@ -100,38 +104,8 @@ async def run_query(
                         msg += f"：{detail}"
                     _emit("progress", {"msg": msg})
 
-                # Stream tokens one by one (supports CJK + Latin text)
-                answer = result.get("answer") or "未找到相关信息。"
-                import re, time
-
-                # Split: CJK chars individually, Latin words as groups, whitespace preserved
-                tokens = []
-                i = 0
-                while i < len(answer):
-                    ch = answer[i]
-                    if ch in ' \t\n\r':
-                        tokens.append(ch)
-                        i += 1
-                    elif '一' <= ch <= '鿿' or '　' <= ch <= '〿' or '＀' <= ch <= '￯':
-                        # CJK character — emit individually for visible streaming
-                        tokens.append(ch)
-                        i += 1
-                    else:
-                        # Latin/numbers/punctuation — group until next CJK or whitespace
-                        j = i
-                        while j < len(answer):
-                            cj = answer[j]
-                            if cj in ' \t\n\r' or '一' <= cj <= '鿿' or '　' <= cj <= '〿' or '＀' <= cj <= '￯':
-                                break
-                            j += 1
-                        tokens.append(answer[i:j])
-                        i = j
-
-                for tok in tokens:
-                    _emit("progress", {"token": tok})
-                    time.sleep(0.025)
-
-                # Send structured result (includes chunks → source references)
+                # Tokens are streamed live by the query engine via _on_progress.
+                # Send structured result (includes chunks → source references).
                 _emit("result", result)
             except Exception as exc:
                 logger.exception("Query failed")

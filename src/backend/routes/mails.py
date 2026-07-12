@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -12,6 +13,7 @@ from src.backend.deps import (
     get_account_id,
     get_cache,
     enqueue_job_and_stream,
+    multi_job_stream,
     prep_then_ingest_stream,
     run_pipeline_with_sse,
     sse_from_queue,
@@ -34,6 +36,8 @@ from src.backend.schemas import (
 )
 
 router = APIRouter(prefix="/api/mails", tags=["mails"])
+
+logger = logging.getLogger(__name__)
 
 
 # ── Stats & queries ──
@@ -330,9 +334,41 @@ async def ingest_mails(
     body: IngestRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """建图：入队 ingest 任务，由 worker 消费 ingest_queue 做 DeepDoc 解析 + 建图。"""
+    """建图：每封邮件一个 ingest_one job，worker 逐个处理。
+
+    如果指定 message_ids：先补回 ingest 队列（处理 reset 后 / 崩 worker 后不在队列的邮件），
+    然后逐封入队给 worker。
+    """
+    from src.backend.storage.redis_cache import MailCache
+    from src.backend import jobqueue
+
+    cache = MailCache(account_id)
+    mids: list[str] = []
+
+    try:
+        if body.message_ids:
+            # 补回队列
+            for mid in body.message_ids:
+                if cache.get_mail(mid):
+                    cache.r.sadd(cache._k("ingest_queue"), mid)
+                    mids.append(mid)
+            if mids:
+                logger.info("ingest: requeued %d mails for account %s", len(mids), account_id)
+        else:
+            # 未指定 → 取队列中所有
+            mids = cache.list_pending_ingest()
+    finally:
+        cache.close()
+
+    if not mids:
+        async def _empty():
+            yield "event: progress\ndata: {\"msg\": \"ingest 队列为空\"}\n\n"
+            yield "event: complete\ndata: {}\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
+
+    # 逐封入队 ingest_one job，一个 SSE 流跟踪所有 job
     return StreamingResponse(
-        enqueue_job_and_stream("ingest", account_id, {"limit": body.limit}),
+        multi_job_stream("ingest_one", account_id, mids),
         media_type="text/event-stream",
     )
 
