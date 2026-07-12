@@ -130,12 +130,24 @@ class MailCleaner:
 
     @staticmethod
     def is_noise_email(subject: str, from_addr: str, body: str) -> bool:
-        """判断是否为噪音邮件（通知、垃圾、自动回复等）"""
-        check_text = f"{subject} {from_addr}".lower()
-        body_lower = body[:500].lower() if body else ""
+        """判断是否为噪音邮件（通知、垃圾、自动回复等）。
 
+        subject/from 级别的关键词是强信号（系统自动通知等）。
+        body 级别只用高置信度模式匹配，避免误杀带 unsubscribe 页脚的正常商业邮件。
+        """
+        check_text = f"{subject} {from_addr}".lower()
         for keyword in NOISE_KEYWORDS:
-            if keyword in check_text or keyword in body_lower:
+            if keyword in check_text:
+                return True
+
+        # Body-level: skip "unsubscribe"/"退订" — they're legally required
+        # footers in commercial emails and trigger too many false positives.
+        body_lower = (body or "")[:1000].lower()
+        SKIP_BODY = {"unsubscribe", "退订", "newsletter", "订阅"}
+        for keyword in NOISE_KEYWORDS:
+            if keyword in SKIP_BODY:
+                continue
+            if keyword in body_lower:
                 return True
         return False
 
