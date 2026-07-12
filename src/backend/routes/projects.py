@@ -45,7 +45,7 @@ ANALYSIS_PROMPT = """请基于知识图谱中的邮件数据，对项目「{proj
 
 
 def _clean(s: str) -> str:
-    return (s or "").replace("<[^>]*>", "")
+    return re.sub(r"<[^>]*>", "", s or "")
 
 
 def _parse_analysis_response(text: str) -> dict | None:
