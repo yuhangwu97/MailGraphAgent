@@ -25,6 +25,8 @@ class ParsedEmail:
         self.from_name: str = ""
         self.to_addrs: list[str] = []
         self.cc_addrs: list[str] = []
+        self.in_reply_to: str = ""       # 父邮件 Message-ID（回信头 In-Reply-To）
+        self.references: list[str] = []  # 会话链上的 Message-ID 列表（References，根在最前）
         self.date: str = ""  # ISO 格式
         self.timestamp: float = 0.0
         self.body_text: str = ""
@@ -102,6 +104,9 @@ def parse_email(msg: EmailMessage, download_dir: Path | None = None) -> ParsedEm
     parsed.from_name = _extract_name(msg.get("From", ""))
     parsed.to_addrs = _extract_email_list(msg.get("To", ""))
     parsed.cc_addrs = _extract_email_list(msg.get("Cc", ""))
+    parsed.references = _extract_msgids(str(msg.get("References", "")))
+    _irt = _extract_msgids(str(msg.get("In-Reply-To", "")))
+    parsed.in_reply_to = _irt[0] if _irt else ""
 
     try:
         dt = parsedate_to_datetime(msg.get("Date", ""))
@@ -172,6 +177,20 @@ def _extract_email_list(header_value: str) -> list[str]:
         if addr:
             emails.append(addr)
     return emails
+
+
+def _extract_msgids(header_value: str) -> list[str]:
+    """从 In-Reply-To / References 头提取 Message-ID 列表（<...> 形式，按出现顺序）。
+
+    References 里根邮件在最前、最近的父邮件在最后；In-Reply-To 一般只有一个。
+    """
+    if not header_value:
+        return []
+    ids = re.findall(r"<[^>]+>", header_value)
+    if ids:
+        return [i.strip() for i in ids]
+    v = header_value.strip()
+    return [v] if v else []
 
 
 def _extract_body(msg: EmailMessage) -> tuple[str, str]:

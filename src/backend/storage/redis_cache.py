@@ -515,6 +515,10 @@ class MailCache:
         pipe.setex(self._k("body", mid), self._body_ttl,
                    json.dumps(mail, ensure_ascii=False))
         pipe.sadd(self._k("ingest_queue"), mid)
+        # 会话线程分组索引（供前端按线程折叠展示；全局，不分账号）
+        thread_id = mail.get("thread_id")
+        if thread_id:
+            pipe.sadd(self._k("idx", "thread", thread_id), mid)
         pipe.execute()
 
     def get_mail(self, message_id: str) -> dict | None:

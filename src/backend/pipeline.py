@@ -135,6 +135,11 @@ class Pipeline:
                 cache.mark_skipped(parsed.message_id, "噪音邮件")
                 return None
 
+            # 会话线程 id：取 References 链的根（最早的祖先），回退到直接父邮件，
+            # 再回退到自身 message_id（单封=独立线程）。供图谱线程上下文注入 + 前端分组。
+            thread_id = (parsed.references[0] if parsed.references
+                         else parsed.in_reply_to) or parsed.message_id
+
             cache.store_mail({
                 "message_id": parsed.message_id,
                 "uid": uid,
@@ -146,6 +151,9 @@ class Pipeline:
                 "cc_addrs": parsed.cc_addrs,
                 "date": parsed.date,
                 "timestamp": parsed.timestamp,
+                "in_reply_to": parsed.in_reply_to,
+                "references": parsed.references,
+                "thread_id": thread_id,
                 "cleaned_body": cleaned,
                 "attachments": [
                     {"filename": a["filename"], "path": a["path"],
@@ -164,6 +172,31 @@ class Pipeline:
     # ══════════════════════════════════════════════
     # 阶段二：Redis → LightRAG + Neo4j + Milvus
     # ══════════════════════════════════════════════
+
+    @staticmethod
+    def _with_thread_context(cache, mail: dict, body: str) -> str:
+        """回信邮件：在正文前注入会话线程上下文（父邮件主题/发件人/日期）。
+
+        目的：LightRAG 以实体为节点建图，本身不感知邮件线程。把"这封是对某封的回复"
+        写进喂给它的文本，抽取时就会把同一会话里反复出现的人/项目/主题在实体图上连起来。
+        非回信（无 In-Reply-To / References）原样返回。
+        """
+        if not body:
+            return body
+        in_reply_to = mail.get("in_reply_to") or ""
+        refs = mail.get("references") or []
+        if not in_reply_to and not refs:
+            return body
+        parent = cache.get_mail_state(in_reply_to) if in_reply_to else {}
+        lines = ["【邮件会话线程】本邮件是一封回信，与以下邮件同属一个会话："]
+        if parent:
+            who = parent.get("from_name") or parent.get("from_addr") or "未知发件人"
+            lines.append(
+                f"- 回复自 {who} 于 {parent.get('date', '')} 的邮件"
+                f"「{parent.get('subject', '')}」")
+        else:
+            lines.append(f"- 所属会话线程 ID：{mail.get('thread_id', '')}")
+        return "\n".join(lines) + "\n\n" + body
 
     def run_ingest(self, limit: int | None = None, on_log=None) -> dict:
         """邮件入 LightRAG 知识图谱（增量图+向量，Neo4j + Milvus）。附件 DeepDoc 解析。"""
@@ -198,6 +231,8 @@ class Pipeline:
 
                     # 1) 正文 → LightRAG（增量图+向量）
                     body = mail.get("cleaned_body") or ""
+                    # 回信邮件：正文前注入会话线程上下文，让同线程邮件的实体在图上连起来
+                    body = self._with_thread_context(cache, mail, body)
                     body_doc_id = ""
                     if body:
                         try:
