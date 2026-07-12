@@ -41,6 +41,7 @@ class MailStats(BaseModel):
     pending: int
     failed: int
     skipped: int
+    processing: int = 0
     ingested: int = 0
     indexed: int = 0
 
@@ -255,3 +256,51 @@ class StatusResponse(BaseModel):
 class SSEEvent(BaseModel):
     event: str  # "progress" | "complete" | "error"
     data: str
+
+
+# ═══════════════════════════════════════════════════════════════
+# Project Analysis
+# ═══════════════════════════════════════════════════════════════
+
+class ProjectSummary(BaseModel):
+    overview: str = ""          # 📌 一句话概述
+    stage: str = ""             # 📈 项目阶段/状态
+    key_dates: str = ""         # 📅 关键时间节点
+    core_people: list[str] = Field(default_factory=list)  # 👥 核心人员
+
+
+class ProjectReport(BaseModel):
+    overview: str = ""          # 📌 一句话概述
+    stage: str = ""             # 📈 项目阶段/状态
+    contract: str = ""          # 💰 合同与金额
+    key_dates: str = ""         # 📅 关键时间节点
+    core_people: str = ""       # 👥 核心人员
+    companies: str = ""         # 🏢 相关公司/组织
+    recent_activity: str = ""   # 📝 近期关键动态
+
+
+class ProjectAnalysisOut(BaseModel):
+    project_name: str
+    summary: ProjectSummary | None = None    # cached AI summary (card)
+    report: ProjectReport | None = None      # cached full report (modal)
+    generated_at: float = 0.0
+    cached: bool = True
+
+
+class ProjectItem(BaseModel):
+    name: str
+    description: str = ""
+    people: list[dict] = Field(default_factory=list)
+    companies: list[dict] = Field(default_factory=list)
+    ai_summary: ProjectSummary | None = None
+
+
+class PaginatedProjects(BaseModel):
+    projects: list[ProjectItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class AnalyzeRequest(BaseModel):
+    question_override: str | None = None  # optional custom question
