@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, computed, nextTick, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
 import ChatMessage from '@/components/chat/ChatMessage.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
@@ -8,6 +9,7 @@ import BrainFab from '@/components/layout/BrainFab.vue'
 const chatStore = useChatStore()
 const messagesEl = ref<HTMLElement | null>(null)
 const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
+const route = useRoute()
 const editingTitle = ref<string | null>(null)
 const titleInput = ref<HTMLInputElement | null>(null)
 const memoryWrap = ref<HTMLElement | null>(null)
@@ -43,11 +45,40 @@ const memoryQA = computed(() => {
 
 onMounted(async () => {
   await chatStore.fetchSessions()
-  await chatStore.ensureSession()
-  if (chatStore.activeSessionId) {
-    await chatStore.loadMessages(chatStore.activeSessionId)
+
+  // Check if arriving from dashboard with a prefill prompt
+  const prefillPrompt = route.query.prompt as string | undefined
+  const targetSession = route.query.session as string | undefined
+
+  if (targetSession) {
+    chatStore.activeSessionId = targetSession
+    await chatStore.fetchSessions()
+    await chatStore.loadMessages(targetSession)
+  } else {
+    await chatStore.ensureSession()
   }
+
+  if (chatStore.activeSessionId && !targetSession) {
+    await chatStore.loadMessages(chatStore.activeSessionId)
+  } else if (chatStore.activeSessionId) {
+    // Session already loaded via targetSession above
+  } else {
+    await chatStore.ensureSession()
+    if (chatStore.activeSessionId) {
+      await chatStore.loadMessages(chatStore.activeSessionId)
+    }
+  }
+
   await chatStore.loadMemory()
+
+  // Auto-fill the input with prefill prompt
+  if (prefillPrompt) {
+    await nextTick()
+    // Small delay to ensure ChatInput is mounted
+    setTimeout(() => {
+      chatInputRef.value?.setText(prefillPrompt)
+    }, 200)
+  }
 })
 
 // Auto-scroll
