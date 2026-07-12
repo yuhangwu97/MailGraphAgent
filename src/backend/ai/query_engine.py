@@ -282,6 +282,15 @@ class QueryEngine:
         self._account_id = account_id
         self._cache = None
         self._query_graph = None
+        self._progress_cb = None
+
+    def _emit_progress(self, msg: str):
+        """Thread-safe: call the progress callback if set."""
+        if self._progress_cb:
+            try:
+                self._progress_cb(msg)
+            except Exception:
+                pass
 
     # ═══════════════════════════════════════════
     # 辅助
@@ -412,6 +421,7 @@ class QueryEngine:
             current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
             weekday=weekday,
         )
+        self._emit_progress("🤔 正在识别查询意图…")
         context_text = self._context_prompt(context)
         prompt = question if not context_text else (
             f"{context_text}\n\n当前用户问题：{question}\n"
@@ -510,6 +520,8 @@ class QueryEngine:
         cache = self._get_cache()
         if cache is None:
             return self._error_response(question, start_time, "Redis 不可用")
+
+        self._emit_progress("📊 正在查询邮件统计数据…")
 
         # 决定 group_by
         group_by = None
@@ -754,6 +766,7 @@ class QueryEngine:
 
 {hints.get(agg, '')}"""
 
+        self._emit_progress("✍️ 正在整理统计结果…")
         answer = self._call_llm(prompt, max_tokens=350)
         if answer and answer != "{}":
             return answer
@@ -859,6 +872,7 @@ class QueryEngine:
                               context: dict | None = None) -> dict:
         """Resolve topic evidence to message ids, then run metadata stats on the intersection."""
         topic = plan.filters.topic or question
+        self._emit_progress("🧠 正在检索相关邮件主题…")
         chunks, topic_ids = self._retrieve_topic_message_ids(topic)
         if not topic_ids:
             # hybrid 的核心是“主题命中 message_id ∩ 元数据过滤”。
@@ -1142,26 +1156,35 @@ LightRAG chunk 证据：
     # 主入口：路由分发
     # ═══════════════════════════════════════════
 
-    def query(self, question: str, context: dict | None = None) -> dict:
-        """主查询入口：查询规划 → 校验 → 路由分发。"""
-        graph_result = self._try_query_graph(question, context)
-        if graph_result is not None:
-            return graph_result
+    def query(self, question: str, context: dict | None = None,
+              progress_cb=None) -> dict:
+        """主查询入口：查询规划 → 校验 → 路由分发。
 
-        start_time = time.time()
+        progress_cb: optional callable(msg: str) for real-time progress updates.
+        """
+        prev_cb = self._progress_cb
+        self._progress_cb = progress_cb
+        try:
+            graph_result = self._try_query_graph(question, context)
+            if graph_result is not None:
+                return graph_result
 
-        plan = self._build_query_plan(question, context)
+            start_time = time.time()
 
-        if plan.route == "clarify":
-            return self._clarify_response(question, plan, start_time)
+            plan = self._build_query_plan(question, context)
 
-        if plan.route == "stat":
-            return self._execute_stat_query(question, plan, start_time, context=context)
+            if plan.route == "clarify":
+                return self._clarify_response(question, plan, start_time)
 
-        if plan.route == "hybrid":
-            return self._execute_hybrid_query(question, plan, start_time, context=context)
+            if plan.route == "stat":
+                return self._execute_stat_query(question, plan, start_time, context=context)
 
-        return self._execute_content_query(question, plan, start_time, context=context)
+            if plan.route == "hybrid":
+                return self._execute_hybrid_query(question, plan, start_time, context=context)
+
+            return self._execute_content_query(question, plan, start_time, context=context)
+        finally:
+            self._progress_cb = prev_cb
 
     def _try_query_graph(self, question: str, context: dict | None = None) -> dict | None:
         try:
@@ -1229,8 +1252,11 @@ LightRAG chunk 证据：
         relationships: list = []
         chunks: list = []
         hop2_added = 0
+        trace: list = []
 
         # 1) 结构化召回：语义（向量）+ 图谱（遍历）一体，取回 entities/relationships/chunks
+        t1 = time.time()
+        self._emit_progress("🧠 正在检索知识图谱…")
         try:
             from src.backend.knowledge.lightrag_wrapper import retrieve_mail_graph
             retrieved = retrieve_mail_graph(question, mode="mix", top_k=20)
@@ -1239,53 +1265,130 @@ LightRAG chunk 证据：
             chunks = retrieved.get("chunks", [])
         except Exception:
             logger.warning("结构化召回失败", exc_info=True)
+        dur1 = int((time.time() - t1) * 1000)
+
+        trace.append({
+            "name": "知识图谱检索", "icon": "🧠",
+            "content": f"向量 + 图遍历召回 {len(chunks)} 段证据、{len(entities)} 个实体",
+            "detail": f"证据 {len(chunks)} · 实体 {len(entities)} · 关系 {len(relationships)}",
+            "status": "ok" if chunks or entities else "warning",
+            "color": "#8B5CF6" if chunks or entities else "#F59E0B",
+            "duration_ms": dur1,
+        })
 
         # 2) 二跳扩展：沿命中实体的一跳邻居再拉一圈，补充图谱上下文。
-        #    走 LightRAG 原生 get_knowledge_graph（workspace 安全、不耦合内部 schema），
-        #    而非手写 Cypher。
         if entities:
+            t2 = time.time()
             try:
                 from src.backend.knowledge.lightrag_wrapper import expand_entity_neighbors
                 seed_ids = [e["name"] for e in entities[:8] if e.get("name")]
                 neigh = expand_entity_neighbors(seed_ids, max_nodes=60)
                 entities, relationships, hop2_added = self._merge_graph(
                     entities, relationships, neigh)
+                dur2 = int((time.time() - t2) * 1000)
+                trace.append({
+                    "name": "实体邻居扩展", "icon": "🔗",
+                    "content": f"二跳邻居 +{hop2_added} 个实体",
+                    "detail": f"扩展后共 {len(entities)} 实体 · {len(relationships)} 关系",
+                    "status": "ok" if hop2_added else "info",
+                    "color": "#6366F1" if hop2_added else "#94A3B8",
+                    "duration_ms": dur2,
+                })
             except Exception:
                 logger.warning("二跳邻居扩展失败", exc_info=True)
 
-        # 3) LLM 合成答案（LightRAG mix：图遍历 + 向量 + 生成）
+        # 3) 为 chunks 补充 doc_name（邮件主题），让前端来源面板可读
+        self._enrich_chunk_doc_names(chunks)
+
+        # 4) LLM 合成答案（LightRAG mix：图遍历 + 向量 + 生成）
         answer = ""
+        self._emit_progress("✍️ 正在生成回答…")
+        t3 = time.time()
         try:
             from src.backend.knowledge.lightrag_wrapper import query_mail
             answer = query_mail(question, mode="mix",
                                 user_prompt=self._SEMANTIC_ANSWER_STYLE)
         except Exception:
             logger.warning("LightRAG 合成失败", exc_info=True)
+        dur3 = int((time.time() - t3) * 1000)
 
-        # 兜底：合成不可用但已有检索证据 → 用 chunks/实体自行总结，绝不丢弃已召回的证据
+        trace.append({
+            "name": "AI 答案合成", "icon": "✍️",
+            "content": f"基于 {len(chunks)} 段证据生成回答",
+            "detail": f"回答长度 {len(answer)} 字",
+            "status": "ok" if answer and len(answer) > 20 else "warning",
+            "color": "#10B981" if answer and len(answer) > 20 else "#F59E0B",
+            "duration_ms": dur3,
+        })
+
+        # 兜底：合成不可用但已有检索证据 → 用 chunks/实体自行总结
         if (not answer or len(answer) <= 20) and (chunks or entities):
+            self._emit_progress("✍️ 正在整理检索结果…")
+            t4 = time.time()
             answer = self._summarize(question, entities, relationships, chunks)
+            dur4 = int((time.time() - t4) * 1000)
+            trace.append({
+                "name": "本地总结（兜底）", "icon": "📝",
+                "content": f"LLM 合成不可用，基于检索证据本地总结",
+                "detail": f"回答长度 {len(answer)} 字",
+                "status": "warning", "color": "#F59E0B",
+                "duration_ms": dur4,
+            })
 
-        dur = int((time.time() - t0) * 1000)
+        total_dur = int((time.time() - t0) * 1000)
 
         if not answer or len(answer) <= 20:
-            trace = [{
-                "name": "LightRAG 无结果", "icon": "🧠",
+            trace.append({
+                "name": "无结果", "icon": "⚠️",
                 "content": "知识图谱中未找到相关信息",
                 "status": "fail", "color": "#EF4444",
-                "duration_ms": dur,
-            }]
+                "duration_ms": total_dur,
+            })
             return "未找到相关信息，请先导入邮件数据。", trace, entities, relationships, chunks
 
-        hop_note = f"，二跳邻居 +{hop2_added}" if hop2_added else ""
-        trace = [{
-            "name": "LightRAG 语义 + 图谱检索", "icon": "🧠",
-            "content": f"向量召回 {len(chunks)} 段 · 实体 {len(entities)} · 关系 {len(relationships)}{hop_note}",
-            "detail": f"实体 {len(entities)} / 关系 {len(relationships)} / 证据 {len(chunks)}",
-            "status": "ok", "color": "#8B5CF6",
-            "duration_ms": dur,
-        }]
         return answer, trace, entities, relationships, chunks
+
+    def _enrich_chunk_doc_names(self, chunks: list[dict]):
+        """为 chunks 补充 doc_name（邮件主题），让前端来源面板可读。"""
+        if not chunks:
+            return
+        cache = self._get_cache()
+        if cache is None:
+            # 无 cache 时用 message_id 作 doc_name
+            for c in chunks:
+                if not c.get("doc_name"):
+                    mid = c.get("doc_id") or c.get("file_path", "")
+                    c["doc_name"] = mid[:60] if mid else "未知来源"
+            return
+
+        # 收集所有 message_id，批量查主题
+        mids = list({c.get("doc_id") or c.get("file_path", "")
+                      for c in chunks if c.get("doc_id") or c.get("file_path")})
+        subjects: dict[str, str] = {}
+        for mid in mids:
+            if not mid:
+                continue
+            try:
+                state = cache.get_mail_state(mid)
+                if state:
+                    subj = state.get("subject") or ""
+                    sender = state.get("from_name") or state.get("from_addr") or ""
+                    if subj:
+                        label = subj[:50]
+                        if sender:
+                            label += f" — {sender[:15]}"
+                        subjects[mid] = label
+                        continue
+                # 无状态或空主题：用 message_id 截断
+                subjects[mid] = mid[:60]
+            except Exception:
+                subjects[mid] = mid[:60]
+
+        for c in chunks:
+            if c.get("doc_name"):
+                continue
+            mid = c.get("doc_id") or c.get("file_path", "")
+            c["doc_name"] = subjects.get(mid) or (mid[:60] if mid else "未知来源")
 
     def _merge_graph(self, entities: list, relationships: list, neigh: dict) -> tuple:
         """合并二跳邻居实体/关系并去重。返回 (entities, relationships, 新增实体数)。"""

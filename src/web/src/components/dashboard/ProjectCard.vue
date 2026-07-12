@@ -23,21 +23,21 @@ defineEmits<{
 }>()
 
 const entityLines = computed(() => {
-  const lines: { icon: string; text: string }[] = []
-  const add = (icon: string, items: NeighborEntity[]) => {
+  const lines: { label: string; text: string }[] = []
+  const add = (label: string, items: NeighborEntity[]) => {
     if (!items.length) return
     const names = items.slice(0, 4).map(i => i.name)
     const suffix = items.length > 4 ? ` 等${items.length}个` : ''
-    lines.push({ icon, text: names.join('、') + suffix })
+    lines.push({ label, text: names.join('、') + suffix })
   }
-  add('👥', props.people)
-  add('🏢', props.companies)
-  add('📋', props.tasks)
-  add('📅', props.events)
-  add('📄', props.documents)
-  add('⚙️', props.systems)
-  add('📍', props.locations)
-  add('📦', props.otherNeighbors)
+  add('人员', props.people)
+  add('公司', props.companies)
+  add('任务', props.tasks)
+  add('事件', props.events)
+  add('文档', props.documents)
+  add('系统', props.systems)
+  add('地点', props.locations)
+  add('其他', props.otherNeighbors)
   return lines
 })
 </script>
@@ -77,8 +77,8 @@ const entityLines = computed(() => {
     <!-- Entity lines -->
     <div class="pc-meta">
       <div v-if="entityLines.length" class="pc-entity-lines">
-        <div v-for="line in entityLines" :key="line.icon" class="pc-entity-line">
-          <span class="pc-el-icon">{{ line.icon }}</span>
+        <div v-for="line in entityLines" :key="line.label" class="pc-entity-line">
+          <span class="pc-el-label">{{ line.label }}</span>
           <span class="pc-el-text">{{ line.text }}</span>
         </div>
       </div>
@@ -208,20 +208,21 @@ const entityLines = computed(() => {
 .pc-entity-line {
   display: flex;
   align-items: baseline;
-  gap: 4px;
+  gap: 6px;
   font-size: 0.72rem;
   line-height: 1.4;
 }
 
-.pc-el-icon {
+.pc-el-label {
   flex-shrink: 0;
-  font-size: 0.7rem;
-  width: 18px;
-  text-align: center;
+  font-size: 0.68rem;
+  font-weight: 550;
+  color: var(--t4);
+  min-width: 30px;
 }
 
 .pc-el-text {
-  color: var(--t3);
+  color: var(--t2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

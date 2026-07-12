@@ -63,7 +63,12 @@ async def run_query(
         def _run():
             try:
                 _emit("progress", {"msg": "🔍 正在分析问题…"})
-                result = engine.query(body.question, context=context)
+
+                def _on_progress(msg: str):
+                    _emit("progress", {"msg": msg})
+
+                result = engine.query(body.question, context=context,
+                                      progress_cb=_on_progress)
 
                 # Emit query plan as a progress step
                 plan = result.get("query_plan")
