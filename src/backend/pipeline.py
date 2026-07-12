@@ -84,7 +84,8 @@ class Pipeline:
                 log(f"拉取 {len(uids)} 封邮件（按收信时间取最新）...")
 
                 for uid, msg in client.fetch_batch(uids, folder=folder):
-                    parsed = self._store_fetched_mail(uid, msg, folder, cache, cleaner, attach_root)
+                    parsed = self._store_fetched_mail(uid, msg, folder, cache, cleaner,
+                                                      attach_root, on_log=log)
                     if parsed is not None:
                         queued += 1
                         log(f"  [{queued}] {parsed.subject[:50]}")
@@ -95,7 +96,8 @@ class Pipeline:
         return queued
 
     def _store_fetched_mail(self, uid, msg, folder, cache, cleaner, attach_root,
-                            forced_message_id: str = "", apply_noise_filter: bool = True):
+                            forced_message_id: str = "", apply_noise_filter: bool = True,
+                            skip_processed: bool = False, on_log=None):
         """解析 + 清洗 + 噪音过滤 + 暂存一封邮件。
 
         入队成功返回 parsed 对象；被去重/噪音跳过或失败返回 None。
@@ -104,8 +106,12 @@ class Pipeline:
         - forced_message_id: 文件邮件解析出的 msg 可能无 Message-ID，沿用扫描阶段
           合成的 id，保证「先扫表头、再解析」两段的 message_id 一致。
         - apply_noise_filter: 用户显式勾选解析的邮件不应被噪音过滤误跳过，可关掉。
+        - skip_processed: 跳过 is_processed 检查（reprocess 已 reset_email 清掉 done 键，
+          但以防万一，允许调用方显式强制重新入队）。
         """
         from src.backend.mail.parser import parse_email
+
+        log = on_log or (lambda m: None)
 
         parsed = None
         try:
@@ -118,7 +124,8 @@ class Pipeline:
                 parsed.message_id = forced_message_id
 
             # message_id 级兜底去重（UID 复用 / 跨 folder 同信时 UID 过滤会漏）
-            if cache.is_processed(parsed.message_id):
+            if not skip_processed and cache.is_processed(parsed.message_id):
+                log(f"  [跳过] {parsed.subject[:50]}（已处理）")
                 return None
 
             cleaned = cleaner.clean(parsed.body_text, parsed.body_html)
@@ -133,6 +140,7 @@ class Pipeline:
             if apply_noise_filter and self.cfg.enable_noise_filter and \
                     cleaner.is_noise_email(parsed.subject, parsed.from_addr, cleaned):
                 cache.mark_skipped(parsed.message_id, "噪音邮件")
+                log(f"  [跳过] {parsed.subject[:50]}（噪音邮件）")
                 return None
 
             # 会话线程 id：取 References 链的根（最早的祖先），回退到直接父邮件，
@@ -164,6 +172,7 @@ class Pipeline:
             return parsed
         except Exception as e:
             logger.error(f"  UID {uid} 处理失败: {e}")
+            log(f"  [错误] UID {uid} 处理失败: {e}")
             # 已解析出 message_id 的落 failed 状态，避免永远卡在 processing
             if parsed is not None:
                 cache.mark_failed(parsed.message_id, str(e))
@@ -396,6 +405,7 @@ class Pipeline:
                             parsed = self._store_fetched_mail(
                                 "", msg, folder, cache, cleaner, attach_root,
                                 forced_message_id=mid, apply_noise_filter=False,
+                                on_log=log,
                             )
                             if parsed is not None:
                                 queued += 1
@@ -457,7 +467,8 @@ class Pipeline:
                     for folder, uids in by_folder.items():
                         for uid, msg in client.fetch_batch(uids, folder=folder):
                             if self._store_fetched_mail(uid, msg, folder,
-                                                        cache, cleaner, attach_root) is not None:
+                                                        cache, cleaner, attach_root,
+                                                        skip_processed=True, on_log=log) is not None:
                                 requeued += 1
             log(f"重新入队 {requeued} 封，待建图...")
         finally:

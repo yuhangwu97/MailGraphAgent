@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from typing import AsyncGenerator
 
@@ -24,6 +25,17 @@ from src.backend.storage.project_analysis_store import ProjectAnalysisStore
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN/Infinity float values with None."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 # 7-dimension analysis prompt template
 ANALYSIS_PROMPT = """请基于知识图谱中的邮件数据，对项目「{project_name}」进行多维度分析。用中文回答，严格按以下7个字段输出JSON格式（不要输出markdown代码块，只输出纯JSON）。
@@ -189,6 +201,37 @@ async def get_analysis(name: str):
         store.close()
 
 
+@router.get("/{name:path}/history")
+async def get_analysis_history(name: str):
+    """Get all historical analyses for a project (newest first)."""
+    store = ProjectAnalysisStore()
+    try:
+        current = store.get(name)
+        history = store.get_history(name)
+
+        items = []
+        if current:
+            items.append({
+                "id": "latest",
+                "generated_at": current.get("generated_at", 0),
+                "summary": current.get("summary"),
+                "report": current.get("report"),
+                "is_latest": True,
+            })
+        for h in history:
+            items.append({
+                "id": str(h.get("generated_at", 0)),
+                "generated_at": h.get("generated_at", 0),
+                "summary": h.get("summary"),
+                "report": h.get("report"),
+                "is_latest": False,
+            })
+
+        return {"project_name": name, "items": items}
+    finally:
+        store.close()
+
+
 @router.post("/{name:path}/analyze")
 async def analyze_project(name: str, body: AnalyzeRequest = AnalyzeRequest()):
     """Generate AI analysis for a project (SSE streaming), cache to Redis.
@@ -232,7 +275,11 @@ async def analyze_project(name: str, body: AnalyzeRequest = AnalyzeRequest()):
             try:
                 _emit("progress", {"msg": f"🔍 正在分析项目「{name}」…"})
                 engine = QueryEngine(account_id="default")
-                result = engine.query(prompt, context={})
+
+                def _on_progress(msg: str):
+                    _emit("progress", {"msg": msg})
+
+                result = engine.query(prompt, context={}, progress_cb=_on_progress)
 
                 answer = result.get("answer", "")
                 _emit("progress", {"msg": "📊 正在解析分析结果…"})
@@ -284,7 +331,8 @@ async def analyze_project(name: str, body: AnalyzeRequest = AnalyzeRequest()):
                 break
             event_type = item.get("event", "progress")
             data = item.get("data", item)
-            yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            safe = _sanitize_json(data)
+            yield f"event: {event_type}\ndata: {json.dumps(safe, ensure_ascii=False, default=str)}\n\n"
 
         await task
 

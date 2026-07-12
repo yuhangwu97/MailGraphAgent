@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -15,6 +16,17 @@ from src.backend.schemas import QueryRequest
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["query"])
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN/Infinity float values with None (→ null in JSON)."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 
 @router.post("/query")
@@ -142,7 +154,9 @@ async def run_query(
                 break
             event_type = item.get("event", "progress")
             data = item.get("data", item)
-            yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            # Sanitize float values to ensure valid JSON (no NaN/Infinity)
+            safe = _sanitize_json(data)
+            yield f"event: {event_type}\ndata: {json.dumps(safe, ensure_ascii=False, default=str)}\n\n"
 
         await task
 

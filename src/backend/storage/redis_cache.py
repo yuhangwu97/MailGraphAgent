@@ -190,15 +190,12 @@ class MailCache:
         pipe.hset(key, mapping={"status": "done", "updated_at": data["updated_at"]})
         pipe.setex(self._k("mail", message_id, "done"), 30 * 86400, "1")
         self._index_state(pipe, message_id, data)
-        pipe.execute()
-        self._index_done_uid(key)
-
-    def _index_done_uid(self, mail_key: str):
-        """把已完成邮件的 uid 加入 per-account per-folder done_uids 集合（供快速去重）"""
-        uid = self.r.hget(mail_key, "uid")
-        folder = self.r.hget(mail_key, "folder")
+        # 将 done_uids 写入移入 pipeline，与 done 键原子执行，避免两层去重不一致
+        uid = (old or {}).get("uid", "")
+        folder = (old or {}).get("folder", "")
         if uid and folder:
-            self.r.sadd(self._mbx_k("done_uids", folder), uid)
+            pipe.sadd(self._mbx_k("done_uids", folder), uid)
+        pipe.execute()
 
     def mark_failed(self, message_id: str, error: str):
         key = self._k("mail", message_id)
@@ -588,8 +585,12 @@ class MailCache:
         self._index_state(pipe, message_id, data)
         if drop_body:
             pipe.delete(self._k("body", message_id))
+        # 将 done_uids 写入移入 pipeline，与 done 键原子执行，避免两层去重不一致
+        uid = (old or {}).get("uid", "")
+        folder = (old or {}).get("folder", "")
+        if uid and folder:
+            pipe.sadd(self._mbx_k("done_uids", folder), uid)
         pipe.execute()
-        self._index_done_uid(key)
 
     def get_mail_state(self, message_id: str) -> dict:
         """取一封邮件的处理状态哈希（uid/folder/status/knowledge_doc_id 等）"""

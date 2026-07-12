@@ -20,6 +20,7 @@ const props = defineProps<{
 defineEmits<{
   'view-report': [name: string]
   'chat-analyze': [name: string]
+  reanalyze: [name: string]
 }>()
 
 const entityLines = computed(() => {
@@ -99,7 +100,23 @@ const entityLines = computed(() => {
         </svg>
         {{ aiSummary ? '查看报告' : 'AI 分析' }}
       </button>
-      <button class="pc-btn pc-btn-ghost" @click="$emit('chat-analyze', name)" title="在 Chat 中深度分析">
+      <button
+        v-if="aiSummary"
+        class="pc-btn pc-btn-ghost"
+        @click="$emit('reanalyze', name)"
+        title="重新 AI 分析"
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        重新分析
+      </button>
+      <button
+        v-else
+        class="pc-btn pc-btn-ghost"
+        @click="$emit('chat-analyze', name)"
+        title="在 Chat 中深度分析"
+      >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>

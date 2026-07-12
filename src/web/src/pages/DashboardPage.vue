@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { mailsApi, graphApi, projectsApi, type MailStats, type ProjectItem, type ProjectReport, type ProjectSummary } from '@/api'
+import { mailsApi, graphApi, projectsApi, type MailStats, type ProjectItem, type ProjectReport, type ProjectSummary, type AnalysisHistoryItem } from '@/api'
 import { useChatStore } from '@/stores/chat'
 import SvgIcon from '@/components/SvgIcon.vue'
 import KpiCards from '@/components/dashboard/KpiCards.vue'
@@ -29,6 +29,9 @@ const modalProjectName = ref('')
 const modalReport = ref<ProjectReport | null>(null)
 const modalSummary = ref<ProjectSummary | null>(null)
 const modalLoading = ref(false)
+const modalHistory = ref<AnalysisHistoryItem[]>([])
+const modalViewingHistoryId = ref<string | null>(null)
+const modalProgress = ref<string[]>([])
 
 const totalPages = computed(() => Math.max(1, Math.ceil(totalProjects.value / PAGE_SIZE)))
 
@@ -84,9 +87,64 @@ const filtered = computed(() => {
 
 // ── Report modal ──
 
+async function loadHistory(name: string) {
+  try {
+    const result = await projectsApi.getHistory(name)
+    modalHistory.value = result.items
+  } catch {
+    modalHistory.value = []
+  }
+}
+
+async function viewHistoryItem(name: string, item: AnalysisHistoryItem) {
+  if (item.is_latest) {
+    // Already viewing latest — just fetch from cache
+    modalViewingHistoryId.value = null
+    try {
+      const cached = await projectsApi.getAnalysis(name)
+      if (cached.report) {
+        modalReport.value = cached.report
+        modalSummary.value = cached.summary
+      }
+    } catch { /* ignore */ }
+  } else {
+    modalViewingHistoryId.value = item.id
+    // Use the full report from history if available
+    if (item.report) {
+      modalReport.value = item.report
+    } else if (item.summary) {
+      // Fallback: summary-only data from older history entries
+      modalReport.value = {
+        overview: item.summary.overview || '',
+        stage: item.summary.stage || '',
+        contract: '',
+        key_dates: item.summary.key_dates || '',
+        core_people: (item.summary.core_people || []).join('；'),
+        companies: '',
+        recent_activity: '',
+      }
+    }
+    modalSummary.value = item.summary
+  }
+  modalLoading.value = false
+}
+
+function formatHistoryTime(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 async function handleViewReport(name: string) {
   modalProjectName.value = name
   modalVisible.value = true
+  modalHistory.value = []
+  modalViewingHistoryId.value = null
+  modalProgress.value = []
+
+  // Load history in background
+  loadHistory(name)
 
   // Try cached first
   try {
@@ -108,7 +166,9 @@ async function handleViewReport(name: string) {
 
   projectsApi.analyze(name, {
     onProgress(data: any) {
-      // Could show progress messages if desired
+      if (data.msg) {
+        modalProgress.value = [...modalProgress.value, data.msg]
+      }
     },
     onComplete(data: any) {
       if (data.report) {
@@ -120,6 +180,8 @@ async function handleViewReport(name: string) {
       modalLoading.value = false
       // Refresh current page to get updated ai_summary on cards
       loadProjects(currentPage.value)
+      // Refresh history
+      loadHistory(name)
     },
     onError(msg: string) {
       console.error('Analysis failed:', msg)
@@ -133,6 +195,43 @@ function handleCloseModal() {
   modalReport.value = null
   modalSummary.value = null
   modalLoading.value = false
+  modalHistory.value = []
+  modalViewingHistoryId.value = null
+  modalProgress.value = []
+}
+
+async function handleReanalyze(name: string) {
+  // Force re-analysis: open modal + start generation
+  modalProjectName.value = name
+  modalVisible.value = true
+  modalLoading.value = true
+  modalReport.value = null
+  modalSummary.value = null
+  modalViewingHistoryId.value = null
+  modalProgress.value = []
+
+  projectsApi.analyze(name, {
+    onProgress(data: any) {
+      if (data.msg) {
+        modalProgress.value = [...modalProgress.value, data.msg]
+      }
+    },
+    onComplete(data: any) {
+      if (data.report) {
+        modalReport.value = data.report as ProjectReport
+      }
+      if (data.summary) {
+        modalSummary.value = data.summary as ProjectSummary
+      }
+      modalLoading.value = false
+      loadProjects(currentPage.value)
+      loadHistory(name)
+    },
+    onError(msg: string) {
+      console.error('Analysis failed:', msg)
+      modalLoading.value = false
+    },
+  })
 }
 
 // ── Chat deep analysis ──
@@ -225,6 +324,7 @@ async function handleChatAnalyze(name: string) {
           :ai-summary="p.ai_summary"
           @view-report="handleViewReport"
           @chat-analyze="handleChatAnalyze"
+          @reanalyze="handleReanalyze"
         />
       </div>
 
@@ -262,8 +362,13 @@ async function handleChatAnalyze(name: string) {
       :report="modalReport"
       :summary="modalSummary"
       :loading="modalLoading"
+      :progress="modalProgress"
+      :history="modalHistory"
+      :viewing-history-id="modalViewingHistoryId"
       @close="handleCloseModal"
       @chat-analyze="(name: string) => { handleCloseModal(); handleChatAnalyze(name) }"
+      @view-history="(item: AnalysisHistoryItem) => viewHistoryItem(modalProjectName, item)"
+      @reanalyze="(name: string) => handleReanalyze(name)"
     />
   </div>
 </template>

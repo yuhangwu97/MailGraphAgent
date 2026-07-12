@@ -69,15 +69,17 @@ export function sseStream(
         } else if (line.startsWith('data: ')) {
           const dataStr = line.slice(6)
           try {
-            const data = JSON.parse(dataStr)
+            // Sanitize NaN/Infinity before parsing (Python json.dumps may emit them)
+            const sanitized = dataStr.replace(/: *NaN/g, ': null').replace(/: *Infinity/g, ': null').replace(/: *-Infinity/g, ': null')
+            const data = JSON.parse(sanitized)
             if (eventType === 'progress') handlers.onProgress?.(data)
             else if (eventType === 'complete') handlers.onComplete?.(data)
             else if (eventType === 'error') handlers.onError?.(data.msg || String(data))
             else if (eventType === 'done') { handlers.onDone?.(); streamDone = true }
             else if (eventType === 'result') handlers.onComplete?.(data)
             else handlers.onProgress?.(data)
-          } catch {
-            // non-JSON data, ignore
+          } catch (e) {
+            console.warn('SSE parse error for event', eventType, e)
           }
           eventType = ''
         }
@@ -367,12 +369,28 @@ export interface PaginatedProjects {
   page_size: number
 }
 
+export interface AnalysisHistoryItem {
+  id: string
+  generated_at: number
+  summary: ProjectSummary | null
+  report: ProjectReport | null
+  is_latest: boolean
+}
+
+export interface AnalysisHistory {
+  project_name: string
+  items: AnalysisHistoryItem[]
+}
+
 export const projectsApi = {
   list: (page = 1, pageSize = 20) =>
     request<PaginatedProjects>(`/projects?page=${page}&page_size=${pageSize}`),
 
   getAnalysis: (name: string) =>
     request<ProjectAnalysis>(`/projects/${encodeURIComponent(name)}/analysis`),
+
+  getHistory: (name: string) =>
+    request<AnalysisHistory>(`/projects/${encodeURIComponent(name)}/history`),
 
   analyze: (name: string, handlers: Parameters<typeof sseStream>[2]) =>
     sseStream(`/projects/${encodeURIComponent(name)}/analyze`, {}, handlers),

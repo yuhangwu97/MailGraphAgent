@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -267,6 +267,24 @@ class ProjectSummary(BaseModel):
     stage: str = ""             # 📈 项目阶段/状态
     key_dates: str = ""         # 📅 关键时间节点
     core_people: list[str] = Field(default_factory=list)  # 👥 核心人员
+
+    @field_validator("core_people", mode="before")
+    @classmethod
+    def normalize_core_people(cls, v):
+        """Accept both string (from AI analysis) and list (from cache normalization)."""
+        if v is None:
+            return []
+        if isinstance(v, str):
+            # AI-generated text like "张明（项目经理）；王芳（技术负责人）"
+            if v.strip():
+                return [v]
+            return []
+        if isinstance(v, list):
+            return [
+                item.get("name", str(item)) if isinstance(item, dict) else str(item)
+                for item in v
+            ]
+        return [str(v)]
 
 
 class ProjectReport(BaseModel):
