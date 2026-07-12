@@ -123,7 +123,27 @@ async def list_projects(
             cached = store.get(p["name"])
             ai_summary = None
             if cached and cached.get("summary"):
-                ai_summary = cached["summary"]
+                raw = cached["summary"]
+                # Normalize core_people: extract names if objects, keep strings as-is
+                raw_people = raw.get("core_people", [])
+                if isinstance(raw_people, list):
+                    people_list = []
+                    for item in raw_people:
+                        if isinstance(item, dict):
+                            people_list.append(item.get("name", str(item)))
+                        else:
+                            people_list.append(str(item))
+                elif isinstance(raw_people, str) and raw_people.strip():
+                    people_list = [raw_people]
+                else:
+                    people_list = []
+
+                ai_summary = {
+                    "overview": _normalize_field(raw.get("overview", "")),
+                    "stage": _normalize_field(raw.get("stage", "")),
+                    "key_dates": _normalize_field(raw.get("key_dates", "")),
+                    "core_people": people_list,
+                }
 
             projects.append(ProjectItem(
                 name=_clean(p["name"]),
