@@ -4,9 +4,20 @@
 
 const BASE = '/api'
 
+// ── Active account context ──
+// 后端按 X-Account-Id 头区分账户数据；这里保存当前账户 id，由 account store 保持同步，
+// 每个 REST / SSE 请求都带上，缺失时后端 fallback 到默认（第一个）账户。
+let activeAccountId: string | null = null
+export function setActiveAccountId(id: string | null) {
+  activeAccountId = id
+}
+function accountHeaders(): Record<string, string> {
+  return activeAccountId ? { 'X-Account-Id': activeAccountId } : {}
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    headers: { 'Content-Type': 'application/json', ...accountHeaders(), ...options?.headers },
     ...options,
   })
   if (!res.ok) {
@@ -32,7 +43,7 @@ export function sseStream(
 
   fetch(`${BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...accountHeaders() },
     body: JSON.stringify(body),
     signal: controller.signal,
   }).then(async (res) => {
@@ -58,15 +69,20 @@ export function sseStream(
         } else if (line.startsWith('data: ')) {
           const dataStr = line.slice(6)
           try {
-            const data = JSON.parse(dataStr)
+            // Sanitize NaN/Infinity before parsing (Python json.dumps may emit them)
+            const sanitized = dataStr.replace(/: *NaN/g, ': null').replace(/: *Infinity/g, ': null').replace(/: *-Infinity/g, ': null')
+            const data = JSON.parse(sanitized)
             if (eventType === 'progress') handlers.onProgress?.(data)
             else if (eventType === 'complete') handlers.onComplete?.(data)
             else if (eventType === 'error') handlers.onError?.(data.msg || String(data))
             else if (eventType === 'done') { handlers.onDone?.(); streamDone = true }
-            else if (eventType === 'result') handlers.onComplete?.(data)
+            else if (eventType === 'result') {
+              console.log('[SSE] result event parsed, keys:', Object.keys(data).join(', '), 'entities:', data?.entities?.length, 'chunks:', data?.chunks?.length)
+              handlers.onComplete?.(data)
+            }
             else handlers.onProgress?.(data)
-          } catch {
-            // non-JSON data, ignore
+          } catch (e) {
+            console.warn('SSE parse error for event', eventType, e)
           }
           eventType = ''
         }
@@ -94,6 +110,7 @@ export interface Account {
   imap_port: number
   email_user: string
   provider: string
+  is_default?: boolean
 }
 
 export const accountsApi = {
@@ -104,6 +121,7 @@ export const accountsApi = {
     email_user: string; email_pass: string; provider: string
   }) => request<Account>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   delete: (id: string) => request<void>(`/accounts/${id}`, { method: 'DELETE' }),
+  setDefault: (id: string) => request<{ default_account_id: string }>(`/accounts/${id}/default`, { method: 'POST' }),
   migrateFromEnv: () => request<{ migrated: boolean; account_count: number }>('/accounts/migrate-from-env', { method: 'POST' }),
 }
 
@@ -114,6 +132,7 @@ export const accountsApi = {
 export interface MailStats {
   total: number; done: number; pending: number
   failed: number; skipped: number; ingested: number; indexed: number
+  processing?: number
 }
 
 export interface MailItem {
@@ -164,6 +183,10 @@ export interface PaginatedMails {
 
 export const mailsApi = {
   stats: () => request<MailStats>('/mails/stats'),
+  list: (params?: { filter?: 'all' | 'todo' | 'done'; page?: number; page_size?: number }) => {
+    const p = params || {}
+    return request<PaginatedMails>(`/mails/list?filter=${p.filter ?? 'all'}&page=${p.page ?? 1}&page_size=${p.page_size ?? 200}`)
+  },
   pending: (params?: { page?: number; page_size?: number }) => {
     const p = params || {}
     return request<PaginatedMails>(`/mails/pending?page=${p.page ?? 1}&page_size=${p.page_size ?? 50}`)
@@ -181,8 +204,8 @@ export const mailsApi = {
 
   fetch: (folder: string, limit: number, handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/fetch', { folder, limit }, handlers),
-  ingest: (limit: number | null, handlers: Parameters<typeof sseStream>[2]) =>
-    sseStream('/mails/ingest', { limit }, handlers),
+  ingest: (limit: number | null, handlers: Parameters<typeof sseStream>[2], messageIds?: string[]) =>
+    sseStream('/mails/ingest', { limit, message_ids: messageIds || null }, handlers),
   reprocess: (messageIds: string[], handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/reprocess', { message_ids: messageIds }, handlers),
 
@@ -292,4 +315,89 @@ export const statusApi = {
   health: () => request<StatusResponse>('/status'),
   tokens: () => request<{ prompt_tokens: number; completion_tokens: number }>('/usage/tokens'),
   logs: (service: string, lines = 50) => request<{ log: string }>(`/logs/${service}?lines=${lines}`),
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Project API
+// ═══════════════════════════════════════════════════════════════
+
+export interface ProjectSummary {
+  overview: string
+  stage: string
+  key_dates: string
+  core_people: string[]
+}
+
+export interface ProjectReport {
+  overview: string
+  stage: string
+  contract: string
+  key_dates: string
+  core_people: string
+  companies: string
+  recent_activity: string
+}
+
+export interface ProjectAnalysis {
+  project_name: string
+  summary: ProjectSummary | null
+  report: ProjectReport | null
+  generated_at: number
+  cached: boolean
+}
+
+export interface NeighborEntity {
+  name: string
+  type: string
+}
+
+export interface ProjectItem {
+  name: string
+  description: string
+  people: NeighborEntity[]
+  companies: NeighborEntity[]
+  tasks: NeighborEntity[]
+  events: NeighborEntity[]
+  documents: NeighborEntity[]
+  systems: NeighborEntity[]
+  locations: NeighborEntity[]
+  other_neighbors: NeighborEntity[]
+  ai_summary: ProjectSummary | null
+}
+
+export interface PaginatedProjects {
+  projects: ProjectItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface AnalysisHistoryItem {
+  id: string
+  generated_at: number
+  summary: ProjectSummary | null
+  report: ProjectReport | null
+  is_latest: boolean
+}
+
+export interface AnalysisHistory {
+  project_name: string
+  items: AnalysisHistoryItem[]
+}
+
+export const projectsApi = {
+  list: (page = 1, pageSize = 20) =>
+    request<PaginatedProjects>(`/projects?page=${page}&page_size=${pageSize}`),
+
+  delete: (name: string) =>
+    request<{ deleted: boolean; project_name: string }>(`/projects/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  getAnalysis: (name: string) =>
+    request<ProjectAnalysis>(`/projects/${encodeURIComponent(name)}/analysis`),
+
+  getHistory: (name: string) =>
+    request<AnalysisHistory>(`/projects/${encodeURIComponent(name)}/history`),
+
+  analyze: (name: string, handlers: Parameters<typeof sseStream>[2]) =>
+    sseStream(`/projects/${encodeURIComponent(name)}/analyze`, {}, handlers),
 }

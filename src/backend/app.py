@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from config.settings import get_settings
-from src.backend.routes import accounts, conversations, graph, mails, query, status
+from src.backend.routes import accounts, conversations, events, graph, mails, projects, query, status
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,8 @@ app.include_router(mails.router)
 app.include_router(conversations.router)
 app.include_router(query.router)
 app.include_router(graph.router)
+app.include_router(projects.router)
+app.include_router(events.router)
 
 
 @app.get("/api/health")

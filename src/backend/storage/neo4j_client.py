@@ -84,10 +84,10 @@ def count_graph() -> dict:
     LightRAG 冷启动、且用有向 :DIRECTED-> 得到真实边数。
 
     ── 关于 workspace / 账号 ──
-    本系统【故意】用全局单一知识图谱：LightRAG 单例、单 workspace(base)，所有账号
-    的邮件汇入同一张图（跨账号统一检索）。这与 Redis 按账号隔离(mailgraph:{id}:)
-    不同，是有意为之，非缺陷。因此这里 MATCH (n) WHERE entity_id IS NOT NULL 不按
-    workspace 限定是安全的——全局只有一个 workspace。
+    本系统用全局单一知识图谱：LightRAG 单例、单 workspace(base)，所有账号的邮件汇入
+    同一张图（跨账号统一检索）。邮件/会话数据（Redis）现在同样全局共享，账号仅作为
+    IMAP 登录凭据。因此这里 MATCH (n) WHERE entity_id IS NOT NULL 不按 workspace
+    限定是安全的——全局只有一个 workspace。
 
     连接失败（Neo4j 未起）时返回 0，让前端优雅降级。
     """
@@ -136,3 +136,134 @@ def get_all_relationships(limit: int = 1000) -> list[dict]:
                 "weight": r["weight"],
             })
     return rels
+
+
+def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
+    """Return paginated project entities with neighbor info.
+
+    Each project dict: {id, name, type, description, people, companies,
+                         tasks, events, documents, systems, locations, other_neighbors}
+    All neighbor types are derived from DIRECTED relationships.
+    Returns: {projects: list[dict], total: int}
+    """
+    skip = max(0, (page - 1) * page_size)
+
+    # Count total projects
+    count_q = (
+        "MATCH (n) WHERE n.entity_id IS NOT NULL AND n.entity_type = 'project' "
+        "RETURN count(n) AS c"
+    )
+
+    # Fetch page of projects
+    projects_q = (
+        "MATCH (n) WHERE n.entity_id IS NOT NULL AND n.entity_type = 'project' "
+        "RETURN n.entity_id AS id, "
+        "       coalesce(n.description, '') AS description "
+        "ORDER BY toLower(n.entity_id) "
+        "SKIP $skip LIMIT $limit"
+    )
+
+    driver = _get_driver()
+    with driver.session() as session:
+        total = session.run(count_q).single()["c"]
+        result = session.run(projects_q, skip=skip, limit=int(page_size))
+        projects = []
+        for r in result:
+            eid = r["id"]
+            projects.append({
+                "id": eid,
+                "name": eid,
+                "type": "project",
+                "description": r["description"],
+            })
+
+    if not projects:
+        return {"projects": [], "total": int(total)}
+
+    # Fetch relationships for this page's projects only
+    project_ids = [p["name"] for p in projects]
+    rels_q = (
+        "MATCH (a)-[r:DIRECTED]->(b) "
+        "WHERE a.entity_id IN $pids AND b.entity_id IS NOT NULL "
+        "RETURN a.entity_id AS source_id, "
+        "       b.entity_id AS target_id, "
+        "       b.entity_type AS target_type, "
+        "       coalesce(b.description, '') AS target_desc "
+        "UNION "
+        "MATCH (a)-[r:DIRECTED]->(b) "
+        "WHERE b.entity_id IN $pids AND a.entity_id IS NOT NULL "
+        "RETURN b.entity_id AS source_id, "
+        "       a.entity_id AS target_id, "
+        "       a.entity_type AS target_type, "
+        "       coalesce(a.description, '') AS target_desc"
+    )
+
+    # Entity type → field name + label mapping
+    TYPE_MAP = {
+        "person": ("people", "人员"),
+        "contact": ("people", "人员"),
+        "employee": ("people", "人员"),
+        "organization": ("companies", "公司"),
+        "task": ("tasks", "任务"),
+        "event": ("events", "事件"),
+        "document": ("documents", "文档"),
+        "system": ("systems", "系统"),
+        "location": ("locations", "地点"),
+    }
+
+    with driver.session() as session:
+        rels = session.run(rels_q, pids=project_ids)
+        # Initialize neighbor buckets
+        NEIGHBOR_FIELDS = ["people", "companies", "tasks", "events", "documents", "systems", "locations", "other_neighbors"]
+        by_project: dict[str, dict[str, list]] = {}
+        for p in projects:
+            by_project[p["name"]] = {f: [] for f in NEIGHBOR_FIELDS}
+
+        seen = set()
+        for r in rels:
+            proj_name = r["source_id"]
+            if proj_name not in by_project:
+                proj_name = r["target_id"]
+                if proj_name not in by_project:
+                    continue
+            neighbor = r["target_id"] if r["source_id"] == proj_name else r["source_id"]
+            ntype = (r["target_type"] or "").lower()
+            ntype_orig = r["target_type"] or ""
+            key = f"{proj_name}|{neighbor}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            field, _ = TYPE_MAP.get(ntype, ("other_neighbors", "其他"))
+            by_project[proj_name][field].append({
+                "name": neighbor,
+                "type": ntype_orig,
+            })
+
+        for p in projects:
+            for f in NEIGHBOR_FIELDS:
+                p[f] = by_project[p["name"]][f]
+
+    return {"projects": projects, "total": int(total)}
+
+
+def delete_project(project_name: str) -> bool:
+    """Delete a project node and its DIRECTED relationships from Neo4j.
+
+    Only removes the project node itself — neighboring entities (people,
+    companies, tasks, etc.) are preserved because they may belong to other
+    projects.  Returns True if a node was deleted, False if none matched.
+    """
+    driver = _get_driver()
+    with driver.session() as session:
+        # Delete all DIRECTED relationships connected to this project, then the node
+        result = session.run(
+            "MATCH (n {entity_id: $name, entity_type: 'project'}) "
+            "DETACH DELETE n "
+            "RETURN count(n) AS deleted",
+            name=project_name,
+        ).single()
+        deleted = result["deleted"] if result else 0
+        if deleted:
+            logger.info("Deleted project '%s' from Neo4j (%d node(s))", project_name, deleted)
+        return deleted > 0

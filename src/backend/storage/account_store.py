@@ -17,6 +17,7 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_KEY = "mailgraph:accounts"
+DEFAULT_KEY = "mailgraph:default_account"  # string: 用户指定的默认账号 id
 
 
 def account_id_from_email(email: str) -> str:
@@ -82,8 +83,19 @@ class AccountStore:
         logger.info("已删除邮箱账号: %s", account_id)
 
     def default_id(self) -> str | None:
+        """默认账号 id：优先用户显式设置的（若仍存在），否则回退到列表第一个。"""
+        stored = self._r.get(DEFAULT_KEY)
+        if stored and self._r.hexists(ACCOUNTS_KEY, stored):
+            return stored
         accounts = self.list()
         return accounts[0]["id"] if accounts else None
+
+    def set_default(self, account_id: str) -> None:
+        """指定默认账号（无 X-Account-Id 时 / CLI 使用）。账号需已存在。"""
+        if not self._r.hexists(ACCOUNTS_KEY, account_id):
+            raise ValueError(f"account not found: {account_id}")
+        self._r.set(DEFAULT_KEY, account_id)
+        logger.info("默认邮箱已设为: %s", account_id)
 
     def ensure_default_from_env(self):
         """存量迁移：无任何账号且环境变量配了邮箱时，导入为默认账号（一次性）。"""

@@ -54,6 +54,7 @@ def health_check(
     store = get_account_store()
     try:
         accounts_raw = store.list()
+        default_id = store.default_id()
         from src.backend.schemas import AccountOut
 
         accounts = [
@@ -64,6 +65,7 @@ def health_check(
                 imap_port=a.get("imap_port", 993),
                 email_user=a.get("email_user", ""),
                 provider=a.get("provider", ""),
+                is_default=(a["id"] == default_id),
             )
             for a in accounts_raw
         ]

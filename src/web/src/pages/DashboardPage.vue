@@ -1,20 +1,40 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { mailsApi, graphApi, type MailStats } from '@/api'
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { mailsApi, graphApi, projectsApi, type MailStats, type ProjectItem, type ProjectReport, type ProjectSummary, type AnalysisHistoryItem } from '@/api'
+import { useChatStore } from '@/stores/chat'
 import SvgIcon from '@/components/SvgIcon.vue'
 import KpiCards from '@/components/dashboard/KpiCards.vue'
 import ProjectCard from '@/components/dashboard/ProjectCard.vue'
+import ProjectReportModal from '@/components/dashboard/ProjectReportModal.vue'
+
+const router = useRouter()
+const chatStore = useChatStore()
+
+const PAGE_SIZE = 20
 
 const kpi = ref<MailStats>({ total: 0, done: 0, pending: 0, failed: 0, skipped: 0, ingested: 0, indexed: 0 })
 const graphNodes = ref(0)
 const projectCount = ref(0)
 const contactCount = ref(0)
-const projects = ref<any[]>([])
+const projects = ref<ProjectItem[]>([])
+const totalProjects = ref(0)
+const currentPage = ref(1)
 const search = ref('')
 const loading = ref(true)
 
-// LightRAG 存储的 entity_type 统一为小写去空格，故一律按小写比较。
-// 人员相关类型放宽匹配（person / contact / employee 都算联系人）。
+// Report modal state
+const modalVisible = ref(false)
+const modalProjectName = ref('')
+const modalReport = ref<ProjectReport | null>(null)
+const modalSummary = ref<ProjectSummary | null>(null)
+const modalLoading = ref(false)
+const modalHistory = ref<AnalysisHistoryItem[]>([])
+const modalViewingHistoryId = ref<string | null>(null)
+const modalProgress = ref<string[]>([])
+
+const totalPages = computed(() => Math.max(1, Math.ceil(totalProjects.value / PAGE_SIZE)))
+
 const PEOPLE_TYPES = ['person', 'contact', 'employee']
 const etype = (e: any) => String(e?.type || '').toLowerCase()
 
@@ -25,64 +45,17 @@ onMounted(async () => {
 async function loadDashboard() {
   loading.value = true
   try {
-    const [stats, entRes, relRes] = await Promise.all([
+    const [stats, entRes] = await Promise.all([
       mailsApi.stats(),
       graphApi.entities(1, 500),
-      graphApi.relationships(1, 2000),
     ])
     kpi.value = stats
     const entities = entRes.entities || []
-    const rels = relRes.relationships || []
     graphNodes.value = entities.length
     projectCount.value = entities.filter((e: any) => etype(e) === 'project').length
     contactCount.value = entities.filter((e: any) => PEOPLE_TYPES.includes(etype(e))).length
 
-    // 实体按 id 与 name 双键索引，关系边的端点可能用其中任一标识
-    const byKey = new Map<string, any>()
-    for (const e of entities) {
-      if (e.id) byKey.set(String(e.id), e)
-      if (e.name) byKey.set(String(e.name), e)
-    }
-
-    // 为每个项目收集其在图谱中的邻居实体
-    const neighborsOf = (proj: any): any[] => {
-      const keys = new Set([String(proj.id), String(proj.name)].filter(Boolean))
-      const out: any[] = []
-      const seen = new Set<string>()
-      for (const r of rels) {
-        const s = String(r.source_id ?? '')
-        const t = String(r.target_id ?? '')
-        let otherKey = ''
-        if (keys.has(s)) otherKey = t
-        else if (keys.has(t)) otherKey = s
-        if (!otherKey) continue
-        const ent = byKey.get(otherKey)
-        if (!ent || !ent.name) continue
-        const dedupe = String(ent.id || ent.name)
-        if (seen.has(dedupe)) continue
-        seen.add(dedupe)
-        out.push(ent)
-      }
-      return out
-    }
-
-    const clean = (s: string) => (s || '').replace(/<[^>]*>/g, '')
-
-    projects.value = entities
-      .filter((e: any) => etype(e) === 'project')
-      .map((p: any) => {
-        const neighbors = neighborsOf(p)
-        return {
-          name: clean(p.name),
-          description: clean((p.description || '') + '').slice(0, 200),
-          people: neighbors
-            .filter((n: any) => PEOPLE_TYPES.includes(etype(n)))
-            .map((n: any) => ({ name: clean(n.name) })),
-          companies: neighbors
-            .filter((n: any) => etype(n) === 'organization')
-            .map((n: any) => ({ name: clean(n.name) })),
-        }
-      })
+    await loadProjects(currentPage.value)
   } catch (e) {
     console.error(e)
   } finally {
@@ -90,10 +63,210 @@ async function loadDashboard() {
   }
 }
 
-const filtered = () => {
+async function loadProjects(page: number) {
+  try {
+    const res = await projectsApi.list(page, PAGE_SIZE)
+    projects.value = res.projects
+    totalProjects.value = res.total
+    currentPage.value = res.page
+  } catch (e) {
+    console.error('Failed to load projects:', e)
+  }
+}
+
+async function goToPage(page: number) {
+  if (page < 1 || page > totalPages.value || page === currentPage.value) return
+  await loadProjects(page)
+}
+
+const filtered = computed(() => {
   if (!search.value) return projects.value
   const q = search.value.toLowerCase()
-  return projects.value.filter((p: any) => p.name.toLowerCase().includes(q))
+  return projects.value.filter((p: ProjectItem) => p.name.toLowerCase().includes(q))
+})
+
+// ── Report modal ──
+
+async function loadHistory(name: string) {
+  try {
+    const result = await projectsApi.getHistory(name)
+    modalHistory.value = result.items
+  } catch {
+    modalHistory.value = []
+  }
+}
+
+async function viewHistoryItem(name: string, item: AnalysisHistoryItem) {
+  if (item.is_latest) {
+    // Already viewing latest — just fetch from cache
+    modalViewingHistoryId.value = null
+    try {
+      const cached = await projectsApi.getAnalysis(name)
+      if (cached.report) {
+        modalReport.value = cached.report
+        modalSummary.value = cached.summary
+      }
+    } catch { /* ignore */ }
+  } else {
+    modalViewingHistoryId.value = item.id
+    // Use the full report from history if available
+    if (item.report) {
+      modalReport.value = item.report
+    } else if (item.summary) {
+      // Fallback: summary-only data from older history entries
+      modalReport.value = {
+        overview: item.summary.overview || '',
+        stage: item.summary.stage || '',
+        contract: '',
+        key_dates: item.summary.key_dates || '',
+        core_people: (item.summary.core_people || []).join('；'),
+        companies: '',
+        recent_activity: '',
+      }
+    }
+    modalSummary.value = item.summary
+  }
+  modalLoading.value = false
+}
+
+function formatHistoryTime(ts: number): string {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+async function handleViewReport(name: string) {
+  modalProjectName.value = name
+  modalVisible.value = true
+  modalHistory.value = []
+  modalViewingHistoryId.value = null
+  modalProgress.value = []
+
+  // Load history in background
+  loadHistory(name)
+
+  // Try cached first
+  try {
+    const cached = await projectsApi.getAnalysis(name)
+    if (cached.cached && cached.report) {
+      modalReport.value = cached.report
+      modalSummary.value = cached.summary
+      modalLoading.value = false
+      return
+    }
+  } catch {
+    // Not cached — proceed to generate
+  }
+
+  // Generate new analysis via SSE
+  modalLoading.value = true
+  modalReport.value = null
+  modalSummary.value = null
+
+  projectsApi.analyze(name, {
+    onProgress(data: any) {
+      if (data.msg) {
+        modalProgress.value = [...modalProgress.value, data.msg]
+      }
+    },
+    onComplete(data: any) {
+      if (data.report) {
+        modalReport.value = data.report as ProjectReport
+      }
+      if (data.summary) {
+        modalSummary.value = data.summary as ProjectSummary
+      }
+      modalLoading.value = false
+      // Refresh current page to get updated ai_summary on cards
+      loadProjects(currentPage.value)
+      // Refresh history
+      loadHistory(name)
+    },
+    onError(msg: string) {
+      console.error('Analysis failed:', msg)
+      modalLoading.value = false
+    },
+  })
+}
+
+function handleCloseModal() {
+  modalVisible.value = false
+  modalReport.value = null
+  modalSummary.value = null
+  modalLoading.value = false
+  modalHistory.value = []
+  modalViewingHistoryId.value = null
+  modalProgress.value = []
+}
+
+async function handleReanalyze(name: string) {
+  // Force re-analysis: open modal + start generation
+  modalProjectName.value = name
+  modalVisible.value = true
+  modalLoading.value = true
+  modalReport.value = null
+  modalSummary.value = null
+  modalViewingHistoryId.value = null
+  modalProgress.value = []
+
+  projectsApi.analyze(name, {
+    onProgress(data: any) {
+      if (data.msg) {
+        modalProgress.value = [...modalProgress.value, data.msg]
+      }
+    },
+    onComplete(data: any) {
+      if (data.report) {
+        modalReport.value = data.report as ProjectReport
+      }
+      if (data.summary) {
+        modalSummary.value = data.summary as ProjectSummary
+      }
+      modalLoading.value = false
+      loadProjects(currentPage.value)
+      loadHistory(name)
+    },
+    onError(msg: string) {
+      console.error('Analysis failed:', msg)
+      modalLoading.value = false
+    },
+  })
+}
+
+// ── Chat deep analysis ──
+
+async function handleChatAnalyze(name: string) {
+  const project = projects.value.find(p => p.name === name)
+  const overview = project?.ai_summary?.overview || project?.description || ''
+
+  const prompt = `请帮我深入分析项目「${name}」。\n\n项目概述：${overview}\n\n请从知识图谱中提取更多细节，包括邮件往来、合同金额、时间线、风险点等。`
+
+  // Create a new conversation and navigate
+  try {
+    const { conversationsApi } = await import('@/api')
+    const session = await conversationsApi.create(`分析: ${name}`)
+    // Navigate with prefill prompt
+    router.push({ path: '/chat', query: { prompt, session: session.id } })
+  } catch {
+    // Fallback: just navigate with prompt
+    router.push({ path: '/chat', query: { prompt } })
+  }
+}
+
+async function handleDelete(name: string) {
+  if (!confirm(`确定要删除项目「${name}」吗？此操作将从知识图谱中移除该项目及其关联缓存，不可撤销。`)) return
+  try {
+    await projectsApi.delete(name)
+    // Reload current page; if last item on last page, go back one page
+    const newTotal = totalProjects.value - 1
+    const maxPage = Math.max(1, Math.ceil(newTotal / PAGE_SIZE))
+    const page = Math.min(currentPage.value, maxPage)
+    await loadProjects(page)
+  } catch (e: any) {
+    console.error('Failed to delete project:', e)
+    alert(`删除失败：${e.message || '未知错误'}`)
+  }
 }
 </script>
 
@@ -147,25 +320,77 @@ const filtered = () => {
       <p>请先在「邮件工作台」拉取邮件并导入到知识图谱，系统将自动识别项目信息。</p>
     </div>
 
-    <!-- Project grid -->
-    <div v-else class="project-grid">
-      <ProjectCard
-        v-for="p in filtered()"
-        :key="p.name"
-        :name="p.name"
-        :description="p.description"
-        :people="p.people"
-        :companies="p.companies"
-      />
-    </div>
+    <!-- Project grid + Pagination -->
+    <template v-else>
+      <div class="project-grid">
+        <ProjectCard
+          v-for="p in filtered"
+          :key="p.name"
+          :name="p.name"
+          :description="p.description"
+          :people="p.people"
+          :companies="p.companies"
+          :tasks="p.tasks"
+          :events="p.events"
+          :documents="p.documents"
+          :systems="p.systems"
+          :locations="p.locations"
+          :other-neighbors="p.other_neighbors"
+          :ai-summary="p.ai_summary"
+          @view-report="handleViewReport"
+          @chat-analyze="handleChatAnalyze"
+          @reanalyze="handleReanalyze"
+          @delete="handleDelete"
+        />
+      </div>
 
-    <p v-if="!loading && projects.length > 0 && !filtered().length" class="text-muted" style="text-align:center;margin-top:2rem;">
+      <!-- Pagination -->
+      <div v-if="totalPages > 1" class="pagination">
+        <button
+          class="page-btn"
+          :disabled="currentPage <= 1"
+          @click="goToPage(currentPage - 1)"
+        >
+          ← 上一页
+        </button>
+        <span class="page-info">
+          {{ currentPage }} / {{ totalPages }}
+          <span class="page-total">（共 {{ totalProjects }} 个项目）</span>
+        </span>
+        <button
+          class="page-btn"
+          :disabled="currentPage >= totalPages"
+          @click="goToPage(currentPage + 1)"
+        >
+          下一页 →
+        </button>
+      </div>
+    </template>
+
+    <p v-if="!loading && projects.length > 0 && !filtered.length" class="text-muted" style="text-align:center;margin-top:2rem;">
       没有匹配「{{ search }}」的项目
     </p>
+
+    <!-- Report Modal -->
+    <ProjectReportModal
+      :visible="modalVisible"
+      :project-name="modalProjectName"
+      :report="modalReport"
+      :summary="modalSummary"
+      :loading="modalLoading"
+      :progress="modalProgress"
+      :history="modalHistory"
+      :viewing-history-id="modalViewingHistoryId"
+      @close="handleCloseModal"
+      @chat-analyze="(name: string) => { handleCloseModal(); handleChatAnalyze(name) }"
+      @view-history="(item: AnalysisHistoryItem) => viewHistoryItem(modalProjectName, item)"
+      @reanalyze="(name: string) => handleReanalyze(name)"
+    />
   </div>
 </template>
 
 <style scoped>
+/* Reuse existing styles, add pagination */
 .page-head {
   display: flex; align-items: flex-start; justify-content: space-between;
   margin-bottom: 1.25rem; gap: 1rem; flex-wrap: wrap;
@@ -202,6 +427,50 @@ const filtered = () => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 0.85rem;
+}
+
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+}
+
+.page-btn {
+  font-size: 0.8rem;
+  padding: 0.35rem 0.85rem;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--t2);
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+
+.page-btn:hover:not(:disabled) {
+  border-color: var(--p);
+  color: var(--p);
+  background: var(--p-bg);
+}
+
+.page-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.page-info {
+  font-size: 0.82rem;
+  color: var(--t2);
+  font-weight: 520;
+}
+
+.page-total {
+  font-weight: 400;
+  color: var(--t4);
 }
 
 /* Skeleton loading */

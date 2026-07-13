@@ -143,6 +143,118 @@ async def enqueue_job_and_stream(
         yield event
 
 
+async def multi_job_stream(
+    job_type: str, account_id: str | None, message_ids: list[str],
+) -> AsyncGenerator[str, None]:
+    """逐封入队独立 job，一个 SSE 流跟踪所有 job 的 progress/complete/error。
+
+    每封邮件一个 ingest_one job：worker 崩了只丢一封，不影响其他。
+    """
+    from src.backend import jobqueue
+
+    main_loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    total = len(message_ids)
+    completed = 0
+    job_ids: list[str] = []
+
+    # 先订阅 → 再入队（避免漏首帧）
+    pubsubs: list["redis.client.PubSub"] = []
+    for mid in message_ids:
+        jid = jobqueue.new_job_id()
+        job_ids.append(jid)
+        ps = jobqueue.subscribe_progress(jid)
+        pubsubs.append(ps)
+
+    # 入队所有 job
+    for i, mid in enumerate(message_ids):
+        jobqueue.enqueue_job(job_type, account_id or "",
+                             {"message_id": mid}, job_id=job_ids[i])
+
+    # 后台线程读所有 Redis pub/sub channel → 汇入一个 queue
+    def _reader() -> None:
+        import time as _time
+        deadline = _time.time() + 7200  # 2h 超时
+        remaining = set(range(total))
+        try:
+            while remaining and _time.time() < deadline:
+                for idx in list(remaining):
+                    msg = pubsubs[idx].get_message(timeout=0.1)
+                    if msg and msg.get("type") == "message":
+                        try:
+                            payload = json.loads(msg["data"])
+                            event_type = payload.get("event", "progress")
+                            data = payload.get("data", {})
+                            # 加上 job 序号，方便前端区分
+                            data["job_idx"] = idx + 1
+                            data["job_total"] = total
+                            main_loop.call_soon_threadsafe(
+                                queue.put_nowait,
+                                {"event": event_type, "data": data},
+                            )
+                            if event_type in ("complete", "error"):
+                                remaining.discard(idx)
+                        except Exception:
+                            pass
+                _time.sleep(0.05)
+        finally:
+            for ps in pubsubs:
+                try:
+                    ps.close()
+                except Exception:
+                    pass
+            main_loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+    threading.Thread(target=_reader, name=f"multi-job-{job_type}", daemon=True).start()
+
+    async for event in sse_from_queue(queue):
+        yield event
+
+
+async def prep_then_ingest_stream(
+    prep_fn, prep_args: tuple, account_id: str | None, ingest_params: dict | None = None,
+) -> AsyncGenerator[str, None]:
+    """先在 API 进程内跑「准备」(prep_fn，只入队不建图)，再入队 ingest 交给 worker 建图。
+
+    prep_fn 是 Pipeline 的准备方法（parse_selected / reprocess），在 API 线程池里跑（读源
+    文件 / 重拉 IMAP，属 IO 型），只把邮件塞进 ingest_queue。准备阶段只发 progress 事件，
+    最终的 complete 由 worker 的 ingest 建图阶段发出，前端看到的是一条连续的 SSE。
+    """
+    main_loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    _DONE = object()
+
+    def _prep() -> None:
+        def on_log(msg: str) -> None:
+            main_loop.call_soon_threadsafe(
+                queue.put_nowait, {"event": "progress", "data": {"msg": msg}})
+        err = None
+        try:
+            prep_fn(*prep_args, on_log=on_log)
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+        main_loop.call_soon_threadsafe(queue.put_nowait, (_DONE, err))
+
+    threading.Thread(target=_prep, name="prep", daemon=True).start()
+
+    # 阶段 1：准备进度（只 progress；准备失败则发 error 并终止）
+    while True:
+        item = await queue.get()
+        if isinstance(item, tuple) and item[0] is _DONE:
+            err = item[1]
+            if err:
+                yield f"event: error\ndata: {json.dumps({'msg': err}, ensure_ascii=False)}\n\n"
+                return
+            break
+        data = json.dumps(item.get("data", {}), ensure_ascii=False)
+        yield f"event: {item.get('event', 'progress')}\ndata: {data}\n\n"
+
+    # 阶段 2：入队 ingest 给 worker，转发建图进度（含最终 complete）
+    async for event in enqueue_job_and_stream("ingest", account_id, ingest_params or {}):
+        yield event
+
+
 
 async def run_in_thread(fn, *args, **kwargs):
     """Run a synchronous function in a thread pool executor."""

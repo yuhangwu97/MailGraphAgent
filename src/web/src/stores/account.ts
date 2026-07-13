@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import { accountsApi, statusApi, type Account } from '@/api'
+import { ref, computed, watch } from 'vue'
+import { accountsApi, statusApi, setActiveAccountId, type Account } from '@/api'
 
 export const useAccountStore = defineStore('account', () => {
   const accounts = ref<Account[]>([])
@@ -8,6 +8,10 @@ export const useAccountStore = defineStore('account', () => {
   const loading = ref(false)
 
   const active = computed(() => accounts.value.find(a => a.id === activeId.value) ?? null)
+
+  // 让 API 客户端始终携带当前账户头。sync flush：activeId 一变立刻同步，
+  // 早于任何监听 activeId 触发的重新拉取，避免用旧账户发请求。
+  watch(activeId, (id) => setActiveAccountId(id), { immediate: true, flush: 'sync' })
 
   async function fetchAccounts() {
     loading.value = true
@@ -40,5 +44,10 @@ export const useAccountStore = defineStore('account', () => {
     await fetchAccounts()
   }
 
-  return { accounts, activeId, active, loading, fetchAccounts, addAccount, deleteAccount }
+  async function setDefault(id: string) {
+    await accountsApi.setDefault(id)
+    await fetchAccounts()
+  }
+
+  return { accounts, activeId, active, loading, fetchAccounts, addAccount, deleteAccount, setDefault }
 })

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -12,6 +13,10 @@ from src.backend.deps import (
     get_account_id,
     get_cache,
     enqueue_job_and_stream,
+    multi_job_stream,
+    prep_then_ingest_stream,
+    run_pipeline_with_sse,
+    sse_from_queue,
 )
 from src.backend.schemas import (
     BrowseDir,
@@ -32,6 +37,8 @@ from src.backend.schemas import (
 
 router = APIRouter(prefix="/api/mails", tags=["mails"])
 
+logger = logging.getLogger(__name__)
+
 
 # ── Stats & queries ──
 
@@ -48,6 +55,7 @@ def mail_stats(cache=Depends(get_cache)):
             pending=s.get("pending", 0),
             failed=s.get("failed", 0),
             skipped=s.get("skipped", 0),
+            processing=s.get("processing", 0),
             ingested=s.get("ingested", 0),
             indexed=s.get("indexed", 0),
         )
@@ -103,6 +111,29 @@ def pending_mails(
             items.append(_to_mail_item(mail))
     return PaginatedMailResponse(
         items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/list", response_model=PaginatedMailResponse)
+def list_all_mails(
+    filter: str = Query("all", pattern="^(all|todo|done)$"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    cache=Depends(get_cache),
+):
+    """统一邮件列表：所有状态合并、按日期倒序、分页。
+
+    filter: all=全部 | todo=未完成(未处理/待入库/处理中/失败) | done=已完成(已入库/已跳过)。
+    """
+    if cache is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    offset = (page - 1) * page_size
+    mails, total = cache.list_mails(filter=filter, limit=page_size, offset=offset)
+    return PaginatedMailResponse(
+        items=[_to_indexed_item(m) for m in mails],
         total=total,
         page=page,
         page_size=page_size,
@@ -276,11 +307,26 @@ async def fetch_mails(
     body: FetchRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Pull mails from IMAP → clean → enqueue. SSE progress stream (runs on worker)."""
-    return StreamingResponse(
-        enqueue_job_and_stream("fetch", account_id, {"folder": body.folder, "limit": body.limit}),
-        media_type="text/event-stream",
-    )
+    """Pull mails from IMAP → clean → enqueue. 在 API 进程内跑（IMAP 属 IO 型，
+    不做 DeepDoc 解析，不会阻塞事件循环；也不占用只管解析的 worker）。"""
+    from src.backend.pipeline import Pipeline
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        task = asyncio.create_task(
+            run_pipeline_with_sse(
+                Pipeline(account_id).run_fetch,
+                body.folder,
+                body.limit,
+                queue=queue,
+            )
+        )
+        async for event in sse_from_queue(queue):
+            yield event
+        await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/ingest")
@@ -288,9 +334,41 @@ async def ingest_mails(
     body: IngestRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Process pending mails → LightRAG. SSE progress stream (runs on worker)."""
+    """建图：每封邮件一个 ingest_one job，worker 逐个处理。
+
+    如果指定 message_ids：先补回 ingest 队列（处理 reset 后 / 崩 worker 后不在队列的邮件），
+    然后逐封入队给 worker。
+    """
+    from src.backend.storage.redis_cache import MailCache
+    from src.backend import jobqueue
+
+    cache = MailCache(account_id)
+    mids: list[str] = []
+
+    try:
+        if body.message_ids:
+            # 补回队列
+            for mid in body.message_ids:
+                if cache.get_mail(mid):
+                    cache.r.sadd(cache._k("ingest_queue"), mid)
+                    mids.append(mid)
+            if mids:
+                logger.info("ingest: requeued %d mails for account %s", len(mids), account_id)
+        else:
+            # 未指定 → 取队列中所有
+            mids = cache.list_pending_ingest()
+    finally:
+        cache.close()
+
+    if not mids:
+        async def _empty():
+            yield "event: progress\ndata: {\"msg\": \"ingest 队列为空\"}\n\n"
+            yield "event: complete\ndata: {}\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
+
+    # 逐封入队 ingest_one job，一个 SSE 流跟踪所有 job
     return StreamingResponse(
-        enqueue_job_and_stream("ingest", account_id, {"limit": body.limit}),
+        multi_job_stream("ingest_one", account_id, mids),
         media_type="text/event-stream",
     )
 
@@ -300,9 +378,11 @@ async def reprocess_mails(
     body: ReprocessRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Force re-process selected mails. SSE progress stream (runs on worker)."""
+    """强制重处理：API 侧重置+重拉入队（IO），再入队 ingest 交 worker 建图。"""
+    from src.backend.pipeline import Pipeline
+    pipe = Pipeline(account_id)
     return StreamingResponse(
-        enqueue_job_and_stream("reprocess", account_id, {"message_ids": body.message_ids}),
+        prep_then_ingest_stream(pipe.reprocess, (body.message_ids,), account_id),
         media_type="text/event-stream",
     )
 
@@ -312,11 +392,24 @@ async def index_files(
     body: IndexFilesRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Step 1: scan local mail files → extract headers into `indexed`. SSE progress (worker)."""
-    return StreamingResponse(
-        enqueue_job_and_stream("index", account_id, {"paths": body.paths}),
-        media_type="text/event-stream",
-    )
+    """Step 1：扫描本地邮件文件表头 → indexed。纯扫描不建图，在 API 进程内跑。"""
+    from src.backend.pipeline import Pipeline
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        task = asyncio.create_task(
+            run_pipeline_with_sse(
+                Pipeline(account_id).run_index_files,
+                body.paths,
+                queue=queue,
+            )
+        )
+        async for event in sse_from_queue(queue):
+            yield event
+        await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.post("/parse-selected")
@@ -324,9 +417,11 @@ async def parse_selected_mails(
     body: ParseSelectedRequest,
     account_id: str = Depends(get_account_id),
 ):
-    """Step 2: read bodies of selected indexed mails → LightRAG vectorize. SSE progress (worker)."""
+    """Step 2：API 侧读选中邮件源文件 + 抽附件入队（IO），再入队 ingest 交 worker 建图。"""
+    from src.backend.pipeline import Pipeline
+    pipe = Pipeline(account_id)
     return StreamingResponse(
-        enqueue_job_and_stream("parse_selected", account_id, {"message_ids": body.message_ids}),
+        prep_then_ingest_stream(pipe.parse_selected, (body.message_ids,), account_id),
         media_type="text/event-stream",
     )
 

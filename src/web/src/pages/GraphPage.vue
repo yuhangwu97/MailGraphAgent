@@ -10,6 +10,8 @@ const entityTypes = ref<string[]>([])
 const selectedTypes = ref<string[]>([])
 const typeCounts = ref<Record<string, number>>({})
 const refreshing = ref(false)
+const building = ref(false)
+const buildLogs = ref<string[]>([])
 
 async function loadGraph() {
   refreshing.value = true

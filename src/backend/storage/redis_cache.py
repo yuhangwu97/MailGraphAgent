@@ -38,9 +38,12 @@ class MailCache:
             decode_responses=True,
             socket_connect_timeout=5,
         )
-        # 按账号隔离命名空间：mail/body/ingest_queue/done_uids/progress/usage 全部自动分账号
+        # 数据全局共享：mail/body/ingest_queue/idx/usage/indexed 不分账号，与知识图谱一致
+        # （项目看板、工作台列表都看统一池）。仅 IMAP 抓取簿记（done_uids/progress，基于
+        # 每邮箱唯一的 UID）按账号隔离，避免不同邮箱同名 folder 的 UID 相互误去重（见 _mbx_k）。
         self._account_id = account_id
-        self._prefix = f"mailgraph:{account_id}:" if account_id else "mailgraph:"
+        self._prefix = "mailgraph:"
+        self._mbx_prefix = f"mailgraph:mbx:{account_id}:" if account_id else "mailgraph:mbx:_:"
         self._body_ttl = int(cfg.fetched_body_ttl_days) * 86400
 
     @property
@@ -49,6 +52,11 @@ class MailCache:
 
     def _k(self, *parts: str) -> str:
         return self._prefix + ":".join(parts)
+
+    def _mbx_k(self, *parts: str) -> str:
+        """按账号隔离的 IMAP 抓取簿记键（done_uids / progress）。UID 只在单个邮箱内唯一，
+        全局合并会导致不同邮箱同名 folder 的 UID 相互误去重、漏抓邮件。"""
+        return self._mbx_prefix + ":".join(parts)
 
     def _status_key(self, status: str) -> str:
         return self._k("idx", "status", status or "pending")
@@ -182,15 +190,12 @@ class MailCache:
         pipe.hset(key, mapping={"status": "done", "updated_at": data["updated_at"]})
         pipe.setex(self._k("mail", message_id, "done"), 30 * 86400, "1")
         self._index_state(pipe, message_id, data)
-        pipe.execute()
-        self._index_done_uid(key)
-
-    def _index_done_uid(self, mail_key: str):
-        """把已完成邮件的 uid 加入 per-folder done_uids 集合（供快速去重）"""
-        uid = self.r.hget(mail_key, "uid")
-        folder = self.r.hget(mail_key, "folder")
+        # 将 done_uids 写入移入 pipeline，与 done 键原子执行，避免两层去重不一致
+        uid = (old or {}).get("uid", "")
+        folder = (old or {}).get("folder", "")
         if uid and folder:
-            self.r.sadd(self._k("done_uids", folder), uid)
+            pipe.sadd(self._mbx_k("done_uids", folder), uid)
+        pipe.execute()
 
     def mark_failed(self, message_id: str, error: str):
         key = self._k("mail", message_id)
@@ -246,29 +251,13 @@ class MailCache:
         pipe.execute()
 
     def get_processed_uids(self, folder: str) -> set[str]:
-        """返回该 folder 下已入库的 UID 集合（去重用）。
+        """返回该账号该 folder 下已入库的 UID 集合（抓取去重用，O(1) SMEMBERS）。
 
-        优先读 per-folder done_uids 集合（O(1) 一次 SMEMBERS）；
-        集合不存在（老数据）时回退全量扫描一次并回填，之后即走快路径。
+        UID 只在单个邮箱内唯一，故按账号隔离（_mbx_k）。集合不存在时返回空集——不做
+        跨账号全量扫描回填（否则会把别的邮箱的 UID 混进来导致误跳过、漏抓）；真正的重复
+        由 pipeline 侧 message_id 级兜底去重（is_processed）兜住，最多重下一次不会重复入库。
         """
-        set_key = self._k("done_uids", folder)
-        if self.r.exists(set_key):
-            return set(self.r.smembers(set_key))
-
-        # 回退 + 回填
-        uids = set()
-        for key in self.r.scan_iter(match=self._k("mail", "*")):
-            if self.r.type(key) != "hash":
-                continue
-            status = self.r.hget(key, "status")
-            f = self.r.hget(key, "folder")
-            if status == "done" and f == folder:
-                uid = self.r.hget(key, "uid")
-                if uid:
-                    uids.add(uid)
-        if uids:
-            self.r.sadd(set_key, *uids)
-        return uids
+        return set(self.r.smembers(self._mbx_k("done_uids", folder)))
 
     def get_unprocessed_count(self) -> int:
         # 优先用 status 索引集 (SCARD O(1))：failed + pending
@@ -523,6 +512,10 @@ class MailCache:
         pipe.setex(self._k("body", mid), self._body_ttl,
                    json.dumps(mail, ensure_ascii=False))
         pipe.sadd(self._k("ingest_queue"), mid)
+        # 会话线程分组索引（供前端按线程折叠展示；全局，不分账号）
+        thread_id = mail.get("thread_id")
+        if thread_id:
+            pipe.sadd(self._k("idx", "thread", thread_id), mid)
         pipe.execute()
 
     def get_mail(self, message_id: str) -> dict | None:
@@ -592,8 +585,12 @@ class MailCache:
         self._index_state(pipe, message_id, data)
         if drop_body:
             pipe.delete(self._k("body", message_id))
+        # 将 done_uids 写入移入 pipeline，与 done 键原子执行，避免两层去重不一致
+        uid = (old or {}).get("uid", "")
+        folder = (old or {}).get("folder", "")
+        if uid and folder:
+            pipe.sadd(self._mbx_k("done_uids", folder), uid)
         pipe.execute()
-        self._index_done_uid(key)
 
     def get_mail_state(self, message_id: str) -> dict:
         """取一封邮件的处理状态哈希（uid/folder/status/knowledge_doc_id 等）"""
@@ -735,10 +732,44 @@ class MailCache:
         mails.sort(key=lambda m: m.get("date", ""), reverse=True)
         return mails[offset:offset + limit]
 
+    # filter → 参与的原始 status 值；"all" 走 idx:date 全量分页
+    _MAIL_FILTERS = {
+        "todo": ("pending", "processing", "indexed", "failed"),  # 未完成
+        "done": ("done", "skipped"),                             # 已完成（含已跳过）
+    }
+
+    def list_mails(self, filter: str = "all", limit: int = 100, offset: int = 0) -> tuple[list[dict], int]:
+        """统一邮件列表：所有状态合并、按日期倒序、分页。返回 (items, total)。
+
+        filter: all=全部；todo=未完成(未处理/待入库/处理中/失败)；done=已完成(已入库/已跳过)。
+        items 为 mail:{id} 哈希（含 status/subject/from/date/source_type/attachment_count…）。
+        """
+        date_key = self._date_key()
+        if filter in self._MAIL_FILTERS:
+            idset: set[str] = set()
+            for s in self._MAIL_FILTERS[filter]:
+                idset |= set(self.r.smembers(self._status_key(s)))
+            scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
+            scored.sort(key=lambda x: x[1], reverse=True)  # 按日期倒序
+            total = len(scored)
+            page_ids = [mid for mid, _ in scored[offset:offset + limit]]
+        else:
+            total = self.r.zcard(date_key)
+            page_ids = self.r.zrevrange(date_key, offset, offset + limit - 1)
+
+        items: list[dict] = []
+        for mid in page_ids:
+            h = self.r.hgetall(self._k("mail", mid))
+            if not h:
+                continue
+            h["message_id"] = mid
+            items.append(h)
+        return items, total
+
     # ── 抓取进度 ──
 
     def get_fetch_progress(self, folder: str, year: int, month: int) -> dict | None:
-        key = self._k("progress", folder, str(year), str(month))
+        key = self._mbx_k("progress", folder, str(year), str(month))
         data = self.r.hgetall(key)
         if not data:
             return None
@@ -750,7 +781,7 @@ class MailCache:
     def update_fetch_progress(self, folder: str, year: int, month: int,
                                last_uid: str, fetched: int, processed: int,
                                completed: bool = False):
-        key = self._k("progress", folder, str(year), str(month))
+        key = self._mbx_k("progress", folder, str(year), str(month))
         self.r.hset(key, mapping={
             "last_uid": last_uid,
             "total_fetched": str(fetched),
@@ -793,7 +824,7 @@ class MailCache:
         if old:
             self._remove_indexes_for_state(pipe, message_id, old)
         if uid and folder:
-            pipe.srem(self._k("done_uids", folder), uid)
+            pipe.srem(self._mbx_k("done_uids", folder), uid)
         pipe.hset(key, mapping={
             "status": "pending", "error_msg": "",
             "updated_at": data["updated_at"],

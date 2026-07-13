@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config.settings import get_settings
+from src.backend.jobqueue import publish_event
 
 logger = logging.getLogger("pipeline")
 
@@ -68,18 +69,24 @@ class Pipeline:
                     log("未找到邮件")
                     return 0
 
-                # 去重：先剔除该 folder 下已入库的 UID，再取最新 limit 封，
-                # 保证每次都推进 backlog（否则最新 N 封若都已入库会永远捞不到老邮件）
+                # 去重：先剔除该 folder 下已入库的 UID
                 processed_uids = cache.get_processed_uids(folder)
                 uids = [u for u in uids if u not in processed_uids]
                 if not uids:
                     log("没有新邮件（均已入库）")
                     return 0
-                uids = uids[-limit:]
-                log(f"拉取 {len(uids)} 封邮件...")
+
+                # 按真实收信时间(INTERNALDATE)取最新 limit 封。不能用 uids[-limit:]：
+                # UID 未必与日期同序（如 QQ 老邮件也有很大的 UID，取 UID 尾部会捞到老邮件）。
+                # 每次取最新的未入库 N 封，同样能推进 backlog（最新的入库后下次自然轮到次新的）。
+                dates = client.fetch_internaldates(uids, folder=folder)
+                uids.sort(key=lambda u: dates.get(u, 0.0), reverse=True)
+                uids = uids[:limit]
+                log(f"拉取 {len(uids)} 封邮件（按收信时间取最新）...")
 
                 for uid, msg in client.fetch_batch(uids, folder=folder):
-                    parsed = self._store_fetched_mail(uid, msg, folder, cache, cleaner, attach_root)
+                    parsed = self._store_fetched_mail(uid, msg, folder, cache, cleaner,
+                                                      attach_root, on_log=log)
                     if parsed is not None:
                         queued += 1
                         log(f"  [{queued}] {parsed.subject[:50]}")
@@ -90,7 +97,8 @@ class Pipeline:
         return queued
 
     def _store_fetched_mail(self, uid, msg, folder, cache, cleaner, attach_root,
-                            forced_message_id: str = "", apply_noise_filter: bool = True):
+                            forced_message_id: str = "", apply_noise_filter: bool = True,
+                            skip_processed: bool = False, on_log=None):
         """解析 + 清洗 + 噪音过滤 + 暂存一封邮件。
 
         入队成功返回 parsed 对象；被去重/噪音跳过或失败返回 None。
@@ -99,8 +107,12 @@ class Pipeline:
         - forced_message_id: 文件邮件解析出的 msg 可能无 Message-ID，沿用扫描阶段
           合成的 id，保证「先扫表头、再解析」两段的 message_id 一致。
         - apply_noise_filter: 用户显式勾选解析的邮件不应被噪音过滤误跳过，可关掉。
+        - skip_processed: 跳过 is_processed 检查（reprocess 已 reset_email 清掉 done 键，
+          但以防万一，允许调用方显式强制重新入队）。
         """
         from src.backend.mail.parser import parse_email
+
+        log = on_log or (lambda m: None)
 
         parsed = None
         try:
@@ -113,7 +125,8 @@ class Pipeline:
                 parsed.message_id = forced_message_id
 
             # message_id 级兜底去重（UID 复用 / 跨 folder 同信时 UID 过滤会漏）
-            if cache.is_processed(parsed.message_id):
+            if not skip_processed and cache.is_processed(parsed.message_id):
+                log(f"  [跳过] {parsed.subject[:50]}（已处理）")
                 return None
 
             cleaned = cleaner.clean(parsed.body_text, parsed.body_html)
@@ -128,7 +141,22 @@ class Pipeline:
             if apply_noise_filter and self.cfg.enable_noise_filter and \
                     cleaner.is_noise_email(parsed.subject, parsed.from_addr, cleaned):
                 cache.mark_skipped(parsed.message_id, "噪音邮件")
+                log(f"  [跳过] {parsed.subject[:50]}（噪音邮件）")
+                try:
+                    publish_event("mail_processed", {
+                        "message_id": parsed.message_id,
+                        "subject": parsed.subject,
+                        "status": "skipped",
+                        "detail": "噪音邮件",
+                    })
+                except Exception:
+                    pass
                 return None
+
+            # 会话线程 id：取 References 链的根（最早的祖先），回退到直接父邮件，
+            # 再回退到自身 message_id（单封=独立线程）。供图谱线程上下文注入 + 前端分组。
+            thread_id = (parsed.references[0] if parsed.references
+                         else parsed.in_reply_to) or parsed.message_id
 
             cache.store_mail({
                 "message_id": parsed.message_id,
@@ -141,6 +169,9 @@ class Pipeline:
                 "cc_addrs": parsed.cc_addrs,
                 "date": parsed.date,
                 "timestamp": parsed.timestamp,
+                "in_reply_to": parsed.in_reply_to,
+                "references": parsed.references,
+                "thread_id": thread_id,
                 "cleaned_body": cleaned,
                 "attachments": [
                     {"filename": a["filename"], "path": a["path"],
@@ -148,17 +179,61 @@ class Pipeline:
                     for a in parsed.attachments
                 ],
             })
+            try:
+                publish_event("mail_processed", {
+                    "message_id": parsed.message_id,
+                    "subject": parsed.subject,
+                    "status": "indexed",
+                    "detail": "已入队，等待建图",
+                })
+            except Exception:
+                pass
             return parsed
         except Exception as e:
             logger.error(f"  UID {uid} 处理失败: {e}")
+            log(f"  [错误] UID {uid} 处理失败: {e}")
             # 已解析出 message_id 的落 failed 状态，避免永远卡在 processing
             if parsed is not None:
                 cache.mark_failed(parsed.message_id, str(e))
+                try:
+                    publish_event("mail_processed", {
+                        "message_id": parsed.message_id,
+                        "subject": parsed.subject if parsed.subject else "(无主题)",
+                        "status": "failed",
+                        "detail": str(e)[:200],
+                    })
+                except Exception:
+                    pass
             return None
 
     # ══════════════════════════════════════════════
     # 阶段二：Redis → LightRAG + Neo4j + Milvus
     # ══════════════════════════════════════════════
+
+    @staticmethod
+    def _with_thread_context(cache, mail: dict, body: str) -> str:
+        """回信邮件：在正文前注入会话线程上下文（父邮件主题/发件人/日期）。
+
+        目的：LightRAG 以实体为节点建图，本身不感知邮件线程。把"这封是对某封的回复"
+        写进喂给它的文本，抽取时就会把同一会话里反复出现的人/项目/主题在实体图上连起来。
+        非回信（无 In-Reply-To / References）原样返回。
+        """
+        if not body:
+            return body
+        in_reply_to = mail.get("in_reply_to") or ""
+        refs = mail.get("references") or []
+        if not in_reply_to and not refs:
+            return body
+        parent = cache.get_mail_state(in_reply_to) if in_reply_to else {}
+        lines = ["【邮件会话线程】本邮件是一封回信，与以下邮件同属一个会话："]
+        if parent:
+            who = parent.get("from_name") or parent.get("from_addr") or "未知发件人"
+            lines.append(
+                f"- 回复自 {who} 于 {parent.get('date', '')} 的邮件"
+                f"「{parent.get('subject', '')}」")
+        else:
+            lines.append(f"- 所属会话线程 ID：{mail.get('thread_id', '')}")
+        return "\n".join(lines) + "\n\n" + body
 
     def run_ingest(self, limit: int | None = None, on_log=None) -> dict:
         """邮件入 LightRAG 知识图谱（增量图+向量，Neo4j + Milvus）。附件 DeepDoc 解析。"""
@@ -193,6 +268,8 @@ class Pipeline:
 
                     # 1) 正文 → LightRAG（增量图+向量）
                     body = mail.get("cleaned_body") or ""
+                    # 回信邮件：正文前注入会话线程上下文，让同线程邮件的实体在图上连起来
+                    body = self._with_thread_context(cache, mail, body)
                     body_doc_id = ""
                     if body:
                         try:
@@ -237,6 +314,15 @@ class Pipeline:
                                         att_doc_ids=att_doc_ids, drop_body=True)
                     _cleanup_attachments(mail, only_paths=uploaded_paths)
                     stats["uploaded"] += 1
+                    try:
+                        publish_event("mail_processed", {
+                            "message_id": mid,
+                            "subject": mail.get("subject", ""),
+                            "status": "done",
+                            "detail": f"正文 + {stats['attachments']} 附件已入库",
+                        })
+                    except Exception:
+                        pass
                     if mail_att_failed:
                         log(f"  [{i}] ⚠ {subj}（正文已入库，{mail_att_failed} 个附件失败，已保留待重试）")
                     else:
@@ -245,6 +331,15 @@ class Pipeline:
                     stats["failed"] += 1
                     if mid:
                         cache.mark_ingest_failed(mid, str(e), drop_body=False)
+                    try:
+                        publish_event("mail_processed", {
+                            "message_id": mid,
+                            "subject": mail.get("subject", "(无主题)")[:50],
+                            "status": "failed",
+                            "detail": str(e)[:200],
+                        })
+                    except Exception:
+                        pass
                     logger.error(f"  [{i}] ✗ {subj}: {e}")
         finally:
             cache.close()
@@ -256,6 +351,95 @@ class Pipeline:
         done_msg += ")"
         log(done_msg)
         return stats
+
+    def run_ingest_one(self, message_id: str, on_log=None) -> dict:
+        """处理单封邮件入 LightRAG（一邮件一 job，worker 崩了只丢一封）。"""
+        from src.backend.knowledge.lightrag_wrapper import insert_mail
+        from src.backend.storage.redis_cache import MailCache
+
+        log = on_log or (lambda m: logger.info(m))
+        cache = MailCache(self.account_id)
+
+        try:
+            # 从队列里原子取出（SREM 防并发）
+            removed = cache.r.srem(cache._k("ingest_queue"), message_id)
+            if not removed:
+                log(f"邮件 {message_id} 不在 ingest 队列中")
+                return {"message_id": message_id, "status": "not_in_queue"}
+
+            mail = cache.get_mail(message_id)
+            if not mail:
+                cache.mark_ingest_failed(message_id, "正文已过期", drop_body=False)
+                log(f"邮件 {message_id[:16]}… 正文已过期，标记 failed")
+                return {"message_id": message_id, "status": "body_expired"}
+
+            subj = (mail.get("subject") or "(无主题)")[:50]
+            stats = {"message_id": message_id, "attachments": 0, "att_failed": 0, "status": "ok"}
+
+            # 1) 正文 → LightRAG
+            body = mail.get("cleaned_body") or ""
+            body = self._with_thread_context(cache, mail, body)
+            if body:
+                try:
+                    doc_id = insert_mail(body, message_id)
+                except Exception as e:
+                    cache.mark_ingest_failed(message_id, f"LightRAG body insert failed: {e}", drop_body=False)
+                    log(f"✗ {subj}: 正文入库失败")
+                    return {"message_id": message_id, "status": "failed", "error": str(e)[:200]}
+
+            # 2) 附件
+            uploaded_paths = []
+            att_doc_ids = []
+            for att in mail.get("attachments", []):
+                apath = att.get("path", "")
+                if apath and Path(apath).exists():
+                    att_text = _parse_attachment(apath, att.get("filename", ""))
+                    if att_text:
+                        att_doc_id = f"{message_id}:{att.get('filename', '')}"
+                        try:
+                            insert_mail(att_text, att_doc_id)
+                            att_doc_ids.append(att_doc_id)
+                            stats["attachments"] += 1
+                            uploaded_paths.append(apath)
+                        except Exception as e:
+                            stats["att_failed"] += 1
+                            logger.error("LightRAG attachment insert failed (%s): %s", att_doc_id, e)
+
+            # 3) 标记完成
+            cache.mark_ingested(message_id, doc_id=doc_id if body else "",
+                                att_doc_ids=att_doc_ids, drop_body=True)
+            _cleanup_attachments(mail, only_paths=uploaded_paths)
+            log(f"✓ {subj}" + (f"（{stats['att_failed']} 附件失败）" if stats["att_failed"] else ""))
+            try:
+                publish_event("mail_processed", {
+                    "message_id": message_id,
+                    "subject": mail.get("subject", ""),
+                    "status": "done",
+                    "detail": "正文已入库",
+                })
+            except Exception:
+                pass
+            return stats
+
+        except Exception as e:
+            if message_id:
+                try:
+                    cache.mark_ingest_failed(message_id, str(e), drop_body=False)
+                except Exception:
+                    pass
+                try:
+                    publish_event("mail_processed", {
+                        "message_id": message_id,
+                        "subject": "(未知)",
+                        "status": "failed",
+                        "detail": str(e)[:200],
+                    })
+                except Exception:
+                    pass
+            logger.error("run_ingest_one failed for %s: %s", message_id, e)
+            return {"message_id": message_id, "status": "failed", "error": str(e)[:200]}
+        finally:
+            cache.close()
 
     # ══════════════════════════════════════════════
     # 完整流程
@@ -356,6 +540,7 @@ class Pipeline:
                             parsed = self._store_fetched_mail(
                                 "", msg, folder, cache, cleaner, attach_root,
                                 forced_message_id=mid, apply_noise_filter=False,
+                                on_log=log,
                             )
                             if parsed is not None:
                                 queued += 1
@@ -371,10 +556,9 @@ class Pipeline:
         finally:
             cache.close()
 
-        log(f"已解析入队 {queued} 封，开始向量化 + GraphRAG 建图...")
-        stats = self.run_ingest(on_log=on_log)
-        stats["queued"] = queued
-        return stats
+        log(f"已解析入队 {queued} 封，待建图...")
+        # 只做「准备+入队」：建图由 worker 的 ingest 任务统一处理（见路由 prep_then_ingest_stream）
+        return {"queued": queued}
 
     # ══════════════════════════════════════════════
     # 强制重新处理（绕过幂等）
@@ -418,17 +602,17 @@ class Pipeline:
                     for folder, uids in by_folder.items():
                         for uid, msg in client.fetch_batch(uids, folder=folder):
                             if self._store_fetched_mail(uid, msg, folder,
-                                                        cache, cleaner, attach_root) is not None:
+                                                        cache, cleaner, attach_root,
+                                                        skip_processed=True,
+                                                        apply_noise_filter=False,
+                                                        on_log=log) is not None:
                                 requeued += 1
-            log(f"重新入队 {requeued} 封，开始重新建图...")
+            log(f"重新入队 {requeued} 封，待建图...")
         finally:
             cache.close()
 
-        # 3) 重新 ingest（走既有队列逻辑）
-        stats = self.run_ingest(on_log=on_log)
-        stats["reset"] = reset_n
-        stats["requeued"] = requeued
-        return stats
+        # 只做「准备+入队」：建图由 worker 的 ingest 任务统一处理（见路由 prep_then_ingest_stream）
+        return {"reset": reset_n, "requeued": requeued}
 
 
 def _safe(s: str) -> str:

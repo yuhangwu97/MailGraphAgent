@@ -85,6 +85,42 @@ const entitySummary = computed(() => {
   }
   return Object.entries(m).sort((a, b) => b[1] - a[1])
 })
+
+// Entities grouped by type for structured display
+const entitiesByType = computed(() => {
+  const groups: Record<string, any[]> = {}
+  for (const e of entities.value) {
+    const t = e.type || 'other'
+    if (!groups[t]) groups[t] = []
+    groups[t].push(e)
+  }
+  // Sort groups by entity count desc
+  return Object.entries(groups).sort((a, b) => b[1].length - a[1].length)
+})
+
+// Type metadata: emoji + label
+const TYPE_META: Record<string, { emoji: string; label: string }> = {
+  person: { emoji: '👤', label: '人员' },
+  organization: { emoji: '🏢', label: '组织' },
+  project: { emoji: '📋', label: '项目' },
+  task: { emoji: '✅', label: '任务' },
+  event: { emoji: '📅', label: '事件' },
+  document: { emoji: '📄', label: '文档' },
+  system: { emoji: '💻', label: '系统' },
+  location: { emoji: '📍', label: '地点' },
+}
+function typeEmoji(t: string): string { return TYPE_META[t]?.emoji || '🏷️' }
+function typeLabel(t: string): string { return TYPE_META[t]?.label || t }
+
+// Top relationships (source → type → target) for display
+const topRelationships = computed(() => {
+  return relationships.value.slice(0, 20).map(r => ({
+    source: r.source_id || '',
+    target: r.target_id || '',
+    type: (r.type || 'related').split(',')[0],
+    desc: (r.description || '').split('<SEP>')[0].slice(0, 60),
+  }))
+})
 </script>
 
 <template>
@@ -231,7 +267,7 @@ const entitySummary = computed(() => {
                       <div class="source-card-header">
                         <span class="source-rank">#{{ i + 1 }}</span>
                         <span class="source-doc">{{ g.doc_name }}</span>
-                        <span class="source-score" :class="scoreLevel(g.maxScore)">
+                        <span v-if="g.maxScore > 0" class="source-score" :class="scoreLevel(g.maxScore)">
                           {{ (g.maxScore * 100).toFixed(0) }}%
                         </span>
                       </div>
@@ -243,6 +279,7 @@ const entitySummary = computed(() => {
 
                   <!-- Graph sources -->
                   <div v-else-if="activeSourceTab === 'graph' && hasGraphData" key="graph" class="graph-source">
+                    <!-- Entity type distribution -->
                     <div v-if="entitySummary.length" class="graph-section">
                       <div class="section-label">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -250,29 +287,52 @@ const entitySummary = computed(() => {
                       </div>
                       <div class="stat-chips">
                         <span v-for="[type, count] in entitySummary" :key="type" class="stat-chip">
-                          {{ type }}
+                          <span class="chip-emoji-sm">{{ typeEmoji(type) }}</span>
+                          {{ typeLabel(type) }}
                           <span class="chip-count">{{ count }}</span>
                         </span>
                       </div>
                     </div>
-                    <div v-if="entities.length" class="graph-section">
+
+                    <!-- Entities grouped by type -->
+                    <div v-if="entitiesByType.length" class="graph-section">
                       <div class="section-label">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-                        关键实体
-                        <span class="panel-badge">{{ Math.min(entities.length, 30) }}/{{ entities.length }}</span>
+                        实体列表
+                        <span class="panel-badge">{{ entities.length }}</span>
                       </div>
-                      <div class="entity-grid">
-                        <span v-for="e in entities.slice(0, 30)" :key="e.id" class="entity-tag">
-                          <span class="entity-name">{{ e.name || e.id }}</span>
-                          <span class="entity-type">{{ e.type }}</span>
-                        </span>
+                      <div v-for="[type, ents] in entitiesByType" :key="type" class="entity-type-group">
+                        <div class="type-group-header">
+                          <span class="type-group-emoji">{{ typeEmoji(type) }}</span>
+                          <span class="type-group-label">{{ typeLabel(type) }}</span>
+                          <span class="type-group-count">{{ ents.length }}</span>
+                        </div>
+                        <div class="type-group-entities">
+                          <span v-for="e in ents.slice(0, 15)" :key="e.id" class="entity-tag" :title="(e.description || '').split('<SEP>')[0].slice(0, 200)">
+                            <span class="entity-name">{{ e.name || e.id }}</span>
+                          </span>
+                          <span v-if="ents.length > 15" class="entity-more">+{{ ents.length - 15 }} 更多</span>
+                        </div>
                       </div>
                     </div>
-                    <div v-if="relationships.length" class="graph-section">
+
+                    <!-- Relationships -->
+                    <div v-if="topRelationships.length" class="graph-section">
                       <div class="section-label">
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 9-14 9V3z"/></svg>
-                        关系
+                        关系列表
                         <span class="panel-badge">{{ relationships.length }} 条</span>
+                      </div>
+                      <div class="rel-list">
+                        <div v-for="(r, i) in topRelationships" :key="i" class="rel-item">
+                          <span class="rel-source">{{ r.source }}</span>
+                          <span class="rel-arrow">→</span>
+                          <span class="rel-type-badge">{{ r.type }}</span>
+                          <span class="rel-arrow">→</span>
+                          <span class="rel-target">{{ r.target }}</span>
+                          <span v-if="r.desc" class="rel-desc">{{ r.desc }}</span>
+                        </div>
+                        <div v-if="relationships.length > 20" class="entity-more">+{{ relationships.length - 20 }} 条更多关系</div>
                       </div>
                     </div>
                   </div>
@@ -994,38 +1054,126 @@ const entitySummary = computed(() => {
   color: var(--p);
   font-size: 0.68rem;
 }
-.entity-grid {
-  display: flex;
-  gap: 0.35rem;
-  flex-wrap: wrap;
+.chip-emoji-sm {
+  font-size: 0.75rem;
+  line-height: 1;
 }
+
+/* Entity type groups */
+.entity-type-group {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.type-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0.4rem 0.7rem;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+}
+.type-group-emoji { font-size: 0.85rem; line-height: 1; }
+.type-group-label { font-weight: 600; color: var(--t2); flex: 1; }
+.type-group-count {
+  font-size: 0.68rem;
+  color: var(--t4);
+  background: var(--surface);
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.type-group-entities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  padding: 0.5rem 0.7rem;
+}
+
+/* Entity tags */
 .entity-tag {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 0.8rem;
-  padding: 5px 10px;
-  background: var(--surface-2);
+  font-size: 0.76rem;
+  padding: 4px 9px;
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: 6px;
   color: var(--t2);
   transition: all 0.15s;
+  cursor: default;
 }
 .entity-tag:hover {
   border-color: var(--p);
   background: color-mix(in srgb, var(--p) 6%, transparent);
 }
 .entity-name { font-weight: 500; }
-.entity-type {
-  color: var(--t4);
+.entity-more {
   font-size: 0.72rem;
-  background: var(--surface);
-  padding: 1px 6px;
-  border-radius: 3px;
+  color: var(--t4);
+  padding: 2px 6px;
+  font-style: italic;
 }
 
-/* ── Graph relationship info ── */
-.rel-info { font-size: 0.72rem; color: var(--t4); }
+/* Relationship list */
+.rel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.rel-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  font-size: 0.73rem;
+  padding: 0.35rem 0.5rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  line-height: 1.5;
+}
+.rel-source, .rel-target {
+  font-weight: 550;
+  color: var(--t2);
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rel-arrow {
+  color: var(--t4);
+  font-size: 0.65rem;
+  flex-shrink: 0;
+}
+.rel-type-badge {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--p-text);
+  background: var(--p-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.rel-desc {
+  font-size: 0.68rem;
+  color: var(--t4);
+  margin-left: auto;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Old flat entity grid — deprecated, replaced by type-group */
+.entity-grid {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
 
 /* ── Transitions ── */
 .step-enter-active {

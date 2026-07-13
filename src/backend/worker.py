@@ -14,13 +14,11 @@ from src.backend.jobqueue import pop_job, publish_progress
 
 logger = logging.getLogger("mailgraph.worker")
 
-# 任务类型 → Pipeline 方法名；params 的键需与方法形参名一致（folder/limit/message_ids/paths）
+# worker 只消费 ingest：SPOP 领取 ingest_queue 里的邮件 → DeepDoc 解析 → 建图。
+# fetch/index/parse_selected/reprocess 都在 API 侧做「准备+入队」，不进 worker。
 _DISPATCH = {
-    "fetch": "run_fetch",
     "ingest": "run_ingest",
-    "reprocess": "reprocess",
-    "index": "run_index_files",
-    "parse_selected": "parse_selected",
+    "ingest_one": "run_ingest_one",
 }
 
 

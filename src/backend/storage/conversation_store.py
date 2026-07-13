@@ -1,7 +1,8 @@
 """
 Conversation and agent memory storage.
 
-Redis-backed, account-scoped:
+Redis-backed, globally shared (not account-scoped — unified with mail data and
+the knowledge graph):
 - sessions: metadata for each chat session
 - messages: ordered chat messages per session
 - memory: compact cross-turn user preferences/context
@@ -82,7 +83,8 @@ class ConversationStore:
             socket_connect_timeout=5,
         )
         self._account_id = account_id or "default"
-        self._prefix = f"mailgraph:{self._account_id}:conv:"
+        # 会话/记忆全局共享（与邮件数据、知识图谱一致，不再按账号隔离）
+        self._prefix = "mailgraph:conv:"
 
     @property
     def r(self) -> redis.Redis:
@@ -150,7 +152,7 @@ class ConversationStore:
             "result": result or {},
             "created_at": now,
         }
-        self.r.rpush(self._k("messages", session_id), json.dumps(msg, ensure_ascii=False))
+        self.r.rpush(self._k("messages", session_id), json.dumps(msg, ensure_ascii=False, default=str))
         self.touch_session(session_id)
         self.r.hincrby(self._k("session", session_id), "message_count", 1)
         if role == "user":

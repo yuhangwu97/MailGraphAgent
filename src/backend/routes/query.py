@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -15,6 +16,17 @@ from src.backend.schemas import QueryRequest
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["query"])
+
+
+def _sanitize_json(obj):
+    """Recursively replace NaN/Infinity float values with None (→ null in JSON)."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 
 @router.post("/query")
@@ -63,7 +75,16 @@ async def run_query(
         def _run():
             try:
                 _emit("progress", {"msg": "🔍 正在分析问题…"})
-                result = engine.query(body.question, context=context)
+
+                def _on_progress(msg):
+                    # dict → passthrough (token streaming); str → wrap as progress msg
+                    if isinstance(msg, dict):
+                        _emit("progress", msg)
+                    else:
+                        _emit("progress", {"msg": str(msg)})
+
+                result = engine.query(body.question, context=context,
+                                      progress_cb=_on_progress)
 
                 # Emit query plan as a progress step
                 plan = result.get("query_plan")
@@ -83,38 +104,8 @@ async def run_query(
                         msg += f"：{detail}"
                     _emit("progress", {"msg": msg})
 
-                # Stream tokens one by one (supports CJK + Latin text)
-                answer = result.get("answer") or "未找到相关信息。"
-                import re, time
-
-                # Split: CJK chars individually, Latin words as groups, whitespace preserved
-                tokens = []
-                i = 0
-                while i < len(answer):
-                    ch = answer[i]
-                    if ch in ' \t\n\r':
-                        tokens.append(ch)
-                        i += 1
-                    elif '一' <= ch <= '鿿' or '　' <= ch <= '〿' or '＀' <= ch <= '￯':
-                        # CJK character — emit individually for visible streaming
-                        tokens.append(ch)
-                        i += 1
-                    else:
-                        # Latin/numbers/punctuation — group until next CJK or whitespace
-                        j = i
-                        while j < len(answer):
-                            cj = answer[j]
-                            if cj in ' \t\n\r' or '一' <= cj <= '鿿' or '　' <= cj <= '〿' or '＀' <= cj <= '￯':
-                                break
-                            j += 1
-                        tokens.append(answer[i:j])
-                        i = j
-
-                for tok in tokens:
-                    _emit("progress", {"token": tok})
-                    time.sleep(0.025)
-
-                # Send structured result (includes chunks → source references)
+                # Tokens are streamed live by the query engine via _on_progress.
+                # Send structured result (includes chunks → source references).
                 _emit("result", result)
             except Exception as exc:
                 logger.exception("Query failed")
@@ -137,7 +128,9 @@ async def run_query(
                 break
             event_type = item.get("event", "progress")
             data = item.get("data", item)
-            yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+            # Sanitize float values to ensure valid JSON (no NaN/Infinity)
+            safe = _sanitize_json(data)
+            yield f"event: {event_type}\ndata: {json.dumps(safe, ensure_ascii=False, default=str)}\n\n"
 
         await task
 

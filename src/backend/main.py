@@ -50,6 +50,15 @@ def log_error(msg: str):
 # ════════════════════════════════════════════════════════════════════
 
 
+def _enqueue(job_type: str, account: Optional[str], params: dict) -> None:
+    """把任务入队给 worker 处理（统一走 Redis 队列，与前端触发一致）。"""
+    from src.backend.jobqueue import enqueue_job
+    account_id = Pipeline(account).account_id
+    job_id = enqueue_job(job_type, account_id, params)
+    log_success(f"已提交 {job_type} 任务给 worker（job {job_id[:8]}）。"
+                f"确保 worker 在运行： python -m src.backend.worker")
+
+
 @app.command("fetch")
 def fetch_emails(
     limit: int = typer.Option(100, help="拉取邮件数量上限"),
@@ -57,7 +66,7 @@ def fetch_emails(
     since: Optional[str] = typer.Option(None, help="只拉取该日期之后 (YYYY-MM-DD)"),
     account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
 ):
-    """拉取邮箱邮件，清洗后暂存到 Redis（待 ingest）"""
+    """拉取邮箱邮件，清洗后暂存到 Redis（待 ingest）。IMAP 属 IO 型，直接在本进程跑。"""
     log_section("📧 邮件拉取")
     try:
         n = Pipeline(account).run_fetch(folder=folder, limit=limit, since=since,
@@ -78,14 +87,18 @@ def fetch_emails(
 def ingest_emails(
     limit: Optional[int] = typer.Option(None, help="限制本次导入数量"),
     account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
+    local: bool = typer.Option(False, "--local", help="离线直跑：在本进程执行，不入队给 worker"),
 ):
     """把暂存的邮件（原文 + 附件）导入 LightRAG，增量跨文档建图"""
     log_section("📚 知识图谱导入 (LightRAG)")
     try:
-        stats = Pipeline(account).run_ingest(limit=limit,
-                                             on_log=lambda m: console.print(f"  {m}"))
-        log_success(f"导入完成：{stats['uploaded']}/{stats['total']} 封"
-                    f"（附件 {stats['attachments']}，失败 {stats['failed']}）")
+        if local:
+            stats = Pipeline(account).run_ingest(limit=limit,
+                                                 on_log=lambda m: console.print(f"  {m}"))
+            log_success(f"导入完成：{stats['uploaded']}/{stats['total']} 封"
+                        f"（附件 {stats['attachments']}，失败 {stats['failed']}）")
+        else:
+            _enqueue("ingest", account, {"limit": limit})
     except Exception as e:
         logger.error("知识图谱导入失败: %s", e, exc_info=True)
         log_error(f"导入失败: {e}")
@@ -104,12 +117,22 @@ def full_pipeline(
     since: Optional[str] = typer.Option(None, help="只处理该日期之后 (YYYY-MM-DD)"),
     skip_fetch: bool = typer.Option(False, help="跳过拉取，直接 ingest 队列"),
     account: Optional[str] = typer.Option(None, help="账号 id，缺省用默认账号"),
+    local: bool = typer.Option(False, "--local", help="离线直跑：在本进程执行，不入队给 worker"),
 ):
     """完整流程：拉取 → 清洗 → GraphRAG 建图"""
     log_section("🚀 完整流程")
     try:
-        pipe = Pipeline(account)
         emit = lambda m: console.print(f"  {m}")
+        if not local:
+            # fetch(IMAP IO) 在本进程直接跑；ingest(解析/建图) 入队给 worker
+            pipe = Pipeline(account)
+            if not skip_fetch:
+                pipe.run_fetch(folder=folder, limit=limit, since=since, on_log=emit)
+            _enqueue("ingest", account, {"limit": limit})
+            log_success("fetch 已本地完成，ingest 已提交给 worker（确保 worker 在运行）")
+            return
+
+        pipe = Pipeline(account)
         if not skip_fetch:
             pipe.run_fetch(folder=folder, limit=limit, since=since, on_log=emit)
         stats = pipe.run_ingest(on_log=emit)
