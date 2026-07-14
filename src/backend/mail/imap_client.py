@@ -288,6 +288,52 @@ class IMAPClient:
             result[m.group(1).decode()] = time.mktime(t)
         return result
 
+    def fetch_headers(
+        self,
+        uids: list[str],
+        folder: str = "INBOX",
+    ) -> dict[str, dict]:
+        """Header-only fetch: returns {uid: {subject, from_addr, from_name, date, message_id, ...}}.
+
+        Uses BODY.PEEK[HEADER.FIELDS] to fetch only envelope-level headers,
+        not the full email body. Used by run_scan for quick mailbox discovery.
+        """
+        if not uids:
+            return {}
+        conn = self.connect()
+        conn.select(folder, readonly=True)
+
+        uid_arg = ",".join(str(u) for u in uids)
+        fields = "(SUBJECT FROM DATE MESSAGE-ID IN-REPLY-TO REFERENCES)"
+        status, data = conn.uid("FETCH", uid_arg,
+                                f"(FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS {fields}])")
+        result: dict[str, dict] = {}
+        if status != "OK" or not data:
+            logger.warning(f"Header FETCH failed (status={status})")
+            return result
+
+        for item in data:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            envelope, header_bytes = item[0], item[1]
+            m = re.search(rb"UID (\d+)", envelope or b"")
+            if not m:
+                continue
+            uid = m.group(1).decode()
+            try:
+                msg = email.message_from_bytes(header_bytes, policy=email.policy.default)
+                result[uid] = {
+                    "subject": str(msg.get("subject", "")),
+                    "from_addr": str(msg.get("from", "")),
+                    "date": str(msg.get("date", "")),
+                    "message_id": str(msg.get("message-id", "")).strip("<>"),
+                    "in_reply_to": str(msg.get("in-reply-to", "")),
+                    "references": str(msg.get("references", "")),
+                }
+            except Exception as e:
+                logger.error(f"UID {uid}: header parse failed - {e}")
+        return result
+
     def fetch_batch(
         self,
         uids: list[str],

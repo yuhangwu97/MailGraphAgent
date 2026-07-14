@@ -521,6 +521,99 @@ class Pipeline:
             f"新增待解析 {stats['indexed']}")
         return stats
 
+    def run_scan(self, source: str, params: dict | None = None, on_log=None) -> dict:
+        """统一扫描入口：IMAP 拉表头 / 文件扫表头 → indexed 清单。
+
+        source="imap": 用 fetch_headers 只拉 ENVELOPE 级元数据，不下载正文。
+        source="file":  复用 run_index_files 扫 .eml/.msg/.pst/.ost。
+
+        产出 indexed 邮件后，用户从清单勾选 → parse_selected → worker 建图。
+        """
+        log = on_log or (lambda m: logger.info(m))
+        params = params or {}
+
+        if source == "imap":
+            return self._run_scan_imap(params, log)
+        elif source == "file":
+            paths = params.get("paths", [])
+            return self.run_index_files(paths, on_log=on_log)
+        else:
+            log(f"未知来源类型: {source}")
+            return {"source": source, "scanned": 0, "indexed": 0}
+
+    def _run_scan_imap(self, params: dict, log) -> dict:
+        """IMAP header-only scan: 拉 ENVELOPE → store_indexed。"""
+        from src.backend.mail.imap_client import IMAPClient
+        from src.backend.storage.redis_cache import MailCache
+
+        folder = params.get("folder", "INBOX")
+        limit = params.get("limit")
+        since = params.get("since")
+        before = params.get("before")
+
+        if not self.account:
+            log("未配置邮箱账号")
+            return {"source": "imap", "scanned": 0, "indexed": 0}
+
+        client = IMAPClient(self.account)
+        cache = MailCache(self.account_id)
+        stats = {"source": "imap", "folder": folder, "scanned": 0, "indexed": 0}
+
+        try:
+            # 获取文件夹总量
+            client.select_folder(folder)
+            # 搜索 UID 范围
+            uids = client.search_uids(folder, since=since, before=before)
+            if limit:
+                uids = uids[-limit:]  # 取最新的 N 封
+
+            if not uids:
+                log(f"IMAP {folder}: 没有匹配的邮件")
+                return stats
+
+            log(f"IMAP {folder}: 扫描 {len(uids)} 封邮件的表头...")
+            stats["total"] = len(uids)
+
+            # 批量拉表头（每批 100）
+            batch_size = 100
+            indexed_uids = []
+            for i in range(0, len(uids), batch_size):
+                chunk = uids[i:i + batch_size]
+                headers = client.fetch_headers(chunk, folder)
+                for uid in chunk:
+                    hdr = headers.get(str(uid))
+                    if not hdr:
+                        continue
+                    stats["scanned"] += 1
+                    rec = {
+                        "subject": hdr.get("subject", ""),
+                        "from_addr": hdr.get("from_addr", ""),
+                        "from_name": "",
+                        "date": hdr.get("date", ""),
+                        "message_id": hdr.get("message_id", f"imap:{uid}"),
+                        "folder": folder,
+                        "uid": uid,
+                        "source_type": "imap",
+                        "source_locator": {
+                            "source_type": "imap",
+                            "folder": folder,
+                            "uid": uid,
+                            "account_id": self.account_id,
+                        },
+                    }
+                    if cache.store_indexed(rec):
+                        stats["indexed"] += 1
+                        indexed_uids.append(uid)
+                if stats["scanned"] % 200 == 0 or (i + batch_size >= len(uids)):
+                    log(f"  已扫描 {stats['scanned']}/{stats['total']}，入库 {stats['indexed']}")
+
+        finally:
+            client.disconnect()
+            cache.close()
+
+        log(f"IMAP 扫描完成：{stats['indexed']}/{stats['total']} 封新邮件入库")
+        return stats
+
     def parse_selected(self, message_ids: list[str], on_log=None) -> dict:
         """Step 2：对选中的 indexed 邮件回原文件读正文（含附件），清洗入队后 ingest 向量化。
 
