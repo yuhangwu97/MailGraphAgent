@@ -121,3 +121,25 @@ def mark_terminal(job_id: str, status: str, summary: str = "",
         "updated_at": time.time(),
         "heartbeat_at": time.time(),
     })
+
+
+def find_stale_running(stale_seconds: float = 60, limit: int = 500, client=None) -> list[dict]:
+    r = _client(client)
+    cutoff = time.time() - stale_seconds
+    out = []
+    for jid in r.zrevrange(JOBS_INDEX, 0, limit - 1):
+        data = r.hgetall(_job_key(jid))
+        if not data or data.get("status") != "running":
+            continue
+        try:
+            hb = float(data.get("heartbeat_at", 0))
+        except (TypeError, ValueError):
+            hb = 0
+        if hb < cutoff:
+            out.append(data)
+    return out
+
+
+def items(job_id: str, client=None) -> set[str]:
+    r = _client(client)
+    return set(r.smembers(_items_key(job_id)))

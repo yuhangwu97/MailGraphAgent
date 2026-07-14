@@ -111,3 +111,18 @@ def test_list_jobs_newest_first_and_mark_terminal():
 
     running = [j["job_id"] for j in jobstore.list_jobs(status="running", client=r)]
     assert a not in running
+
+
+def test_find_stale_running_jobs():
+    r = FakeRedis()
+    fresh = jobstore.create_job("parse", client=r)
+    jobstore.set_stage(fresh, "build-graph", client=r)  # status=running, heartbeat now
+
+    stale = jobstore.create_job("parse", client=r)
+    jobstore.set_stage(stale, "build-graph", client=r)
+    # force an old heartbeat
+    r.hset(jobstore._job_key(stale), mapping={"heartbeat_at": time.time() - 999})
+
+    stale_ids = [j["job_id"] for j in jobstore.find_stale_running(stale_seconds=60, client=r)]
+    assert stale in stale_ids
+    assert fresh not in stale_ids
