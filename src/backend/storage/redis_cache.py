@@ -580,6 +580,25 @@ class MailCache:
         if message_id:
             self.r.zrem(self._k("inflight"), message_id)
 
+    def reap_inflight(self, stale_seconds: float = 60) -> list[str]:
+        """Re-queue in-flight mails whose claim is older than stale_seconds.
+
+        A crash between claim_pending_mail_tracked and release_inflight leaves a
+        mail out of the queue and stuck at 'processing'. This puts it back in
+        ingest_queue, resets its status to 'pending', and clears the in-flight entry.
+        Returns the requeued message_ids.
+        """
+        import time as _t
+        cutoff = _t.time() - stale_seconds
+        key = self._k("inflight")
+        stale = self.r.zrangebyscore(key, "-inf", cutoff)
+        for mid in stale:
+            self.r.sadd(self._k("ingest_queue"), mid)
+            self.r.zrem(key, mid)
+            if self.r.hgetall(self._k("mail", mid)):
+                self.r.hset(self._k("mail", mid), mapping={"status": "pending"})
+        return list(stale)
+
     def requeue_pending(self, message_id: str) -> None:
         """把已领取但处理中断的邮件放回队列，供后续重试。"""
         if message_id:

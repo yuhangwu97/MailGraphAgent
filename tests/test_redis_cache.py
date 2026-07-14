@@ -235,3 +235,20 @@ def test_claim_tracked_adds_inflight_and_release_removes():
     cache.release_inflight("m1")
     inflight = cache._r.zrangebyscore(cache._k("inflight"), "-inf", "+inf")
     assert "m1" not in inflight
+
+
+def test_reap_inflight_requeues_stale_and_resets_status():
+    import time as _t
+    cache = _make_cache()
+    cache.store_mail({"message_id": "m1", "cleaned_body": "hi", "attachments": []})
+    cache.claim_pending_mail_tracked()          # m1 now in-flight, out of queue
+    # mark it processing (as the worker would)
+    cache._r.hset(cache._k("mail", "m1"), mapping={"status": "processing"})
+    # force stale claim time
+    cache._r.zadd(cache._k("inflight"), {"m1": _t.time() - 999})
+
+    requeued = cache.reap_inflight(stale_seconds=60)
+    assert requeued == ["m1"]
+    assert "m1" in cache._r.smembers(cache._k("ingest_queue"))
+    assert "m1" not in cache._r.zrangebyscore(cache._k("inflight"), "-inf", "+inf")
+    assert cache._r.hgetall(cache._k("mail", "m1")).get("status") == "pending"
