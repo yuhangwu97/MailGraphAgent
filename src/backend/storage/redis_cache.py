@@ -557,6 +557,29 @@ class MailCache:
                 continue  # 正文已过期，已被 SPOP 移除，继续取下一封
             return mail
 
+    def claim_pending_mail_tracked(self) -> dict | None:
+        """SPOP a pending mail AND record it in the in-flight zset (score=claimed_at).
+
+        Recoverable variant of claim_pending_mail: if the worker crashes before
+        release_inflight, the reaper can find and requeue it. Expired bodies are
+        skipped (already SPOP'd out) without touching in-flight.
+        """
+        import time as _t
+        while True:
+            mid = self.r.spop(self._k("ingest_queue"))
+            if not mid:
+                return None
+            mail = self.get_mail(mid)
+            if mail is None:
+                continue
+            self.r.zadd(self._k("inflight"), {mid: _t.time()})
+            return mail
+
+    def release_inflight(self, message_id: str) -> None:
+        """Remove a mail from the in-flight zset once graph-build finished."""
+        if message_id:
+            self.r.zrem(self._k("inflight"), message_id)
+
     def requeue_pending(self, message_id: str) -> None:
         """把已领取但处理中断的邮件放回队列，供后续重试。"""
         if message_id:
