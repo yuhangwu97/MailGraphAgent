@@ -30,14 +30,15 @@ const filterChips = computed(() => {
   ]
 })
 
-// Status metadata
+// Status metadata — 设计文档 §3.5 状态词表
 const STATUS_META: Record<string, { label: string; dot: string; cls: string }> = {
-  indexed:   { label: '未处理', dot: '⚪', cls: 'st-pending' },
-  pending:   { label: '待导入', dot: '🟡', cls: 'st-pending' },
+  indexed:   { label: '待入库', dot: '⚪', cls: 'st-pending' },
+  pending:   { label: '待重拉', dot: '🟡', cls: 'st-pending' },
   processing:{ label: '处理中', dot: '🔵', cls: 'st-processing' },
-  done:      { label: '已入库', dot: '🟢', cls: 'st-done' },
-  failed:    { label: '失败',   dot: '🔴', cls: 'st-failed' },
-  skipped:   { label: '已完成', dot: '⏭️', cls: 'st-skipped' },
+  done:      { label: '已建图', dot: '🟢', cls: 'st-done' },
+  failed:    { label: '失败·可重试', dot: '🔴', cls: 'st-failed' },
+  skipped:   { label: '已跳过·噪音', dot: '⏭️', cls: 'st-skipped' },
+  degraded:  { label: '部分降级', dot: '🟠', cls: 'st-degraded' },
 }
 
 function statusMeta(s: string) {

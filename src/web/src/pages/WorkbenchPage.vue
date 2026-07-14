@@ -6,6 +6,7 @@ import TopBar from '@/components/workbench/TopBar.vue'
 import MailList from '@/components/workbench/MailList.vue'
 import ActivityPanel from '@/components/workbench/ActivityPanel.vue'
 import ImportDrawer from '@/components/workbench/ImportDrawer.vue'
+import JobCenter from '@/components/workbench/JobCenter.vue'
 import type { ActivityEvent } from '@/components/workbench/ActivityPanel.vue'
 
 const statusStore = useStatusStore()
@@ -394,15 +395,17 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- Side: activity panel -->
+      <!-- Side: activity panel + job center -->
       <Transition name="panel-slide">
-        <ActivityPanel
-          v-if="sidePanelVisible"
-          :activities="activities"
-          :kpi="kpi"
-          :graph-status="gstatus"
-          :services="services"
-        />
+        <div v-if="sidePanelVisible" class="wb-side">
+          <JobCenter />
+          <ActivityPanel
+            :activities="activities"
+            :kpi="kpi"
+            :graph-status="gstatus"
+            :services="services"
+          />
+        </div>
       </Transition>
     </div>
 
@@ -492,6 +495,15 @@ onUnmounted(() => {
 
 .wb-refresh-btn {
   margin-left: auto;
+}
+
+.wb-side {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 320px;
+  flex-shrink: 0;
+  overflow-y: auto;
 }
 
 .wb-toggle-panel {
