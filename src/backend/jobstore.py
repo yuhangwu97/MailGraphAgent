@@ -93,3 +93,31 @@ def update(job_id: str, client=None, **fields) -> None:
     if fields:
         r.hset(_job_key(job_id), mapping=fields)
     _touch(r, job_id)
+
+
+def list_jobs(status: str | None = None, limit: int = 50, client=None) -> list[dict]:
+    r = _client(client)
+    job_ids = r.zrevrange(JOBS_INDEX, 0, limit - 1)
+    out = []
+    for jid in job_ids:
+        data = r.hgetall(_job_key(jid))
+        if not data:
+            continue
+        if status and data.get("status") != status:
+            continue
+        out.append(data)
+    return out
+
+
+def mark_terminal(job_id: str, status: str, summary: str = "",
+                  error: str = "", client=None) -> None:
+    if status not in _TERMINAL:
+        raise ValueError(f"not a terminal status: {status}")
+    r = _client(client)
+    r.hset(_job_key(job_id), mapping={
+        "status": status,
+        "summary": summary,
+        "error": error,
+        "updated_at": time.time(),
+        "heartbeat_at": time.time(),
+    })

@@ -94,3 +94,20 @@ def test_progress_and_stage_and_heartbeat():
     assert int(float(job["done"])) == 2
     assert int(float(job["att_failed"])) == 1
     assert float(job["heartbeat_at"]) > before
+
+
+def test_list_jobs_newest_first_and_mark_terminal():
+    r = FakeRedis()
+    a = jobstore.create_job("scan", client=r)
+    time.sleep(0.01)
+    b = jobstore.create_job("parse", client=r)
+    ids = [j["job_id"] for j in jobstore.list_jobs(client=r)]
+    assert ids[:2] == [b, a]  # newest first
+
+    jobstore.mark_terminal(a, "completed", summary="done 5/5", client=r)
+    job = jobstore.get_job(a, client=r)
+    assert job["status"] == "completed"
+    assert job["summary"] == "done 5/5"
+
+    running = [j["job_id"] for j in jobstore.list_jobs(status="running", client=r)]
+    assert a not in running
