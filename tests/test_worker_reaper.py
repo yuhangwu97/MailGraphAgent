@@ -41,3 +41,34 @@ def test_reaper_marks_interrupted_and_requeues():
     assert jobstore.get_job(job_id, client=r)["status"] == "interrupted"
     assert calls["reaped"] == [60]
     assert n == 1  # one job interrupted
+
+
+def test_crash_then_recover_full_loop():
+    import time
+    from src.backend import jobstore, worker
+    from tests.test_jobstore import FakeRedis
+    from tests.test_redis_cache import _make_cache
+
+    jclient = FakeRedis()
+    cache = _make_cache()
+
+    # a job is running, building graph
+    job_id = jobstore.create_job("parse", client=jclient)
+    jobstore.set_stage(job_id, "build-graph", client=jclient)
+
+    # a mail is claimed but the worker "crashes" before release
+    cache.store_mail({"message_id": "m1", "cleaned_body": "x", "attachments": []})
+    cache.claim_pending_mail_tracked()
+    cache._r.hset(cache._k("mail", "m1"), mapping={"status": "processing"})
+
+    # simulate stale timestamps (crash)
+    cache._r.zadd(cache._k("inflight"), {"m1": time.time() - 999})
+    jclient.hset(jobstore._job_key(job_id), mapping={"heartbeat_at": time.time() - 999})
+
+    # reaper runs
+    worker._reap(client=jclient, cache_factory=lambda: cache, stale_seconds=60)
+
+    # mail is claimable again and job is interrupted
+    assert "m1" in cache._r.smembers(cache._k("ingest_queue"))
+    assert cache.claim_pending_mail_tracked()["message_id"] == "m1"
+    assert jobstore.get_job(job_id, client=jclient)["status"] == "interrupted"
