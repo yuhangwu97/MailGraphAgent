@@ -257,7 +257,7 @@ class Pipeline:
             while True:
                 if limit and i >= limit:
                     break
-                mail = cache.claim_pending_mail()   # 原子领取：多 worker 不会拿到同一封
+                mail = cache.claim_pending_mail_tracked()   # 原子领取+inflight 追踪
                 if mail is None:
                     break                            # 队列已被各 worker 取空
                 i += 1
@@ -290,9 +290,18 @@ class Pipeline:
                     mail_att_failed = 0
                     for att in mail.get("attachments", []):
                         apath = att.get("path", "")
+                        att_fn = att.get("filename", "")
                         if apath and Path(apath).exists():
-                            att_text = _parse_attachment(apath, att.get("filename", ""))
+                            cache.set_attachment_status(mid, att_fn, "parsing")
+                            att_text, degrade = _parse_attachment(apath, att_fn)
                             if att_text:
+                                if degrade:
+                                    cache.set_attachment_status(
+                                        mid, att_fn, "degraded", degrade)
+                                    logger.warning(
+                                        "附件解析降级 %s/%s: %s", mid, att_fn, degrade)
+                                else:
+                                    cache.set_attachment_status(mid, att_fn, "parsed")
                                 att_doc_id = f"{mid}:{att.get('filename', '')}"
                                 try:
                                     insert_mail(att_text, att_doc_id)
@@ -301,13 +310,18 @@ class Pipeline:
                                     # 仅成功入库的附件才允许清理源文件
                                     uploaded_paths.append(apath)
                                 except Exception as e:
-                                    # 附件失败不阻断正文入库，但必须计入失败、保留源文件供重试、显性上报，
-                                    # 绝不能像旧逻辑那样静默 warning 后仍按成功计数。
                                     mail_att_failed += 1
                                     stats["att_failed"] += 1
+                                    cache.set_attachment_status(
+                                        mid, att_fn, "failed", str(e)[:100])
                                     logger.error(
                                         "LightRAG attachment insert failed (%s): %s", att_doc_id, e)
-                                    log(f"  [{i}] ⚠ 附件入库失败：{att.get('filename', '')}")
+                                    log(f"  [{i}] ⚠ 附件入库失败：{att_fn}")
+                            else:
+                                mail_att_failed += 1
+                                stats["att_failed"] += 1
+                                cache.set_attachment_status(
+                                    mid, att_fn, "failed", degrade or "no_text")
 
                     # 正文（及成功的附件）已入库，记录 doc_id → message_id 供证据归属
                     cache.mark_ingested(mid, doc_id=body_doc_id,
@@ -392,10 +406,17 @@ class Pipeline:
             att_doc_ids = []
             for att in mail.get("attachments", []):
                 apath = att.get("path", "")
+                att_fn = att.get("filename", "")
                 if apath and Path(apath).exists():
-                    att_text = _parse_attachment(apath, att.get("filename", ""))
+                    cache.set_attachment_status(message_id, att_fn, "parsing")
+                    att_text, degrade = _parse_attachment(apath, att_fn)
                     if att_text:
-                        att_doc_id = f"{message_id}:{att.get('filename', '')}"
+                        if degrade:
+                            cache.set_attachment_status(
+                                message_id, att_fn, "degraded", degrade)
+                        else:
+                            cache.set_attachment_status(message_id, att_fn, "parsed")
+                        att_doc_id = f"{message_id}:{att_fn}"
                         try:
                             insert_mail(att_text, att_doc_id)
                             att_doc_ids.append(att_doc_id)
@@ -403,7 +424,13 @@ class Pipeline:
                             uploaded_paths.append(apath)
                         except Exception as e:
                             stats["att_failed"] += 1
+                            cache.set_attachment_status(
+                                message_id, att_fn, "failed", str(e)[:100])
                             logger.error("LightRAG attachment insert failed (%s): %s", att_doc_id, e)
+                    else:
+                        stats["att_failed"] += 1
+                        cache.set_attachment_status(
+                            message_id, att_fn, "failed", degrade or "no_text")
 
             # 3) 标记完成
             cache.mark_ingested(message_id, doc_id=doc_id if body else "",
@@ -620,43 +647,79 @@ def _safe(s: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", str(s))[:32]
 
 
-def _parse_attachment(filepath: str, filename: str) -> str:
-    """解析附件文本：优先 DeepDoc，回落 pypdf/docx。"""
+def _parse_attachment(filepath: str, filename: str,
+                     timeout: float | None = None,
+                     on_status=None) -> tuple[str, str]:
+    """解析附件文本：优先 DeepDoc，回落 pypdf/docx。
+
+    Returns (text, degrade_reason):
+      - degrade_reason="" → 满血 DeepDoc 解析
+      - degrade_reason="deepdoc_model_missing" → DeepDoc 模型缺失，已回落
+      - degrade_reason="deepdoc_error" → DeepDoc 异常，已回落
+      - degrade_reason="fallback" → 无 DeepDoc 支持此格式，直接回落
+    """
+    import signal
     ext = Path(filepath).suffix.lower()
+    degrade = ""
+
+    def _deepdoc_pdf():
+        from src.backend.knowledge.plugins.parser.pdf_parser import RAGFlowPdfParser
+        parser = RAGFlowPdfParser()
+        text_blocks, _ = parser(filepath, need_image=False, zoomin=3, return_html=False)
+        text = "\n".join(parser.remove_tag(t) for t in (text_blocks or []))
+        return text.strip()
+
+    def _deepdoc_docx():
+        from src.backend.knowledge.plugins.parser.docx_parser import DocxParser
+        parser = DocxParser()
+        text_blocks, _ = parser(filepath)
+        text = "\n".join(b if isinstance(b, str) else str(b) for b in (text_blocks or []))
+        return text.strip()
 
     # 尝试 DeepDoc（PDF: 布局+OCR+表格）
     if ext == ".pdf":
         try:
-            from src.backend.knowledge.plugins.parser.pdf_parser import RAGFlowPdfParser
-            parser = RAGFlowPdfParser()
-            text_blocks, _ = parser(filepath, need_image=False, zoomin=3, return_html=False)
-            text = "\n".join(parser.remove_tag(t) for t in (text_blocks or []))
-            if text.strip():
-                return text[:20000]
+            text = _deepdoc_pdf()
+            if text:
+                return text[:20000], ""
+        except FileNotFoundError as e:
+            # onnx 模型缺失（LFS 132 字节指针占位符）→ 显式标 degraded
+            degrade = "deepdoc_model_missing"
+            logger.warning("DeepDoc PDF model missing, degraded fallback for %s: %s", filename, e)
         except Exception as e:
-            logger.debug("DeepDoc PDF failed, fallback: %s", e)
+            degrade = "deepdoc_error"
+            logger.warning("DeepDoc PDF failed, degraded fallback for %s: %s", filename, e)
 
     if ext in (".docx", ".doc"):
         try:
-            from src.backend.knowledge.plugins.parser.docx_parser import DocxParser
-            parser = DocxParser()
-            text_blocks, _ = parser(filepath)
-            text = "\n".join(b if isinstance(b, str) else str(b) for b in (text_blocks or []))
-            if text.strip():
-                return text[:20000]
+            text = _deepdoc_docx()
+            if text:
+                return text[:20000], ""
+        except FileNotFoundError as e:
+            degrade = "deepdoc_model_missing"
+            logger.warning("DeepDoc Docx model missing, degraded fallback for %s: %s", filename, e)
         except Exception as e:
-            logger.debug("DeepDoc Docx failed, fallback: %s", e)
+            degrade = "deepdoc_error"
+            logger.warning("DeepDoc Docx failed, degraded fallback for %s: %s", filename, e)
+
+    if not degrade and ext in (".pdf", ".docx", ".doc"):
+        degrade = "fallback"
+
+    if on_status:
+        on_status("parsing")
 
     # 回落简单解析
     try:
         if ext == ".pdf":
             from pypdf import PdfReader
             reader = PdfReader(filepath)
-            return "\n".join(p.extract_text() or "" for p in reader.pages)[:10000]
+            text = "\n".join(p.extract_text() or "" for p in reader.pages)[:10000]
+            return text, degrade
         elif ext in (".docx", ".doc"):
             from docx import Document
             doc = Document(filepath)
-            return "\n".join(p.text for p in doc.paragraphs)[:10000]
+            text = "\n".join(p.text for p in doc.paragraphs)[:10000]
+            return text, degrade
         elif ext in (".xlsx", ".xls"):
             import openpyxl
             wb = openpyxl.load_workbook(filepath, data_only=True)
@@ -664,12 +727,13 @@ def _parse_attachment(filepath: str, filename: str) -> str:
             for ws in wb.worksheets:
                 for row in ws.iter_rows(values_only=True):
                     texts.append("\t".join(str(c or "") for c in row))
-            return "\n".join(texts)[:10000]
+            return "\n".join(texts)[:10000], ""
         elif ext in (".txt", ".md", ".csv", ".log"):
-            return Path(filepath).read_text(encoding="utf-8", errors="ignore")[:10000]
+            text = Path(filepath).read_text(encoding="utf-8", errors="ignore")[:10000]
+            return text, ""
     except Exception as e:
         logger.warning("附件解析失败 %s: %s", filename, e)
-    return ""
+    return "", "parse_error"
 
 
 def _cleanup_attachments(mail: dict, only_paths: list[str] | None = None):

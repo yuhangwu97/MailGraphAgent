@@ -599,6 +599,29 @@ class MailCache:
                 self.r.hset(self._k("mail", mid), mapping={"status": "pending"})
         return list(stale)
 
+    # ── 附件逐项状态追踪（§3.3）──
+    # 每个附件在 mailgraph:mail:{id}:atts (hash) 中记一条：
+    #   field=filename, value=status[:reason]
+    # status ∈ {pending, parsing, parsed, failed, degraded}
+    # degraded 是“解析成功但质量降级”（如 DeepDoc 模型缺失回落 pypdf）
+
+    def set_attachment_status(self, message_id: str, filename: str,
+                              status: str, reason: str = "") -> None:
+        """记录单个附件的解析状态。"""
+        val = status if not reason else f"{status}:{reason}"
+        self.r.hset(self._k("mail", message_id, "atts"), filename, val)
+
+    def get_attachment_statuses(self, message_id: str) -> dict[str, str]:
+        """获取一封邮件的全部附件状态。返回 {filename: status}。"""
+        raw = self.r.hgetall(self._k("mail", message_id, "atts"))
+        return raw or {}
+
+    def clear_attachment_statuses(self, message_id: str) -> None:
+        """清除附件的逐项状态记录。"""
+        key = self._k("mail", message_id, "atts")
+        if self.r.exists(key):
+            self.r.delete(key)
+
     def requeue_pending(self, message_id: str) -> None:
         """把已领取但处理中断的邮件放回队列，供后续重试。"""
         if message_id:
