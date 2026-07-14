@@ -78,3 +78,19 @@ def test_create_and_get_job():
     assert job["status"] == "queued"
     assert json.loads(job["params"])["folder"] == "INBOX"
     assert float(job["created_at"]) > 0
+
+
+def test_progress_and_stage_and_heartbeat():
+    r = FakeRedis()
+    job_id = jobstore.create_job("parse", client=r)
+    jobstore.set_stage(job_id, "parse-attachments", client=r)
+    jobstore.incr(job_id, "done", 2, client=r)
+    jobstore.incr(job_id, "att_failed", 1, client=r)
+    before = float(jobstore.get_job(job_id, client=r)["heartbeat_at"])
+    time.sleep(0.01)
+    jobstore.heartbeat(job_id, client=r)
+    job = jobstore.get_job(job_id, client=r)
+    assert job["stage"] == "parse-attachments"
+    assert int(float(job["done"])) == 2
+    assert int(float(job["att_failed"])) == 1
+    assert float(job["heartbeat_at"]) > before

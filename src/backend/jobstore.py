@@ -65,3 +65,31 @@ def get_job(job_id: str, client=None) -> dict | None:
     r = _client(client)
     data = r.hgetall(_job_key(job_id))
     return data or None
+
+
+def _touch(r, job_id: str) -> None:
+    r.hset(_job_key(job_id), mapping={"updated_at": time.time()})
+
+
+def set_stage(job_id: str, stage: str, client=None) -> None:
+    r = _client(client)
+    r.hset(_job_key(job_id), mapping={"stage": stage, "status": "running"})
+    _touch(r, job_id)
+
+
+def incr(job_id: str, field: str, amount: float = 1, client=None) -> None:
+    r = _client(client)
+    r.hincrbyfloat(_job_key(job_id), field, amount)
+    _touch(r, job_id)
+
+
+def heartbeat(job_id: str, client=None) -> None:
+    r = _client(client)
+    r.hset(_job_key(job_id), mapping={"heartbeat_at": time.time()})
+
+
+def update(job_id: str, client=None, **fields) -> None:
+    r = _client(client)
+    if fields:
+        r.hset(_job_key(job_id), mapping=fields)
+    _touch(r, job_id)
