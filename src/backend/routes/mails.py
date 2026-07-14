@@ -279,8 +279,8 @@ def indexed_mails(
     if cache is None:
         raise HTTPException(status_code=503, detail="Redis unavailable")
     offset = (page - 1) * page_size
-    mails = cache.list_indexed(limit=page_size, offset=offset)
-    total = cache.count_indexed()
+    mails = cache.list_indexed(limit=page_size, offset=offset, status=status)
+    total = cache.count_indexed(status=status)
     return PaginatedMailResponse(
         items=[_to_indexed_item(m) for m in mails],
         total=total,

@@ -678,43 +678,55 @@ class MailCache:
         pipe.execute()
         return True
 
-    def count_indexed(self) -> int:
-        """已扫描待解析(indexed)邮件总数。优先 status 索引集 (SCARD)。"""
-        idx_key = self._status_key("indexed")
-        if self.r.exists(idx_key):
-            return self.r.scard(idx_key)
+    # status filter 参与的目标 status 值；all 走全量
+    _INDEXED_STATUSES = {
+        "pending": ("indexed",),       # 已扫描待解析
+        "done": ("done", "skipped"),   # 已处理
+    }
+
+    def count_indexed(self, status: str = "pending") -> int:
+        """已扫描(indexed)/已处理(done)邮件总数。优先 status 索引集 (SCARD O(1))。"""
+        if status in self._INDEXED_STATUSES:
+            total = 0
+            for s in self._INDEXED_STATUSES[status]:
+                sk = self._status_key(s)
+                if self.r.exists(sk):
+                    total += self.r.scard(sk)
+            return total
+        # all：取所有非 transient 邮件
         count = 0
-        for key in self.r.scan_iter(match=self._k("mail", "*")):
-            if self.r.type(key) != "hash":
-                continue
-            if self.r.hget(key, "status") == "indexed":
-                count += 1
+        for s in ("indexed", "pending", "processing", "done", "failed", "skipped"):
+            sk = self._status_key(s)
+            if self.r.exists(sk):
+                count += self.r.scard(sk)
         return count
 
-    def list_indexed(self, limit: int = 100, offset: int = 0) -> list[dict]:
-        """列出 indexed 邮件（表头 + 回读定位符），按 date 倒序分页。"""
-        idx_key = self._status_key("indexed")
-        mids = list(self.r.smembers(idx_key)) if self.r.exists(idx_key) else []
-        mails: list[dict] = []
-        if mids:
-            for mid in mids:
-                data = self.r.hgetall(self._k("mail", mid))
-                if data.get("status") == "indexed":
-                    data["message_id"] = mid
-                    mails.append(data)
+    def list_indexed(self, limit: int = 100, offset: int = 0, status: str = "pending") -> list[dict]:
+        """列出 indexed（pending=未处理/done=已处理/all=全部）邮件，按 date 倒序分页。"""
+        date_key = self._date_key()
+        if status in self._INDEXED_STATUSES:
+            # 收集目标状态集的所有 mid，用 ZSET date 排序分页
+            idset: set[str] = set()
+            for s in self._INDEXED_STATUSES[status]:
+                sk = self._status_key(s)
+                if self.r.exists(sk):
+                    idset |= set(self.r.smembers(sk))
+            scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            total = len(scored)
+            page_ids = [mid for mid, _ in scored[offset:offset + limit]]
         else:
-            # 回退：无索引集时全量扫描
-            prefix_len = len(self._prefix) + len("mail:")
-            for key in self.r.scan_iter(match=self._k("mail", "*")):
-                if self.r.type(key) != "hash":
-                    continue
-                data = self.r.hgetall(key)
-                if data.get("status") != "indexed":
-                    continue
-                data["message_id"] = key[prefix_len:]
-                mails.append(data)
-        mails.sort(key=lambda m: m.get("date", ""), reverse=True)
-        return mails[offset:offset + limit]
+            # all：直接从 date ZSET 分页
+            page_ids = self.r.zrevrange(date_key, offset, offset + limit)
+
+        mails: list[dict] = []
+        for mid in page_ids:
+            data = self.r.hgetall(self._k("mail", mid))
+            if not data:
+                continue
+            data["message_id"] = mid
+            mails.append(data)
+        return mails
 
     def list_recent_mails(self, limit: int = 50, offset: int = 0) -> list[dict]:
         """列出最近暂存的邮件正文（供前端工作台展示）"""
