@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from config.settings import get_settings
-from src.backend.routes import accounts, conversations, events, graph, mails, projects, query, status
+from src.backend.routes import accounts, conversations, events, graph, jobs, mails, projects, query, status
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,7 @@ app.add_middleware(
 app.include_router(status.router)
 app.include_router(accounts.router)
 app.include_router(mails.router)
+app.include_router(jobs.router)
 app.include_router(conversations.router)
 app.include_router(query.router)
 app.include_router(graph.router)
