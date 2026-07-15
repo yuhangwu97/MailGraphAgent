@@ -325,10 +325,9 @@ class Pipeline:
                                         "LightRAG attachment insert failed (%s): %s", att_doc_id, e)
                                     log(f"  [{i}] ⚠ 附件入库失败：{att_fn}")
                             else:
-                                mail_att_failed += 1
-                                stats["att_failed"] += 1
-                                cache.set_attachment_status(
-                                    mid, att_fn, "failed", degrade or "no_text")
+                                # 解析失败（如缺库、格式不支持）直接跳过，不阻塞
+                                cache.set_attachment_status(mid, att_fn, "skipped", degrade or "解析失败")
+                                logger.debug("附件解析跳过 %s/%s: %s", mid, att_fn, degrade or "解析失败")
 
                     # 正文（及成功的附件）已入库，记录 doc_id → message_id 供证据归属
                     cache.mark_ingested(mid, doc_id=body_doc_id,
@@ -435,9 +434,9 @@ class Pipeline:
                                 message_id, att_fn, "failed", str(e)[:100])
                             logger.error("LightRAG attachment insert failed (%s): %s", att_doc_id, e)
                     else:
-                        stats["att_failed"] += 1
-                        cache.set_attachment_status(
-                            message_id, att_fn, "failed", degrade or "no_text")
+                        # 解析失败直接跳过，不计入失败
+                        cache.set_attachment_status(message_id, att_fn, "skipped", degrade or "解析失败")
+                        logger.debug("附件解析跳过 %s/%s: %s", message_id, att_fn, degrade or "解析失败")
 
             # 3) 标记完成
             cache.mark_ingested(message_id, doc_id=doc_id if body else "",

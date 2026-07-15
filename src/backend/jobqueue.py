@@ -16,12 +16,13 @@ import uuid
 
 import redis
 
-from config.settings import get_settings
+from src.backend.redis_pool import make_client
 
 logger = logging.getLogger(__name__)
 
 JOBS_KEY = "mailgraph:jobs"
 EVENTS_CHANNEL = "mailgraph:events"
+PROGRESS_PATTERN = "mailgraph:progress:*"
 
 # BRPOP 的阻塞时长（秒）。必须 < 客户端 socket_timeout，否则 socket 读超时会与
 # 服务端阻塞计时同时到点、先抛 TimeoutError（redis-py 8 默认 socket_timeout=5）。
@@ -37,21 +38,16 @@ _client_lock = threading.Lock()
 
 
 def _client() -> redis.Redis:
-    """返回复用的 Redis 客户端（持久连接池）。
+    """返回复用的 Redis 客户端（共享连接池，进程级复用）。
 
-    socket_timeout 设为明显大于 BRPOP_TIMEOUT，避免阻塞式 BRPOP 的 socket 读超时
+    覆盖 socket_timeout 为 BRPOP_TIMEOUT 的 4 倍，避免阻塞式 BRPOP 的 socket 读超时
     与服务端阻塞计时打架（这正是 worker 空闲轮询时偶发 TimeoutError 的根因）。
     """
     global _client_singleton
     if _client_singleton is None:
         with _client_lock:
             if _client_singleton is None:
-                cfg = get_settings()
-                _client_singleton = redis.Redis(
-                    host=cfg.redis_host,
-                    port=cfg.redis_port,
-                    db=cfg.redis_db,
-                    password=cfg.redis_password or None,
+                _client_singleton = make_client(
                     decode_responses=True,
                     socket_timeout=BRPOP_TIMEOUT * 4,      # 20s > BRPOP 5s
                     socket_connect_timeout=10,
@@ -122,4 +118,16 @@ def subscribe_progress(job_id: str) -> "redis.client.PubSub":
     """
     pubsub = _client().pubsub(ignore_subscribe_messages=True)
     pubsub.subscribe(progress_channel(job_id))
+    return pubsub
+
+
+def subscribe_progress_batch(job_ids: list[str]) -> "redis.client.PubSub":
+    """API 侧：用单个 PubSub + psubscribe 订阅一批 job 的进度频道。
+
+    相比为每个 job_id 创建独立 PubSub（subscribe_progress ∪ N），
+    此函数只占用 1 个 Redis 连接，适合 multi_job_stream 场景。
+    调用方负责消费与关闭。
+    """
+    pubsub = _client().pubsub(ignore_subscribe_messages=True)
+    pubsub.psubscribe(PROGRESS_PATTERN)
     return pubsub

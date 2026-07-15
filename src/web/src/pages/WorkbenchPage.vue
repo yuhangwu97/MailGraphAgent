@@ -51,14 +51,32 @@ const processLogs = ref<string[]>([])
 const loading = ref(false)
 
 const PAGE_SIZE = 200
+const page = ref(1)
+
+// ── Debounced refresh ──
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer)
+  refreshTimer = setTimeout(() => {
+    refreshList()
+    refreshStats()
+    refreshGraphStatus()
+  }, 1000) // 每秒最多刷新一次，避免每封邮件都触发 API 调用
+}
 
 async function refreshList() {
   try {
     loading.value = true
-    const r = await mailsApi.list({ filter: filter.value, page: 1, page_size: PAGE_SIZE })
+    const r = await mailsApi.list({ filter: filter.value, page: page.value, page_size: PAGE_SIZE })
     mails.value = r?.items || []
     total.value = r?.total || 0
   } catch (e) { console.error(e) } finally { loading.value = false }
+}
+
+function goPage(p: number) {
+  page.value = p
+  refreshList()
 }
 
 // Apply client-side search filter
@@ -92,14 +110,6 @@ function toggleAll() {
 }
 
 // ── Process selected ──
-function isFileMail(m: MailItem): boolean {
-  return !!m.source_type && m.source_type !== 'imap'
-}
-
-function isImapMail(m: MailItem): boolean {
-  return !m.source_type || m.source_type === 'imap'
-}
-
 function isTerminal(m: MailItem): boolean {
   return ['done', 'skipped', 'failed'].includes(m.status)
 }
@@ -109,51 +119,24 @@ async function handleProcess() {
   if (!ids.length) return
 
   const byId = (id: string) => mails.value.find(x => x.message_id === id)
-  // 只有 failed / skipped 才重处理，done 不再动
+  // 未完成（非终态）的邮件统一走 parseSelected，不再区分 IMAP/文件/缓存
+  const parseIds = ids.filter(id => {
+    const m = byId(id); return !!m && !isTerminal(m)
+  })
   const reprocessIds = ids.filter(id => {
     const m = byId(id); return !!m && (m.status === 'failed' || m.status === 'skipped')
-  })
-  const fileIds = ids.filter(id => { const m = byId(id); return !!m && !isTerminal(m) && isFileMail(m) })
-  // 未完成的 IMAP 邮件分三路：
-  //   - indexed: 只有表头没有正文，走 parseSelected → IMAP 拉正文 → 入队
-  //   - pending/processing: 正文已在 Redis 缓存中，补回 ingest 队列即可
-  //   - failed/skipped: 走 reprocess（先查缓存，没有再 IMAP 重拉）
-  const indexedImapIds = ids.filter(id => {
-    const m = byId(id); return !!m && m.status === 'indexed' && isImapMail(m)
-  })
-  const cachedImapIds = ids.filter(id => {
-    const m = byId(id); return !!m && (m.status === 'pending' || m.status === 'processing') && isImapMail(m)
   })
 
   processing.value = true
   processLogs.value = []
   const promises: Promise<void>[] = []
 
-  if (indexedImapIds.length) {
+  if (parseIds.length) {
     promises.push(new Promise<void>((resolve) => {
-      mailsApi.parseSelected(indexedImapIds, {
-        onProgress(d: any) { processLogs.value.push('[IMAP] ' + (d.msg || JSON.stringify(d))) },
+      mailsApi.parseSelected(parseIds, {
+        onProgress(d: any) { processLogs.value.push(d.msg || JSON.stringify(d)) },
         onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[IMAP] 错误: ' + m); resolve() },
-      })
-    }))
-  }
-
-  if (cachedImapIds.length) {
-    promises.push(new Promise<void>((resolve) => {
-      mailsApi.ingest(null, {
-        onProgress(d: any) { processLogs.value.push('[缓存] ' + (d.msg || JSON.stringify(d))) },
-        onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[缓存] 错误: ' + m); resolve() },
-      }, cachedImapIds)
-    }))
-  }
-  if (fileIds.length) {
-    promises.push(new Promise<void>((resolve) => {
-      mailsApi.parseSelected(fileIds, {
-        onProgress(d: any) { processLogs.value.push('[文件] ' + (d.msg || JSON.stringify(d))) },
-        onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[文件] 错误: ' + m); resolve() },
+        onError(m: string) { processLogs.value.push('错误: ' + m); resolve() },
       })
     }))
   }
@@ -195,6 +178,7 @@ async function handleRefresh() {
 // 操作完成后刷新：自动切回"全部"让用户看到结果
 async function handleDrawerRefresh() {
   filter.value = 'all'
+  page.value = 1
   selectedIds.value = new Set()
   await refreshAll()
 }
@@ -235,10 +219,8 @@ function connectSSE() {
           detail: d.detail || '',
           timestamp: Date.now(),
         })
-        // Auto-refresh list and stats when a mail is processed
-        refreshList()
-        refreshStats()
-        refreshGraphStatus()
+        // 防抖刷新：大量邮件连续处理时不逐封触发 API 调用
+        scheduleRefresh()
       } catch {}
     })
 
@@ -338,6 +320,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   disconnectSSE()
+  if (refreshTimer) clearTimeout(refreshTimer)
 })
 </script>
 
@@ -366,14 +349,17 @@ onUnmounted(() => {
         <MailList
           :mails="visibleMails"
           :total="total"
+          :page="page"
+          :page-size="PAGE_SIZE"
           :filter="filter"
           :selected-ids="selectedIds"
           :kpi="kpi"
           :processing="processing"
-          @update:filter="(f: MailFilter) => { filter = f; selectedIds = new Set(); refreshList() }"
+          @update:filter="(f: MailFilter) => { filter = f; page = 1; selectedIds = new Set(); refreshList() }"
           @toggle-select="toggleSelect"
           @toggle-all="toggleAll"
           @process="handleProcess"
+          @go-page="(p: number) => goPage(p)"
         />
 
         <!-- Bottom bar -->

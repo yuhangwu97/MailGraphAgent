@@ -10,6 +10,7 @@ import time
 import logging
 import redis
 from config.settings import get_settings
+from src.backend.redis_pool import make_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,7 @@ class MailCache:
     def __init__(self, account_id: str | None = None):
         cfg = get_settings()
         self._cfg = cfg
-        self._r = redis.Redis(
-            host=cfg.redis_host,
-            port=cfg.redis_port,
-            db=cfg.redis_db,
-            password=cfg.redis_password or None,
+        self._r = make_client(
             decode_responses=True,
             socket_connect_timeout=5,
         )
@@ -823,53 +820,52 @@ class MailCache:
         filter: all=全部；todo=未完成(未处理/待入库/处理中/失败)；done=已完成(已入库/已跳过)。
         items 为 mail:{id} 哈希（含 status/subject/from/date/source_type/attachment_count…）。
 
-        懒清理：遇到 hash 不存在的 message_id，同步删除 date_key / status 集合中的残留。
+        filter=all 走 Redis zrevrange 真分页，只拉取当前页数据。
+        filter=todo/done 用 pipeline 批量 zscore，减少网络往返。
         """
         date_key = self._date_key()
         if filter in self._MAIL_FILTERS:
+            # 收集所有 status 集合中的 ID（union）
             idset: set[str] = set()
             for s in self._MAIL_FILTERS[filter]:
                 idset |= set(self.r.smembers(self._status_key(s)))
-            scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
+
+            if not idset:
+                return [], 0
+
+            # Pipeline 批量 zscore：1 次网络往返替代 N 次
+            pipe = self.r.pipeline()
+            for mid in idset:
+                pipe.zscore(date_key, mid)
+            scores = pipe.execute()
+
+            scored = [
+                (mid, s or 0.0)
+                for mid, s in zip(idset, scores)  # type: ignore[arg-type]
+            ]
             scored.sort(key=lambda x: x[1], reverse=True)
-            # 懒清理 + 过滤：移除已无 hash 的脏 ID
-            valid: list[tuple[str, float]] = []
-            for mid, score in scored:
-                if self.r.exists(self._k("mail", mid)):
-                    valid.append((mid, score))
-                else:
-                    self._purge_stale_id(mid, filter)
-            total = len(valid)
-            page_ids = [mid for mid, _ in valid[offset:offset + limit]]
+
+            total = len(scored)
+            page_mids = [mid for mid, _ in scored[offset:offset + limit]]
         else:
-            # filter=all：从 date_key 倒序扫，同步清理残留
-            all_ids = self.r.zrevrange(date_key, 0, -1)
-            valid: list[str] = []
-            for mid in all_ids:
-                if self.r.exists(self._k("mail", mid)):
-                    valid.append(mid)
-                else:
-                    self.r.zrem(date_key, mid)
-            total = len(valid)
-            page_ids = valid[offset:offset + limit]
+            # filter=all：Redis sorted set 真分页 — 只取当前页，不拉全量
+            total = self.r.zcard(date_key)
+            page_mids = self.r.zrevrange(date_key, offset, offset + limit - 1)
 
+        # 取当前页的 hash + 懒清理脏 ID（只检查当前页，不全量扫描）
         items: list[dict] = []
-        for mid in page_ids:
+        for mid in page_mids:
             h = self.r.hgetall(self._k("mail", mid))
-            if not h:
-                continue
-            h["message_id"] = mid
-            items.append(h)
-        return items, total
+            if h:
+                h["message_id"] = mid
+                items.append(h)
+            else:
+                # 懒清理：hash 已删除的残留引用
+                self.r.zrem(date_key, mid)
+                for st in self._MAIL_FILTERS.get(filter, ()):
+                    self.r.srem(self._status_key(st), mid)
 
-    def _purge_stale_id(self, mid: str, filter_name: str):
-        """清理残留索引：hash 已删除但 status 集合 / date_key 中仍有引用。"""
-        pipe = self.r.pipeline()
-        pipe.zrem(self._date_key(), mid)
-        if filter_name in self._MAIL_FILTERS:
-            for s in self._MAIL_FILTERS[filter_name]:
-                pipe.srem(self._status_key(s), mid)
-        pipe.execute()
+        return items, total
 
     # ── 抓取进度 ──
 
@@ -939,7 +935,8 @@ class MailCache:
         pipe.execute()
 
     def close(self):
-        self._r.close()
+        """释放客户端引用（共享连接池由进程级池管理，无需手动断开）。"""
+        self._r = None
 
     # ── 兼容旧接口 ──
 

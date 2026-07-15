@@ -5,6 +5,8 @@ import type { MailItem, MailStats } from '@/api'
 const props = defineProps<{
   mails: MailItem[]
   total: number
+  page: number
+  pageSize: number
   filter: 'all' | 'todo' | 'done'
   selectedIds: Set<string>
   kpi: MailStats
@@ -16,7 +18,10 @@ const emit = defineEmits<{
   (e: 'toggle-select', id: string): void
   (e: 'toggle-all'): void
   (e: 'process'): void
+  (e: 'go-page', p: number): void
 }>()
+
+const totalPages = computed(() => Math.max(1, Math.ceil(props.total / props.pageSize)))
 
 // Filter chips
 const filterChips = computed(() => {
@@ -166,7 +171,7 @@ function failReason(m: MailItem): string {
               <span class="ml-time">{{ fmtDate(m.date).time }}</span>
             </td>
             <td class="col-subject">
-              <div class="ml-subject">{{ m.subject || '(无主题)' }}</div>
+              <div class="ml-subject" :title="m.subject || ''">{{ m.subject || '(无主题)' }}</div>
               <div class="ml-meta">
                 <span v-if="attSummary(m)" class="ml-att">{{ attSummary(m) }}</span>
                 <span
@@ -184,6 +189,16 @@ function failReason(m: MailItem): string {
       </table>
       <div v-else class="ml-empty">
         {{ filter === 'todo' ? '暂无未完成邮件' : filter === 'done' ? '暂无已完成邮件' : '暂无邮件' }}
+      </div>
+    </div>
+
+    <!-- Pagination -->
+    <div class="ml-pager" v-if="totalPages > 1">
+      <span class="ml-pager-info">{{ (page - 1) * pageSize + 1 }}-{{ Math.min(page * pageSize, total) }} / {{ total.toLocaleString() }}</span>
+      <div class="ml-pager-btns">
+        <button class="btn btn-secondary btn-sm" :disabled="page <= 1" @click="emit('go-page', page - 1)">上一页</button>
+        <span class="ml-pager-num">{{ page }} / {{ totalPages }}</span>
+        <button class="btn btn-secondary btn-sm" :disabled="page >= totalPages" @click="emit('go-page', page + 1)">下一页</button>
       </div>
     </div>
   </div>
@@ -436,7 +451,9 @@ function failReason(m: MailItem): string {
   color: var(--t1);
   font-weight: 520;
   line-height: 1.4;
-  word-break: break-word;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ml-meta {
@@ -488,5 +505,34 @@ function failReason(m: MailItem): string {
   text-align: center;
   color: var(--t4);
   font-size: 0.85rem;
+}
+
+/* ── Pagination ── */
+.ml-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.85rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+
+.ml-pager-info {
+  font-size: 0.72rem;
+  color: var(--t4);
+}
+
+.ml-pager-btns {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ml-pager-num {
+  font-size: 0.75rem;
+  color: var(--t4);
+  min-width: 60px;
+  text-align: center;
 }
 </style>

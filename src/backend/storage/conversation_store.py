@@ -19,6 +19,7 @@ from typing import Any
 import redis
 
 from config.settings import get_settings
+from src.backend.redis_pool import make_client
 
 
 def _now() -> float:
@@ -73,12 +74,7 @@ class AgentMemory:
 
 class ConversationStore:
     def __init__(self, account_id: str | None = None):
-        cfg = get_settings()
-        self._r = redis.Redis(
-            host=cfg.redis_host,
-            port=cfg.redis_port,
-            db=cfg.redis_db,
-            password=cfg.redis_password or None,
+        self._r = make_client(
             decode_responses=True,
             socket_connect_timeout=5,
         )
@@ -202,7 +198,8 @@ class ConversationStore:
         self.r.zadd(self._k("sessions"), {session_id: now})
 
     def close(self):
-        self._r.close()
+        """释放客户端引用（共享连接池由进程级池管理）。"""
+        self._r = None
 
     def _decode_session(self, raw: dict) -> dict:
         return {
