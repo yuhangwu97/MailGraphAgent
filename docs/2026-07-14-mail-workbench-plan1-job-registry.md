@@ -913,4 +913,3 @@ git commit -m "test(worker): end-to-end crash-recovery loop"
 - **Plan 3 — IMAP as a source** (spec §2, §3.3): `imap_client.fetch_headers`; IMAP entry in `mail/sources` registry (`scan_headers` + `read_message` + reader); `Pipeline.run_scan(source, params)`; deprecate `run_fetch` to delegate.
 - **Plan 4 — Job routes & mails.py refactor** (spec §3.2): `routes/jobs.py` (list/detail/pause/resume/retry-failed/delete); make `fetch`/`index`/`reprocess`/`parse-selected` create durable Jobs and pass `job_record_id`.
 - **Plan 5 — Frontend** (spec §4): `IntakeDialog.vue`, `JobCenter.vue`/`JobCard.vue`/`JobDetail.vue`, `stores/jobs.ts`, `MailList.vue` status-label + attachment-status refactor, remove ephemeral `processLogs`.
-
