@@ -120,9 +120,16 @@ class Pipeline:
             dl_dir = Path(attach_root) / _safe(uid or forced_message_id or "file")
             parsed = parse_email(msg, download_dir=dl_dir)
 
-            # 文件邮件兜底：无 Message-ID 时用扫描阶段合成的 id
+            # 文件邮件兜底：无 Message-ID 时用扫描阶段合成的 id。
+            # 同时归一化尖括号：parse_email 可能产出 "<id>"，scan 阶段是无尖括号
+            # 的原始 id，若实质相同则统一用 forced_message_id 保持记录一致。
             if not parsed.message_id and forced_message_id:
                 parsed.message_id = forced_message_id
+            else:
+                _norm = (parsed.message_id or "").strip().strip("<>")
+                _forced = (forced_message_id or "").strip().strip("<>")
+                if _norm and _norm == _forced:
+                    parsed.message_id = forced_message_id
 
             # message_id 级兜底去重（UID 复用 / 跨 folder 同信时 UID 过滤会漏）
             if not skip_processed and cache.is_processed(parsed.message_id):
@@ -585,22 +592,22 @@ class Pipeline:
                     if not hdr:
                         continue
                     stats["scanned"] += 1
-                    rec = {
-                        "subject": hdr.get("subject", ""),
-                        "from_addr": hdr.get("from_addr", ""),
-                        "from_name": "",
-                        "date": hdr.get("date", ""),
-                        "message_id": hdr.get("message_id", f"imap:{uid}"),
-                        "folder": folder,
-                        "uid": uid,
-                        "source_type": "imap",
-                        "source_locator": {
+                    from src.backend.mail.sources.base import HeaderRecord
+                    rec = HeaderRecord(
+                        subject=hdr.get("subject", ""),
+                        from_addr=hdr.get("from_addr", ""),
+                        from_name="",
+                        date=hdr.get("date", ""),
+                        message_id=hdr.get("message_id", f"imap:{uid}"),
+                        folder=folder,
+                        has_attachment=False,
+                        locator={
                             "source_type": "imap",
                             "folder": folder,
                             "uid": uid,
                             "account_id": self.account_id,
                         },
-                    }
+                    )
                     if cache.store_indexed(rec):
                         stats["indexed"] += 1
                         indexed_uids.append(uid)
@@ -615,13 +622,16 @@ class Pipeline:
         return stats
 
     def parse_selected(self, message_ids: list[str], on_log=None) -> dict:
-        """Step 2：对选中的 indexed 邮件回原文件读正文（含附件），清洗入队后 ingest 向量化。
+        """Step 2：对选中的 indexed 邮件拉取正文（含附件），清洗入队后 ingest 向量化。
 
-        按源文件归组，PST/OST 每个文件只 open 一次。用户显式勾选的邮件不做噪音过滤。
+        文件源（eml/msg/pst）按源文件归组，PST/OST 每个文件只 open 一次。
+        IMAP 源通过 IMAPClient.fetch_batch 按 folder 归组拉取。
+        用户显式勾选的邮件不做噪音过滤。
         """
         import json as _json
 
         from src.backend.mail.sources import open_reader
+        from src.backend.mail.imap_client import IMAPClient
         from src.backend.mail.cleaner import MailCleaner
         from src.backend.storage.redis_cache import MailCache
 
@@ -634,8 +644,10 @@ class Pipeline:
         attach_root = self.cfg.resolve_data_path("attachments")
 
         queued = 0
-        # 按 (源类型, 源文件) 归组
-        groups: dict[tuple[str, str], list[tuple[str, dict, str]]] = {}
+        # 按源分组：文件源按 (source_type, path)，IMAP 源按 folder
+        file_groups: dict[tuple[str, str], list[tuple[str, dict, str]]] = {}
+        imap_by_folder: dict[str, list[tuple[str, str, str]]] = {}  # folder → [(mid, uid, status)]
+
         try:
             for mid in message_ids or []:
                 state = cache.get_mail_state(mid)
@@ -647,10 +659,19 @@ class Pipeline:
                     locator = {}
                 if not locator:
                     continue
-                key = (locator.get("source_type", ""), locator.get("path", ""))
-                groups.setdefault(key, []).append((mid, locator, state.get("folder", "")))
+                stype = locator.get("source_type", "")
+                if stype == "imap":
+                    folder = locator.get("folder", "INBOX")
+                    uid = str(locator.get("uid", ""))
+                    if uid:
+                        imap_by_folder.setdefault(folder, []).append(
+                            (mid, uid, state.get("status", "indexed")))
+                else:
+                    key = (stype, locator.get("path", ""))
+                    file_groups.setdefault(key, []).append((mid, locator, state.get("folder", "")))
 
-            for (stype, spath), items in groups.items():
+            # ── 文件源：从本地文件读取正文 ──
+            for (stype, spath), items in file_groups.items():
                 log(f"解析 {Path(spath).name} 的 {len(items)} 封...")
                 reader = open_reader(stype, spath)
                 try:
@@ -673,6 +694,63 @@ class Pipeline:
                         reader.close()
                     except Exception:
                         pass
+
+            # ── IMAP 源：按状态区分处理 ──
+            #   indexed（待入库）：新邮件，直接 IMAP 拉正文。
+            #   failed（失败·可重试）：先查 Redis 缓存，有就直接入队（省一次 IMAP），没有再拉。
+            if imap_by_folder:
+                retry_from_cache = 0
+                uncached: dict[str, list[tuple[str, str]]] = {}  # folder → [(mid, uid)]
+
+                for folder, items in imap_by_folder.items():
+                    for mid, uid, status in items:
+                        if status == "failed":
+                            # 检查上次是否已拉过正文（缓存还在）
+                            cached_body = cache.get_mail(mid)
+                            last_error = (cache.get_mail_state(mid) or {}).get("error", "")
+                            if cached_body is not None:
+                                cache.r.sadd(cache._k("ingest_queue"), mid)
+                                cache.mark_processing(
+                                    mid, uid, folder,
+                                    cached_body.get("subject", ""),
+                                    cached_body.get("from_addr", ""),
+                                    cached_body.get("date", ""),
+                                )
+                                queued += 1
+                                retry_from_cache += 1
+                                subj = (cached_body.get("subject") or "(无主题)")[:50]
+                                reason = f"，上次失败原因: {last_error}" if last_error else ""
+                                log(f"  [{queued}] [缓存] {subj}{reason}")
+                            else:
+                                uncached.setdefault(folder, []).append((mid, uid))
+                        else:
+                            # indexed 等：直接拉 IMAP
+                            uncached.setdefault(folder, []).append((mid, uid))
+
+                if retry_from_cache:
+                    log(f"  ↳ {retry_from_cache} 封从缓存恢复，无需重复拉 IMAP")
+
+                if uncached:
+                    with IMAPClient(self.account) as client:
+                        for folder, items in uncached.items():
+                            uid_map = {uid: mid for mid, uid in items}
+                            uids = list(uid_map.keys())
+                            log(f"IMAP 拉取 {folder} 的 {len(uids)} 封...")
+                            try:
+                                for uid, msg in client.fetch_batch(uids, folder=folder):
+                                    mid = uid_map.get(str(uid), "")
+                                    parsed = self._store_fetched_mail(
+                                        uid, msg, folder, cache, cleaner, attach_root,
+                                        forced_message_id=mid, apply_noise_filter=False,
+                                        on_log=log,
+                                    )
+                                    if parsed is not None:
+                                        queued += 1
+                                        log(f"  [{queued}] {(parsed.subject or '(无主题)')[:50]}")
+                            except Exception as e:
+                                logger.error("IMAP 拉取失败 folder=%s: %s", folder, e)
+                                for mid, _uid in items:
+                                    cache.mark_failed(mid, str(e))
         finally:
             cache.close()
 
@@ -685,7 +763,14 @@ class Pipeline:
     # ══════════════════════════════════════════════
 
     def reprocess(self, message_ids: list[str], on_log=None) -> dict:
-        """强制重新处理指定邮件：重置状态 → 重新拉取正文 → LightRAG 重建。"""
+        """强制重新处理指定邮件：重置状态 → 重新拉取正文 → LightRAG 重建。
+
+        按当前状态分流：
+        - failed（失败·可重试）：先查 Redis 缓存，有就直接入队（省一次 IMAP）；没有再拉。
+        - 其他（pending/skipped）：重置后走 IMAP 拉取全文。
+        """
+        import json as _json
+
         from src.backend.storage.redis_cache import MailCache
         from src.backend.mail.imap_client import IMAPClient
         from src.backend.mail.cleaner import MailCleaner
@@ -700,33 +785,71 @@ class Pipeline:
 
         reset_n = 0
         requeued = 0
+        from_cache = 0
         try:
-            # 1) 重置状态，按 folder 归组待重拉的 uid
+            # 1) 分流：failed 先查缓存，其余走重置+重拉
             by_folder: dict[str, list[str]] = {}
             for mid in message_ids:
                 meta = cache.get_mail_state(mid)
                 if not meta:
                     continue
+                status = meta.get("status", "")
+
+                # 失败邮件：优先用缓存正文（上次可能已拉取成功只是后续步骤失败）
+                if status == "failed":
+                    cached_body = cache.get_mail(mid)
+                    last_error = meta.get("error_msg", "")
+                    if cached_body is not None:
+                        # 正文还在，直接重新入队
+                        cache.r.sadd(cache._k("ingest_queue"), mid)
+                        cache.mark_processing(
+                            mid,
+                            meta.get("uid", ""),
+                            meta.get("folder", "INBOX"),
+                            cached_body.get("subject", ""),
+                            cached_body.get("from_addr", ""),
+                            cached_body.get("date", ""),
+                        )
+                        requeued += 1
+                        from_cache += 1
+                        subj = (cached_body.get("subject") or "(无主题)")[:50]
+                        reason = f"，上次失败: {last_error}" if last_error else ""
+                        log(f"  [{requeued}] [缓存恢复] {subj}{reason}")
+                        continue
+
+                # 其他状态 / 缓存未命中 → 重置后走 IMAP 拉取
                 cache.reset_email(mid)
                 uid = meta.get("uid", "")
                 folder = meta.get("folder", "INBOX")
+                # uid 可能存于 source_locator 中（store_indexed 的顶层 uid 为空串）
+                if not uid:
+                    try:
+                        locator = _json.loads(meta.get("source_locator", "{}") or "{}")
+                        uid = str(locator.get("uid", ""))
+                    except Exception:
+                        pass
                 if uid:
                     by_folder.setdefault(folder, []).append(uid)
                 reset_n += 1
 
-            log(f"已重置 {reset_n} 封，重新拉取正文...")
+            if from_cache:
+                log(f"  ↳ {from_cache} 封从缓存恢复，无需重复拉 IMAP")
 
             # 2) 重新从 IMAP 拉这些 uid → 重新入队
             if by_folder:
+                log(f"已重置 {reset_n} 封，重新拉取正文...")
                 with IMAPClient(self.account) as client:
                     for folder, uids in by_folder.items():
+                        log(f"IMAP 拉取 {folder} 的 {len(uids)} 封...")
                         for uid, msg in client.fetch_batch(uids, folder=folder):
-                            if self._store_fetched_mail(uid, msg, folder,
-                                                        cache, cleaner, attach_root,
-                                                        skip_processed=True,
-                                                        apply_noise_filter=False,
-                                                        on_log=log) is not None:
+                            parsed = self._store_fetched_mail(uid, msg, folder,
+                                                              cache, cleaner, attach_root,
+                                                              skip_processed=True,
+                                                              apply_noise_filter=False,
+                                                              on_log=log)
+                            if parsed is not None:
                                 requeued += 1
+                                log(f"  [{requeued}] {(parsed.subject or '(无主题)')[:50]}")
             log(f"重新入队 {requeued} 封，待建图...")
         finally:
             cache.close()

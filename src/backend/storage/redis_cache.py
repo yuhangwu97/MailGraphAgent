@@ -714,6 +714,8 @@ class MailCache:
         import json as _json
 
         mid = getattr(rec, "message_id", "") or ""
+        # 归一化：去掉尖括号，避免同一个 message_id 因格式差异产生重复记录
+        mid = mid.strip().strip("<>")
         if not mid:
             return False
         # 去重：已存在（indexed/pending/processing/done/failed/skipped）则跳过
@@ -820,6 +822,8 @@ class MailCache:
 
         filter: all=全部；todo=未完成(未处理/待入库/处理中/失败)；done=已完成(已入库/已跳过)。
         items 为 mail:{id} 哈希（含 status/subject/from/date/source_type/attachment_count…）。
+
+        懒清理：遇到 hash 不存在的 message_id，同步删除 date_key / status 集合中的残留。
         """
         date_key = self._date_key()
         if filter in self._MAIL_FILTERS:
@@ -827,12 +831,27 @@ class MailCache:
             for s in self._MAIL_FILTERS[filter]:
                 idset |= set(self.r.smembers(self._status_key(s)))
             scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
-            scored.sort(key=lambda x: x[1], reverse=True)  # 按日期倒序
-            total = len(scored)
-            page_ids = [mid for mid, _ in scored[offset:offset + limit]]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            # 懒清理 + 过滤：移除已无 hash 的脏 ID
+            valid: list[tuple[str, float]] = []
+            for mid, score in scored:
+                if self.r.exists(self._k("mail", mid)):
+                    valid.append((mid, score))
+                else:
+                    self._purge_stale_id(mid, filter)
+            total = len(valid)
+            page_ids = [mid for mid, _ in valid[offset:offset + limit]]
         else:
-            total = self.r.zcard(date_key)
-            page_ids = self.r.zrevrange(date_key, offset, offset + limit - 1)
+            # filter=all：从 date_key 倒序扫，同步清理残留
+            all_ids = self.r.zrevrange(date_key, 0, -1)
+            valid: list[str] = []
+            for mid in all_ids:
+                if self.r.exists(self._k("mail", mid)):
+                    valid.append(mid)
+                else:
+                    self.r.zrem(date_key, mid)
+            total = len(valid)
+            page_ids = valid[offset:offset + limit]
 
         items: list[dict] = []
         for mid in page_ids:
@@ -842,6 +861,15 @@ class MailCache:
             h["message_id"] = mid
             items.append(h)
         return items, total
+
+    def _purge_stale_id(self, mid: str, filter_name: str):
+        """清理残留索引：hash 已删除但 status 集合 / date_key 中仍有引用。"""
+        pipe = self.r.pipeline()
+        pipe.zrem(self._date_key(), mid)
+        if filter_name in self._MAIL_FILTERS:
+            for s in self._MAIL_FILTERS[filter_name]:
+                pipe.srem(self._status_key(s), mid)
+        pipe.execute()
 
     # ── 抓取进度 ──
 

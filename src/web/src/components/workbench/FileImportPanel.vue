@@ -74,7 +74,7 @@ const STATUS_META: Record<string, { label: string; cls: string }> = {
   processing: { label: '处理中', cls: 'st-processing' },
   done: { label: '已处理', cls: 'st-done' },
   failed: { label: '失败', cls: 'st-failed' },
-  skipped: { label: '已跳过', cls: 'st-skipped' },
+  skipped: { label: '已入队', cls: 'st-skipped' },
 }
 function statusMeta(s: string) {
   return STATUS_META[s] || { label: s || '未知', cls: 'st-pending' }

@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useAccountStore } from '@/stores/account'
 
 const emit = defineEmits<{
-  (e: 'open-drawer', mode: 'fetch' | 'import'): void
+  (e: 'open-drawer'): void
   (e: 'search', q: string): void
 }>()
 
@@ -14,6 +14,7 @@ const showAccountForm = ref(false)
 // ── Add account form ──
 const providerPresets: Record<string, [string, number]> = {
   'Gmail': ['imap.gmail.com', 993],
+  'Outlook': ['outlook.office365.com', 993],
   'QQ 邮箱': ['imap.qq.com', 993],
   '阿里企业邮箱': ['imap.mxhichina.com', 993],
   '自定义': ['', 993],
@@ -80,13 +81,9 @@ onMounted(async () => {
       </div>
 
       <div class="topbar-actions">
-        <button class="tb-action-btn" @click="emit('open-drawer', 'fetch')">
-          <span class="tb-action-icon">📨</span>
-          拉取邮件
-        </button>
-        <button class="tb-action-btn" @click="emit('open-drawer', 'import')">
-          <span class="tb-action-icon">📂</span>
-          导入文件
+        <button class="tb-action-btn" @click="emit('open-drawer')">
+          <span class="tb-action-icon">📥</span>
+          导入邮件
         </button>
       </div>
 

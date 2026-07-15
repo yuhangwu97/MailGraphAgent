@@ -98,6 +98,14 @@ class ReprocessRequest(BaseModel):
     message_ids: list[str]
 
 
+# ── 统一扫描入口（IMAP / 文件）──
+
+class ScanRequest(BaseModel):
+    """统一扫描：source="imap" 拉表头，source="file" 扫本地文件表头 → indexed 清单。"""
+    source: Literal["imap", "file"]
+    params: dict = Field(default_factory=dict, description="imap: {folder,limit,since,before} | file: {paths}")
+
+
 # ── 文件邮件导入（本地 .eml/.msg/.pst/.ost）──
 
 class IndexFilesRequest(BaseModel):

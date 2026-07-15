@@ -12,7 +12,7 @@ import type { ActivityEvent } from '@/components/workbench/ActivityPanel.vue'
 const statusStore = useStatusStore()
 
 // ── Layout state ──
-const drawerMode = ref<'fetch' | 'import' | null>(null)
+const showDrawer = ref(false)
 const searchText = ref('')
 const refreshing = ref(false)
 const sidePanelVisible = ref(true)
@@ -114,37 +114,38 @@ async function handleProcess() {
     const m = byId(id); return !!m && (m.status === 'failed' || m.status === 'skipped')
   })
   const fileIds = ids.filter(id => { const m = byId(id); return !!m && !isTerminal(m) && isFileMail(m) })
-  // 未完成的 IMAP 邮件分两路：
-  //   - pending: 正文未存（噪音过滤掉的），走 reprocess 重拉 IMAP → 入队
-  //   - indexed/processing: 正文已在 Redis，补回 ingest 队列即可
-  const pendingImapIds = ids.filter(id => {
-    const m = byId(id); return !!m && m.status === 'pending' && isImapMail(m)
+  // 未完成的 IMAP 邮件分三路：
+  //   - indexed: 只有表头没有正文，走 parseSelected → IMAP 拉正文 → 入队
+  //   - pending/processing: 正文已在 Redis 缓存中，补回 ingest 队列即可
+  //   - failed/skipped: 走 reprocess（先查缓存，没有再 IMAP 重拉）
+  const indexedImapIds = ids.filter(id => {
+    const m = byId(id); return !!m && m.status === 'indexed' && isImapMail(m)
   })
-  const otherImapIds = ids.filter(id => {
-    const m = byId(id); return !!m && m.status !== 'pending' && !isTerminal(m) && isImapMail(m)
+  const cachedImapIds = ids.filter(id => {
+    const m = byId(id); return !!m && (m.status === 'pending' || m.status === 'processing') && isImapMail(m)
   })
 
   processing.value = true
   processLogs.value = []
   const promises: Promise<void>[] = []
 
-  if (pendingImapIds.length) {
+  if (indexedImapIds.length) {
     promises.push(new Promise<void>((resolve) => {
-      mailsApi.reprocess(pendingImapIds, {
-        onProgress(d: any) { processLogs.value.push('[重拉] ' + (d.msg || JSON.stringify(d))) },
+      mailsApi.parseSelected(indexedImapIds, {
+        onProgress(d: any) { processLogs.value.push('[IMAP] ' + (d.msg || JSON.stringify(d))) },
         onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[重拉] 错误: ' + m); resolve() },
+        onError(m: string) { processLogs.value.push('[IMAP] 错误: ' + m); resolve() },
       })
     }))
   }
 
-  if (otherImapIds.length) {
+  if (cachedImapIds.length) {
     promises.push(new Promise<void>((resolve) => {
       mailsApi.ingest(null, {
-        onProgress(d: any) { processLogs.value.push('[IMAP] ' + (d.msg || JSON.stringify(d))) },
+        onProgress(d: any) { processLogs.value.push('[缓存] ' + (d.msg || JSON.stringify(d))) },
         onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[IMAP] 错误: ' + m); resolve() },
-      }, otherImapIds)
+        onError(m: string) { processLogs.value.push('[缓存] 错误: ' + m); resolve() },
+      }, cachedImapIds)
     }))
   }
   if (fileIds.length) {
@@ -173,12 +174,12 @@ async function handleProcess() {
 }
 
 // ── Drawer ──
-function openDrawer(mode: 'fetch' | 'import') {
-  drawerMode.value = mode
+function openDrawer() {
+  showDrawer.value = true
 }
 
 function closeDrawer() {
-  drawerMode.value = null
+  showDrawer.value = false
 }
 
 // ── Data refresh ──
@@ -411,8 +412,7 @@ onUnmounted(() => {
 
     <!-- Import drawer -->
     <ImportDrawer
-      :open="drawerMode !== null"
-      :mode="drawerMode"
+      :open="showDrawer"
       @close="closeDrawer"
       @refresh="handleDrawerRefresh"
     />
@@ -501,9 +501,11 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  width: 320px;
+  width: 340px;
+  min-width: 280px;
   flex-shrink: 0;
   overflow-y: auto;
+  overflow-x: visible;
 }
 
 .wb-toggle-panel {

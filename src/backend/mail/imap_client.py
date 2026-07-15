@@ -21,6 +21,8 @@ PROVIDER_CONFIG = {
     "imap.gmail.com": {"sent_folder": '"[Gmail]/Sent Mail"', "all_mail": '"[Gmail]/All Mail"'},
     "imap.qq.com": {"sent_folder": '"Sent Messages"', "all_mail": None},
     "imap.mxhichina.com": {"sent_folder": '"已发送"', "all_mail": None},
+    "imap.qiye.aliyun.com": {"sent_folder": '"已发送"', "all_mail": None},
+    "outlook.office365.com": {"sent_folder": '"Sent Items"', "all_mail": None},
 }
 
 
@@ -109,6 +111,15 @@ class IMAPClient:
         logger.info(f"文件夹 [{folder}]: {count} 封邮件")
         return status, count
 
+    def get_folder_count(self, folder: str = "INBOX") -> int:
+        """快速获取文件夹邮件总数（仅 SEARCH，不下载任何内容）"""
+        conn = self.connect()
+        conn.select(folder, readonly=True)
+        _, data = conn.search(None, "ALL")
+        if not data or not data[0]:
+            return 0
+        return len(data[0].split())
+
     def list_folders(self) -> list[str]:
         """列出所有文件夹"""
         conn = self.connect()
@@ -130,6 +141,7 @@ class IMAPClient:
         for candidate in [
             '"[Gmail]/Sent Mail"',
             '"[Gmail]/&' + self._b64("Sent Mail") + '"',
+            '"Sent Items"',
             '"Sent Messages"',
             '"Sent"',
             '"已发送"',

@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException
 
 from src.backend.deps import get_account_store
 from src.backend.schemas import AccountCreate, AccountOut
+
+
+class PreviewRequest(BaseModel):
+    account_id: str
+    folder: str = "INBOX"
+
+
+class PreviewResponse(BaseModel):
+    folder: str
+    total: int
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -101,3 +112,21 @@ def migrate_from_env(store=Depends(get_account_store)):
     finally:
         store.close()
     return {"migrated": len(accounts) > 0, "account_count": len(accounts)}
+
+
+@router.post("/preview", response_model=PreviewResponse)
+def preview_folder(request: PreviewRequest, store=Depends(get_account_store)):
+    """快速获取 IMAP 文件夹邮件总数（不下载任何内容）。"""
+    from src.backend.mail.imap_client import IMAPClient
+
+    try:
+        account = store.get(request.account_id)
+    finally:
+        store.close()
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    with IMAPClient(account) as client:
+        total = client.get_folder_count(request.folder)
+    return PreviewResponse(folder=request.folder, total=total)

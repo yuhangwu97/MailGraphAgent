@@ -213,7 +213,7 @@ async def multi_job_stream(
 
 
 async def prep_then_ingest_stream(
-    prep_fn, prep_args: tuple, account_id: str | None, ingest_params: dict | None = None,
+    prep_fn, prep_args: tuple, account_id: str | None,
 ) -> AsyncGenerator[str, None]:
     """先在 API 进程内跑「准备」(prep_fn，只入队不建图)，再入队 ingest 交给 worker 建图。
 
@@ -250,9 +250,19 @@ async def prep_then_ingest_stream(
         data = json.dumps(item.get("data", {}), ensure_ascii=False)
         yield f"event: {item.get('event', 'progress')}\ndata: {data}\n\n"
 
-    # 阶段 2：入队 ingest 给 worker，转发建图进度（含最终 complete）
-    async for event in enqueue_job_and_stream("ingest", account_id, ingest_params or {}):
-        yield event
+    # 阶段 2：逐封入队 ingest_one job，多 worker 可并行分担建图
+    from src.backend.storage.redis_cache import MailCache
+    cache = MailCache(account_id)
+    try:
+        mids = cache.list_pending_ingest()
+    finally:
+        cache.close()
+    if mids:
+        async for event in multi_job_stream("ingest_one", account_id, mids):
+            yield event
+    else:
+        yield "event: progress\ndata: " + json.dumps({"msg": "ingest 队列为空"}, ensure_ascii=False) + "\n\n"
+        yield "event: complete\ndata: {}\n\n"
 
 
 

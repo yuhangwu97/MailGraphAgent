@@ -123,6 +123,11 @@ export const accountsApi = {
   delete: (id: string) => request<void>(`/accounts/${id}`, { method: 'DELETE' }),
   setDefault: (id: string) => request<{ default_account_id: string }>(`/accounts/${id}/default`, { method: 'POST' }),
   migrateFromEnv: () => request<{ migrated: boolean; account_count: number }>('/accounts/migrate-from-env', { method: 'POST' }),
+  preview: (accountId: string, folder: string = 'INBOX') =>
+    request<{ folder: string; total: number }>('/accounts/preview', {
+      method: 'POST',
+      body: JSON.stringify({ account_id: accountId, folder }),
+    }),
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -211,6 +216,20 @@ export const mailsApi = {
 
   // ── File import (.eml/.msg/.pst/.ost) ──
   pick: (mode: 'folder' | 'files' = 'folder') => request<PickResponse>(`/mails/pick?mode=${mode}`),
+  uploadFiles: async (files: File[]): Promise<{ paths: string[]; count: number }> => {
+    const formData = new FormData()
+    files.forEach(f => formData.append('files', f))
+    const res = await fetch(`${BASE}/mails/upload-files`, {
+      method: 'POST',
+      headers: { ...accountHeaders() },
+      body: formData,
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(body.detail || `HTTP ${res.status}`)
+    }
+    return res.json()
+  },
   browse: (dir?: string) => request<BrowseResponse>(`/mails/browse${dir ? `?dir=${encodeURIComponent(dir)}` : ''}`),
   indexed: (params?: { page?: number; page_size?: number; status?: 'pending' | 'done' | 'all' }) => {
     const p = params || {}
@@ -220,6 +239,10 @@ export const mailsApi = {
     sseStream('/mails/index', { paths }, handlers),
   parseSelected: (messageIds: string[], handlers: Parameters<typeof sseStream>[2]) =>
     sseStream('/mails/parse-selected', { message_ids: messageIds }, handlers),
+
+  // ── Unified scan (IMAP + file) ──
+  scan: (source: 'imap' | 'file', params: Record<string, unknown>, handlers: Parameters<typeof sseStream>[2]) =>
+    sseStream('/mails/scan', { source, params }, handlers),
 }
 
 // ═══════════════════════════════════════════════════════════════
