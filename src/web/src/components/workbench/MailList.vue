@@ -5,6 +5,8 @@ import type { MailItem, MailStats } from '@/api'
 const props = defineProps<{
   mails: MailItem[]
   total: number
+  page: number
+  pageSize: number
   filter: 'all' | 'todo' | 'done'
   selectedIds: Set<string>
   kpi: MailStats
@@ -16,7 +18,10 @@ const emit = defineEmits<{
   (e: 'toggle-select', id: string): void
   (e: 'toggle-all'): void
   (e: 'process'): void
+  (e: 'go-page', p: number): void
 }>()
+
+const totalPages = computed(() => Math.max(1, Math.ceil(props.total / props.pageSize)))
 
 // Filter chips
 const filterChips = computed(() => {
@@ -30,14 +35,15 @@ const filterChips = computed(() => {
   ]
 })
 
-// Status metadata
+// Status metadata — 设计文档 §3.5 状态词表
 const STATUS_META: Record<string, { label: string; dot: string; cls: string }> = {
-  indexed:   { label: '未处理', dot: '⚪', cls: 'st-pending' },
-  pending:   { label: '待导入', dot: '🟡', cls: 'st-pending' },
+  indexed:   { label: '待入库', dot: '⚪', cls: 'st-pending' },
+  pending:   { label: '待重拉', dot: '🟡', cls: 'st-pending' },
   processing:{ label: '处理中', dot: '🔵', cls: 'st-processing' },
-  done:      { label: '已入库', dot: '🟢', cls: 'st-done' },
-  failed:    { label: '失败',   dot: '🔴', cls: 'st-failed' },
-  skipped:   { label: '已完成', dot: '⏭️', cls: 'st-skipped' },
+  done:      { label: '已建图', dot: '🟢', cls: 'st-done' },
+  failed:    { label: '失败·可重试', dot: '🔴', cls: 'st-failed' },
+  skipped:   { label: '已跳过·噪音', dot: '⏭️', cls: 'st-skipped' },
+  degraded:  { label: '部分降级', dot: '🟠', cls: 'st-degraded' },
 }
 
 function statusMeta(s: string) {
@@ -165,7 +171,7 @@ function failReason(m: MailItem): string {
               <span class="ml-time">{{ fmtDate(m.date).time }}</span>
             </td>
             <td class="col-subject">
-              <div class="ml-subject">{{ m.subject || '(无主题)' }}</div>
+              <div class="ml-subject" :title="m.subject || ''">{{ m.subject || '(无主题)' }}</div>
               <div class="ml-meta">
                 <span v-if="attSummary(m)" class="ml-att">{{ attSummary(m) }}</span>
                 <span
@@ -183,6 +189,16 @@ function failReason(m: MailItem): string {
       </table>
       <div v-else class="ml-empty">
         {{ filter === 'todo' ? '暂无未完成邮件' : filter === 'done' ? '暂无已完成邮件' : '暂无邮件' }}
+      </div>
+    </div>
+
+    <!-- Pagination -->
+    <div class="ml-pager" v-if="totalPages > 1">
+      <span class="ml-pager-info">{{ (page - 1) * pageSize + 1 }}-{{ Math.min(page * pageSize, total) }} / {{ total.toLocaleString() }}</span>
+      <div class="ml-pager-btns">
+        <button class="btn btn-secondary btn-sm" :disabled="page <= 1" @click="emit('go-page', page - 1)">上一页</button>
+        <span class="ml-pager-num">{{ page }} / {{ totalPages }}</span>
+        <button class="btn btn-secondary btn-sm" :disabled="page >= totalPages" @click="emit('go-page', page + 1)">下一页</button>
       </div>
     </div>
   </div>
@@ -435,7 +451,9 @@ function failReason(m: MailItem): string {
   color: var(--t1);
   font-weight: 520;
   line-height: 1.4;
-  word-break: break-word;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ml-meta {
@@ -487,5 +505,34 @@ function failReason(m: MailItem): string {
   text-align: center;
   color: var(--t4);
   font-size: 0.85rem;
+}
+
+/* ── Pagination ── */
+.ml-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.85rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+
+.ml-pager-info {
+  font-size: 0.72rem;
+  color: var(--t4);
+}
+
+.ml-pager-btns {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.ml-pager-num {
+  font-size: 0.75rem;
+  color: var(--t4);
+  min-width: 60px;
+  text-align: center;
 }
 </style>

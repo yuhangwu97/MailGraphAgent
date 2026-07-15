@@ -6,7 +6,11 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import os as _os
+import shutil
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 from src.backend.deps import (
@@ -33,6 +37,7 @@ from src.backend.schemas import (
     ParseSelectedRequest,
     PickResponse,
     ReprocessRequest,
+    ScanRequest,
 )
 
 router = APIRouter(prefix="/api/mails", tags=["mails"])
@@ -231,6 +236,38 @@ def pick_path(mode: str = Query("folder", pattern="^(folder|files)$")):
     return PickResponse(paths=paths, canceled=False)
 
 
+@router.post("/upload-files")
+async def upload_files(
+    files: list[UploadFile] = File(..., description="邮件文件 (.eml/.msg/.pst/.ost)"),
+    account_id: str = Depends(get_account_id),
+):
+    """接收浏览器端上传的邮件文件，保存到服务端临时目录，返回绝对路径列表。
+
+    前端用 <input type=file> 选择文件后上传，然后调用 POST /mails/scan (source=file)
+    用返回的 paths 扫描表头。
+    """
+    data_dir = _os.environ.get("DATA_DIR", "./data")
+    upload_dir = Path(data_dir) / "uploads" / account_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[str] = []
+    for f in files:
+        safe_name = Path(f.filename or "unknown").name
+        dest = upload_dir / safe_name
+        if dest.exists():
+            stem, suffix = dest.stem, dest.suffix
+            i = 1
+            while dest.exists():
+                dest = upload_dir / f"{stem}_{i}{suffix}"
+                i += 1
+        with open(dest, "wb") as buf:
+            shutil.copyfileobj(f.file, buf)
+        saved_paths.append(str(dest.resolve()))
+        logger.info("upload: saved %s → %s", safe_name, dest)
+
+    return {"paths": saved_paths, "count": len(saved_paths)}
+
+
 @router.get("/browse", response_model=BrowseResponse)
 def browse_files(dir: str | None = Query(None, description="要浏览的目录绝对路径；留空则从用户主目录开始")):
     """浏览服务端本地目录：返回子目录 + 受支持的邮件文件 + 上级目录，供前端逐级点选。只读。"""
@@ -275,12 +312,15 @@ def indexed_mails(
     page_size: int = Query(50, ge=1, le=500),
     cache=Depends(get_cache),
 ):
-    """列出文件来源邮件。status: pending(未处理) | done(已处理) | all(全部)。"""
+    """列出已索引邮件（IMAP 表头扫描 + 文件扫描统一入口）。
+
+    status: pending(未处理) | done(已处理) | all(全部)。
+    """
     if cache is None:
         raise HTTPException(status_code=503, detail="Redis unavailable")
     offset = (page - 1) * page_size
-    mails = cache.list_indexed(limit=page_size, offset=offset)
-    total = cache.count_indexed()
+    mails = cache.list_indexed(limit=page_size, offset=offset, status=status)
+    total = cache.count_indexed(status=status)
     return PaginatedMailResponse(
         items=[_to_indexed_item(m) for m in mails],
         total=total,
@@ -302,13 +342,48 @@ def mail_detail(message_id: str, cache=Depends(get_cache)):
 # ── SSE operations ──
 
 
+@router.post("/scan")
+async def scan_mails(
+    body: ScanRequest,
+    account_id: str = Depends(get_account_id),
+):
+    """统一扫描入口：IMAP 拉表头 / 文件扫表头 → indexed 清单。
+
+    source="imap":  只拉 ENVELOPE 级元数据（主题/发件人/日期），不下载正文。
+    source="file":  扫描本地 .eml/.msg/.pst/.ost 文件的邮件表头。
+    产出 indexed 邮件后，用户从清单勾选 → POST /mails/parse-selected 建图。
+    """
+    from src.backend.pipeline import Pipeline
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        task = asyncio.create_task(
+            run_pipeline_with_sse(
+                Pipeline(account_id).run_scan,
+                body.source,
+                body.params,
+                queue=queue,
+            )
+        )
+        async for event in sse_from_queue(queue):
+            yield event
+        await task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @router.post("/fetch")
 async def fetch_mails(
     body: FetchRequest,
     account_id: str = Depends(get_account_id),
 ):
     """Pull mails from IMAP → clean → enqueue. 在 API 进程内跑（IMAP 属 IO 型，
-    不做 DeepDoc 解析，不会阻塞事件循环；也不占用只管解析的 worker）。"""
+    不做 DeepDoc 解析，不会阻塞事件循环；也不占用只管解析的 worker）。
+
+    DEPRECATED: 新代码请用 POST /mails/scan (source=imap) + POST /mails/parse-selected
+    两步流程，表头扫描与正文解析分离。
+    """
     from src.backend.pipeline import Pipeline
 
     queue: asyncio.Queue = asyncio.Queue()

@@ -149,6 +149,7 @@ async def multi_job_stream(
     """逐封入队独立 job，一个 SSE 流跟踪所有 job 的 progress/complete/error。
 
     每封邮件一个 ingest_one job：worker 崩了只丢一封，不影响其他。
+    使用单个 PubSub + psubscribe 替代 N 个独立 PubSub，避免 Redis 连接数爆炸。
     """
     from src.backend import jobqueue
 
@@ -156,54 +157,65 @@ async def multi_job_stream(
     queue: asyncio.Queue = asyncio.Queue()
 
     total = len(message_ids)
-    completed = 0
     job_ids: list[str] = []
+    job_id_set: set[str] = set()
 
-    # 先订阅 → 再入队（避免漏首帧）
-    pubsubs: list["redis.client.PubSub"] = []
-    for mid in message_ids:
+    # 预生成所有 job_id
+    for _ in message_ids:
         jid = jobqueue.new_job_id()
         job_ids.append(jid)
-        ps = jobqueue.subscribe_progress(jid)
-        pubsubs.append(ps)
+        job_id_set.add(jid)
 
-    # 入队所有 job
+    # 单个 PubSub 订阅所有进度频道（psubscribe mailgraph:progress:*）
+    pubsub = jobqueue.subscribe_progress_batch(job_ids)
+
+    # 入队所有 job（订阅后再入队，避免漏首帧）
     for i, mid in enumerate(message_ids):
         jobqueue.enqueue_job(job_type, account_id or "",
                              {"message_id": mid}, job_id=job_ids[i])
 
-    # 后台线程读所有 Redis pub/sub channel → 汇入一个 queue
+    # 后台线程读 psubscribe → 按 job_id 过滤 → 汇入队列
     def _reader() -> None:
         import time as _time
         deadline = _time.time() + 7200  # 2h 超时
         remaining = set(range(total))
+        # job_id → idx 映射，用于从 channel 名反查序号
+        id_to_idx = {jid: i for i, jid in enumerate(job_ids)}
         try:
             while remaining and _time.time() < deadline:
-                for idx in list(remaining):
-                    msg = pubsubs[idx].get_message(timeout=0.1)
-                    if msg and msg.get("type") == "message":
-                        try:
-                            payload = json.loads(msg["data"])
-                            event_type = payload.get("event", "progress")
-                            data = payload.get("data", {})
-                            # 加上 job 序号，方便前端区分
-                            data["job_idx"] = idx + 1
-                            data["job_total"] = total
-                            main_loop.call_soon_threadsafe(
-                                queue.put_nowait,
-                                {"event": event_type, "data": data},
-                            )
-                            if event_type in ("complete", "error"):
-                                remaining.discard(idx)
-                        except Exception:
-                            pass
-                _time.sleep(0.05)
-        finally:
-            for ps in pubsubs:
+                msg = pubsub.get_message(timeout=0.5)
+                if not msg or msg.get("type") != "pmessage":
+                    continue
+                # psubscribe 消息的 channel 在 msg["channel"] 中
+                channel = msg.get("channel", "")
+                # 从 channel 名提取 job_id（格式: mailgraph:progress:{job_id}）
+                if not channel.startswith("mailgraph:progress:"):
+                    continue
+                recv_jid = channel[len("mailgraph:progress:"):]
+                if recv_jid not in id_to_idx:
+                    continue
+                idx = id_to_idx[recv_jid]
+                if idx not in remaining:
+                    continue
                 try:
-                    ps.close()
+                    payload = json.loads(msg["data"])
+                    event_type = payload.get("event", "progress")
+                    data = payload.get("data", {})
+                    data["job_idx"] = idx + 1
+                    data["job_total"] = total
+                    main_loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        {"event": event_type, "data": data},
+                    )
+                    if event_type in ("complete", "error"):
+                        remaining.discard(idx)
                 except Exception:
                     pass
+        finally:
+            try:
+                pubsub.close()
+            except Exception:
+                pass
             main_loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 
     threading.Thread(target=_reader, name=f"multi-job-{job_type}", daemon=True).start()
@@ -213,7 +225,7 @@ async def multi_job_stream(
 
 
 async def prep_then_ingest_stream(
-    prep_fn, prep_args: tuple, account_id: str | None, ingest_params: dict | None = None,
+    prep_fn, prep_args: tuple, account_id: str | None,
 ) -> AsyncGenerator[str, None]:
     """先在 API 进程内跑「准备」(prep_fn，只入队不建图)，再入队 ingest 交给 worker 建图。
 
@@ -250,9 +262,19 @@ async def prep_then_ingest_stream(
         data = json.dumps(item.get("data", {}), ensure_ascii=False)
         yield f"event: {item.get('event', 'progress')}\ndata: {data}\n\n"
 
-    # 阶段 2：入队 ingest 给 worker，转发建图进度（含最终 complete）
-    async for event in enqueue_job_and_stream("ingest", account_id, ingest_params or {}):
-        yield event
+    # 阶段 2：逐封入队 ingest_one job，多 worker 可并行分担建图
+    from src.backend.storage.redis_cache import MailCache
+    cache = MailCache(account_id)
+    try:
+        mids = cache.list_pending_ingest()
+    finally:
+        cache.close()
+    if mids:
+        async for event in multi_job_stream("ingest_one", account_id, mids):
+            yield event
+    else:
+        yield "event: progress\ndata: " + json.dumps({"msg": "ingest 队列为空"}, ensure_ascii=False) + "\n\n"
+        yield "event: complete\ndata: {}\n\n"
 
 
 

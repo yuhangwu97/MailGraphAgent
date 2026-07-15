@@ -45,7 +45,7 @@ function eventTitle(type: string): string {
     case 'processed': return '建图完成'
     case 'processing': return '正在处理'
     case 'failed': return '处理失败'
-    case 'skipped': return '已跳过'
+    case 'skipped': return '已入队'
     case 'ingested': return '已入库'
     case 'started': return '开始处理'
     default: return type
@@ -173,14 +173,13 @@ const docChips = computed(() => {
 .act-panel {
   display: flex;
   flex-direction: column;
-  width: 360px;
-  flex-shrink: 0;
+  flex: 1;
+  min-height: 0;
   gap: 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r);
   overflow: hidden;
-  height: 100%;
 }
 
 .ap-section {

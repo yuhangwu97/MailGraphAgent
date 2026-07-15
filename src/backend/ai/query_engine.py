@@ -275,7 +275,7 @@ class QueryEngine:
         cfg = get_settings()
         self.llm = OpenAI(
             api_key=cfg.openai_api_key,
-            base_url=f"{cfg.openai_base_url}/v1",
+            base_url=f"{cfg.openai_base_url}/v1" if not cfg.openai_base_url.endswith("/v1") else cfg.openai_base_url,
             timeout=60.0,
         )
         self.model = cfg.openai_model

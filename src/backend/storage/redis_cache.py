@@ -10,6 +10,7 @@ import time
 import logging
 import redis
 from config.settings import get_settings
+from src.backend.redis_pool import make_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,7 @@ class MailCache:
     def __init__(self, account_id: str | None = None):
         cfg = get_settings()
         self._cfg = cfg
-        self._r = redis.Redis(
-            host=cfg.redis_host,
-            port=cfg.redis_port,
-            db=cfg.redis_db,
-            password=cfg.redis_password or None,
+        self._r = make_client(
             decode_responses=True,
             socket_connect_timeout=5,
         )
@@ -557,6 +554,71 @@ class MailCache:
                 continue  # 正文已过期，已被 SPOP 移除，继续取下一封
             return mail
 
+    def claim_pending_mail_tracked(self) -> dict | None:
+        """SPOP a pending mail AND record it in the in-flight zset (score=claimed_at).
+
+        Recoverable variant of claim_pending_mail: if the worker crashes before
+        release_inflight, the reaper can find and requeue it. Expired bodies are
+        skipped (already SPOP'd out) without touching in-flight.
+        """
+        import time as _t
+        while True:
+            mid = self.r.spop(self._k("ingest_queue"))
+            if not mid:
+                return None
+            mail = self.get_mail(mid)
+            if mail is None:
+                continue
+            self.r.zadd(self._k("inflight"), {mid: _t.time()})
+            return mail
+
+    def release_inflight(self, message_id: str) -> None:
+        """Remove a mail from the in-flight zset once graph-build finished."""
+        if message_id:
+            self.r.zrem(self._k("inflight"), message_id)
+
+    def reap_inflight(self, stale_seconds: float = 60) -> list[str]:
+        """Re-queue in-flight mails whose claim is older than stale_seconds.
+
+        A crash between claim_pending_mail_tracked and release_inflight leaves a
+        mail out of the queue and stuck at 'processing'. This puts it back in
+        ingest_queue, resets its status to 'pending', and clears the in-flight entry.
+        Returns the requeued message_ids.
+        """
+        import time as _t
+        cutoff = _t.time() - stale_seconds
+        key = self._k("inflight")
+        stale = self.r.zrangebyscore(key, "-inf", cutoff)
+        for mid in stale:
+            self.r.sadd(self._k("ingest_queue"), mid)
+            self.r.zrem(key, mid)
+            if self.r.hgetall(self._k("mail", mid)):
+                self.r.hset(self._k("mail", mid), mapping={"status": "pending"})
+        return list(stale)
+
+    # ── 附件逐项状态追踪（§3.3）──
+    # 每个附件在 mailgraph:mail:{id}:atts (hash) 中记一条：
+    #   field=filename, value=status[:reason]
+    # status ∈ {pending, parsing, parsed, failed, degraded}
+    # degraded 是“解析成功但质量降级”（如 DeepDoc 模型缺失回落 pypdf）
+
+    def set_attachment_status(self, message_id: str, filename: str,
+                              status: str, reason: str = "") -> None:
+        """记录单个附件的解析状态。"""
+        val = status if not reason else f"{status}:{reason}"
+        self.r.hset(self._k("mail", message_id, "atts"), filename, val)
+
+    def get_attachment_statuses(self, message_id: str) -> dict[str, str]:
+        """获取一封邮件的全部附件状态。返回 {filename: status}。"""
+        raw = self.r.hgetall(self._k("mail", message_id, "atts"))
+        return raw or {}
+
+    def clear_attachment_statuses(self, message_id: str) -> None:
+        """清除附件的逐项状态记录。"""
+        key = self._k("mail", message_id, "atts")
+        if self.r.exists(key):
+            self.r.delete(key)
+
     def requeue_pending(self, message_id: str) -> None:
         """把已领取但处理中断的邮件放回队列，供后续重试。"""
         if message_id:
@@ -649,6 +711,8 @@ class MailCache:
         import json as _json
 
         mid = getattr(rec, "message_id", "") or ""
+        # 归一化：去掉尖括号，避免同一个 message_id 因格式差异产生重复记录
+        mid = mid.strip().strip("<>")
         if not mid:
             return False
         # 去重：已存在（indexed/pending/processing/done/failed/skipped）则跳过
@@ -678,43 +742,55 @@ class MailCache:
         pipe.execute()
         return True
 
-    def count_indexed(self) -> int:
-        """已扫描待解析(indexed)邮件总数。优先 status 索引集 (SCARD)。"""
-        idx_key = self._status_key("indexed")
-        if self.r.exists(idx_key):
-            return self.r.scard(idx_key)
+    # status filter 参与的目标 status 值；all 走全量
+    _INDEXED_STATUSES = {
+        "pending": ("indexed",),       # 已扫描待解析
+        "done": ("done", "skipped"),   # 已处理
+    }
+
+    def count_indexed(self, status: str = "pending") -> int:
+        """已扫描(indexed)/已处理(done)邮件总数。优先 status 索引集 (SCARD O(1))。"""
+        if status in self._INDEXED_STATUSES:
+            total = 0
+            for s in self._INDEXED_STATUSES[status]:
+                sk = self._status_key(s)
+                if self.r.exists(sk):
+                    total += self.r.scard(sk)
+            return total
+        # all：取所有非 transient 邮件
         count = 0
-        for key in self.r.scan_iter(match=self._k("mail", "*")):
-            if self.r.type(key) != "hash":
-                continue
-            if self.r.hget(key, "status") == "indexed":
-                count += 1
+        for s in ("indexed", "pending", "processing", "done", "failed", "skipped"):
+            sk = self._status_key(s)
+            if self.r.exists(sk):
+                count += self.r.scard(sk)
         return count
 
-    def list_indexed(self, limit: int = 100, offset: int = 0) -> list[dict]:
-        """列出 indexed 邮件（表头 + 回读定位符），按 date 倒序分页。"""
-        idx_key = self._status_key("indexed")
-        mids = list(self.r.smembers(idx_key)) if self.r.exists(idx_key) else []
-        mails: list[dict] = []
-        if mids:
-            for mid in mids:
-                data = self.r.hgetall(self._k("mail", mid))
-                if data.get("status") == "indexed":
-                    data["message_id"] = mid
-                    mails.append(data)
+    def list_indexed(self, limit: int = 100, offset: int = 0, status: str = "pending") -> list[dict]:
+        """列出 indexed（pending=未处理/done=已处理/all=全部）邮件，按 date 倒序分页。"""
+        date_key = self._date_key()
+        if status in self._INDEXED_STATUSES:
+            # 收集目标状态集的所有 mid，用 ZSET date 排序分页
+            idset: set[str] = set()
+            for s in self._INDEXED_STATUSES[status]:
+                sk = self._status_key(s)
+                if self.r.exists(sk):
+                    idset |= set(self.r.smembers(sk))
+            scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
+            scored.sort(key=lambda x: x[1], reverse=True)
+            total = len(scored)
+            page_ids = [mid for mid, _ in scored[offset:offset + limit]]
         else:
-            # 回退：无索引集时全量扫描
-            prefix_len = len(self._prefix) + len("mail:")
-            for key in self.r.scan_iter(match=self._k("mail", "*")):
-                if self.r.type(key) != "hash":
-                    continue
-                data = self.r.hgetall(key)
-                if data.get("status") != "indexed":
-                    continue
-                data["message_id"] = key[prefix_len:]
-                mails.append(data)
-        mails.sort(key=lambda m: m.get("date", ""), reverse=True)
-        return mails[offset:offset + limit]
+            # all：直接从 date ZSET 分页
+            page_ids = self.r.zrevrange(date_key, offset, offset + limit)
+
+        mails: list[dict] = []
+        for mid in page_ids:
+            data = self.r.hgetall(self._k("mail", mid))
+            if not data:
+                continue
+            data["message_id"] = mid
+            mails.append(data)
+        return mails
 
     def list_recent_mails(self, limit: int = 50, offset: int = 0) -> list[dict]:
         """列出最近暂存的邮件正文（供前端工作台展示）"""
@@ -743,27 +819,52 @@ class MailCache:
 
         filter: all=全部；todo=未完成(未处理/待入库/处理中/失败)；done=已完成(已入库/已跳过)。
         items 为 mail:{id} 哈希（含 status/subject/from/date/source_type/attachment_count…）。
+
+        filter=all 走 Redis zrevrange 真分页，只拉取当前页数据。
+        filter=todo/done 用 pipeline 批量 zscore，减少网络往返。
         """
         date_key = self._date_key()
         if filter in self._MAIL_FILTERS:
+            # 收集所有 status 集合中的 ID（union）
             idset: set[str] = set()
             for s in self._MAIL_FILTERS[filter]:
                 idset |= set(self.r.smembers(self._status_key(s)))
-            scored = [(mid, self.r.zscore(date_key, mid) or 0.0) for mid in idset]
-            scored.sort(key=lambda x: x[1], reverse=True)  # 按日期倒序
-            total = len(scored)
-            page_ids = [mid for mid, _ in scored[offset:offset + limit]]
-        else:
-            total = self.r.zcard(date_key)
-            page_ids = self.r.zrevrange(date_key, offset, offset + limit - 1)
 
+            if not idset:
+                return [], 0
+
+            # Pipeline 批量 zscore：1 次网络往返替代 N 次
+            pipe = self.r.pipeline()
+            for mid in idset:
+                pipe.zscore(date_key, mid)
+            scores = pipe.execute()
+
+            scored = [
+                (mid, s or 0.0)
+                for mid, s in zip(idset, scores)  # type: ignore[arg-type]
+            ]
+            scored.sort(key=lambda x: x[1], reverse=True)
+
+            total = len(scored)
+            page_mids = [mid for mid, _ in scored[offset:offset + limit]]
+        else:
+            # filter=all：Redis sorted set 真分页 — 只取当前页，不拉全量
+            total = self.r.zcard(date_key)
+            page_mids = self.r.zrevrange(date_key, offset, offset + limit - 1)
+
+        # 取当前页的 hash + 懒清理脏 ID（只检查当前页，不全量扫描）
         items: list[dict] = []
-        for mid in page_ids:
+        for mid in page_mids:
             h = self.r.hgetall(self._k("mail", mid))
-            if not h:
-                continue
-            h["message_id"] = mid
-            items.append(h)
+            if h:
+                h["message_id"] = mid
+                items.append(h)
+            else:
+                # 懒清理：hash 已删除的残留引用
+                self.r.zrem(date_key, mid)
+                for st in self._MAIL_FILTERS.get(filter, ()):
+                    self.r.srem(self._status_key(st), mid)
+
         return items, total
 
     # ── 抓取进度 ──
@@ -834,7 +935,8 @@ class MailCache:
         pipe.execute()
 
     def close(self):
-        self._r.close()
+        """释放客户端引用（共享连接池由进程级池管理，无需手动断开）。"""
+        self._r = None
 
     # ── 兼容旧接口 ──
 

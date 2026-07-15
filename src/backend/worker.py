@@ -22,6 +22,23 @@ _DISPATCH = {
 }
 
 
+def _heartbeat_logger(job_record_id, client=None, publish=None):
+    """Return an on_log(msg) that publishes progress AND heartbeats the durable job."""
+    from src.backend import jobstore
+    from src.backend.jobqueue import publish_progress
+
+    pub = publish or publish_progress
+
+    def on_log(msg: str) -> None:
+        if job_record_id:
+            try:
+                jobstore.heartbeat(job_record_id, client=client)
+            except Exception:
+                pass
+        pub  # keep ref; actual publish below when wired with job_id
+    return on_log
+
+
 def _handle(job: dict) -> None:
     job_id = job.get("job_id", "")
     jtype = job.get("type", "")
@@ -33,7 +50,15 @@ def _handle(job: dict) -> None:
         publish_progress(job_id, "error", {"msg": f"unknown job type: {jtype}"})
         return
 
+    job_record_id = params.pop("job_record_id", "")
+
     def on_log(msg: str) -> None:
+        if job_record_id:
+            try:
+                from src.backend import jobstore
+                jobstore.heartbeat(job_record_id)
+            except Exception:
+                pass
         publish_progress(job_id, "progress", {"msg": msg})
 
     logger.info("job %s start type=%s account=%s", job_id, jtype, account_id)
@@ -49,17 +74,53 @@ def _handle(job: dict) -> None:
         publish_progress(job_id, "error", {"msg": str(e)})
 
 
+def _reap(client=None, cache_factory=None, stale_seconds: float = 60) -> int:
+    """Mark stale running jobs interrupted and requeue in-flight mails.
+
+    Returns the number of jobs marked interrupted.
+    """
+    from src.backend import jobstore
+
+    # 1) requeue stale in-flight mails (account-agnostic pool)
+    if cache_factory is None:
+        from src.backend.storage.redis_cache import MailCache
+        cache_factory = lambda: MailCache(None)
+    cache = cache_factory()
+    try:
+        cache.reap_inflight(stale_seconds=stale_seconds)
+    finally:
+        try:
+            cache.close()
+        except Exception:
+            pass
+
+    # 2) mark stale running jobs interrupted
+    stale_jobs = jobstore.find_stale_running(stale_seconds=stale_seconds, client=client)
+    for job in stale_jobs:
+        jobstore.mark_terminal(job["job_id"], "interrupted",
+                               summary="worker heartbeat lost", client=client)
+    return len(stale_jobs)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     logger.info("ingest worker started, waiting for jobs...")
+    try:
+        _reap()  # startup recovery sweep
+    except Exception:
+        logger.exception("startup reap failed")
+    last_reap = time.time()
     while True:
         try:
             job = pop_job(timeout=5)
             if job:
                 _handle(job)
+            if time.time() - last_reap > 30:
+                _reap()
+                last_reap = time.time()
         except KeyboardInterrupt:
             logger.info("worker stopping")
             break

@@ -10,9 +10,8 @@ from __future__ import annotations
 import json
 import time
 
-import redis
-
 from config.settings import get_settings
+from src.backend.redis_pool import make_client
 
 
 def _now() -> float:
@@ -21,12 +20,7 @@ def _now() -> float:
 
 class ProjectAnalysisStore:
     def __init__(self):
-        cfg = get_settings()
-        self._r = redis.Redis(
-            host=cfg.redis_host,
-            port=cfg.redis_port,
-            db=cfg.redis_db,
-            password=cfg.redis_password or None,
+        self._r = make_client(
             decode_responses=True,
             socket_connect_timeout=5,
         )
@@ -92,4 +86,5 @@ class ProjectAnalysisStore:
         self._r.delete(self._k(project_name))
 
     def close(self):
-        self._r.close()
+        """释放客户端引用（共享连接池由进程级池管理）。"""
+        self._r = None

@@ -94,6 +94,12 @@ class FakeRedis:
     def smembers(self, key):
         return set(self.sets.get(key, set()))
 
+    def spop(self, key):
+        s = self.sets.get(key)
+        if not s:
+            return None
+        return s.pop()
+
     def scard(self, key):
         return len(self.sets.get(key, set()))
 
@@ -154,6 +160,16 @@ def make_cache(monkeypatch):
     return rc.MailCache("acct"), fake
 
 
+def _make_cache():
+    cache = rc.MailCache.__new__(rc.MailCache)
+    cache._r = FakeRedis()
+    cache._prefix = "mailgraph:"
+    cache._mbx_prefix = "mailgraph:mbx:_:"
+    cache._body_ttl = 3600
+    cache._account_id = None
+    return cache
+
+
 def test_store_mail_queues_body_and_mark_ingested_clears_it(monkeypatch):
     cache, fake = make_cache(monkeypatch)
     mail = {"message_id": "mid-1", "subject": "合同", "attachments": []}
@@ -206,3 +222,33 @@ def test_query_stats_uses_indexes_and_message_id_intersection(monkeypatch):
     assert result["matched_ids"] == ["m1"]
     assert result["total"] == 1
     assert result["by_status"]["done"] == 1
+
+
+def test_claim_tracked_adds_inflight_and_release_removes():
+    cache = _make_cache()
+    # seed one mail body + queue entry
+    cache.store_mail({"message_id": "m1", "cleaned_body": "hi", "attachments": []})
+    claimed = cache.claim_pending_mail_tracked()
+    assert claimed["message_id"] == "m1"
+    inflight = cache._r.zrangebyscore(cache._k("inflight"), "-inf", "+inf")
+    assert "m1" in inflight
+    cache.release_inflight("m1")
+    inflight = cache._r.zrangebyscore(cache._k("inflight"), "-inf", "+inf")
+    assert "m1" not in inflight
+
+
+def test_reap_inflight_requeues_stale_and_resets_status():
+    import time as _t
+    cache = _make_cache()
+    cache.store_mail({"message_id": "m1", "cleaned_body": "hi", "attachments": []})
+    cache.claim_pending_mail_tracked()          # m1 now in-flight, out of queue
+    # mark it processing (as the worker would)
+    cache._r.hset(cache._k("mail", "m1"), mapping={"status": "processing"})
+    # force stale claim time
+    cache._r.zadd(cache._k("inflight"), {"m1": _t.time() - 999})
+
+    requeued = cache.reap_inflight(stale_seconds=60)
+    assert requeued == ["m1"]
+    assert "m1" in cache._r.smembers(cache._k("ingest_queue"))
+    assert "m1" not in cache._r.zrangebyscore(cache._k("inflight"), "-inf", "+inf")
+    assert cache._r.hgetall(cache._k("mail", "m1")).get("status") == "pending"

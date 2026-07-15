@@ -10,9 +10,8 @@ import json
 import logging
 import re
 
-import redis
-
 from config.settings import get_settings
+from src.backend.redis_pool import make_client
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +30,7 @@ class AccountStore:
     def __init__(self):
         cfg = get_settings()
         self._cfg = cfg
-        self._r = redis.Redis(
-            host=cfg.redis_host,
-            port=cfg.redis_port,
-            db=cfg.redis_db,
-            password=cfg.redis_password or None,
+        self._r = make_client(
             decode_responses=True,
             socket_connect_timeout=5,
         )
@@ -114,4 +109,5 @@ class AccountStore:
             logger.info("已从环境变量迁移默认邮箱账号: %s", cfg.email_user)
 
     def close(self):
-        self._r.close()
+        """释放客户端引用（共享连接池由进程级池管理）。"""
+        self._r = None

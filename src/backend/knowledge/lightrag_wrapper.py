@@ -93,7 +93,7 @@ def _run(coro):
 # 同一父进程 fork 的 worker 有效；用 `python -m src.backend.worker` 起的多个独立
 # 进程之间没有共享锁，并发写同一实体会丢更新/产生重复节点。用 Redis 分布式锁把
 # 图谱写入串行化——解析(DeepDoc)与查询仍并行，只有真正的写入被串行化。
-_LIGHTRAG_WRITE_LOCK_KEY = "mailgraph:lightrag:write"
+_LIGHTRAG_WRITE_LOCK_KEY = "mailgraph:lightrag:write1"
 _lock_client: redis.Redis | None = None
 _lock_client_lock = threading.Lock()
 
@@ -112,10 +112,10 @@ def _get_lock_client() -> redis.Redis:
 
 
 @contextlib.contextmanager
-def lightrag_write_lock(timeout: int = 1800, blocking_timeout: int = 1800):
+def lightrag_write_lock(timeout: int = 300, blocking_timeout: int = 300):
     """获取跨进程的 LightRAG 写入锁（Redis），串行化图谱/向量写入。
 
-    timeout: 持锁自动过期秒数（持锁进程若崩溃，锁到期自动释放，避免死锁）。
+    timeout: 持锁自动过期秒数（持锁进程若崩溃，5 分钟后自动释放）。
     blocking_timeout: 等待获取锁的最长秒数。
     """
     lock = _get_lock_client().lock(

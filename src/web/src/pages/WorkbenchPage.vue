@@ -6,12 +6,13 @@ import TopBar from '@/components/workbench/TopBar.vue'
 import MailList from '@/components/workbench/MailList.vue'
 import ActivityPanel from '@/components/workbench/ActivityPanel.vue'
 import ImportDrawer from '@/components/workbench/ImportDrawer.vue'
+import JobCenter from '@/components/workbench/JobCenter.vue'
 import type { ActivityEvent } from '@/components/workbench/ActivityPanel.vue'
 
 const statusStore = useStatusStore()
 
 // ── Layout state ──
-const drawerMode = ref<'fetch' | 'import' | null>(null)
+const showDrawer = ref(false)
 const searchText = ref('')
 const refreshing = ref(false)
 const sidePanelVisible = ref(true)
@@ -50,14 +51,32 @@ const processLogs = ref<string[]>([])
 const loading = ref(false)
 
 const PAGE_SIZE = 200
+const page = ref(1)
+
+// ── Debounced refresh ──
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer)
+  refreshTimer = setTimeout(() => {
+    refreshList()
+    refreshStats()
+    refreshGraphStatus()
+  }, 1000) // 每秒最多刷新一次，避免每封邮件都触发 API 调用
+}
 
 async function refreshList() {
   try {
     loading.value = true
-    const r = await mailsApi.list({ filter: filter.value, page: 1, page_size: PAGE_SIZE })
+    const r = await mailsApi.list({ filter: filter.value, page: page.value, page_size: PAGE_SIZE })
     mails.value = r?.items || []
     total.value = r?.total || 0
   } catch (e) { console.error(e) } finally { loading.value = false }
+}
+
+function goPage(p: number) {
+  page.value = p
+  refreshList()
 }
 
 // Apply client-side search filter
@@ -91,14 +110,6 @@ function toggleAll() {
 }
 
 // ── Process selected ──
-function isFileMail(m: MailItem): boolean {
-  return !!m.source_type && m.source_type !== 'imap'
-}
-
-function isImapMail(m: MailItem): boolean {
-  return !m.source_type || m.source_type === 'imap'
-}
-
 function isTerminal(m: MailItem): boolean {
   return ['done', 'skipped', 'failed'].includes(m.status)
 }
@@ -108,50 +119,24 @@ async function handleProcess() {
   if (!ids.length) return
 
   const byId = (id: string) => mails.value.find(x => x.message_id === id)
-  // 只有 failed / skipped 才重处理，done 不再动
+  // 未完成（非终态）的邮件统一走 parseSelected，不再区分 IMAP/文件/缓存
+  const parseIds = ids.filter(id => {
+    const m = byId(id); return !!m && !isTerminal(m)
+  })
   const reprocessIds = ids.filter(id => {
     const m = byId(id); return !!m && (m.status === 'failed' || m.status === 'skipped')
-  })
-  const fileIds = ids.filter(id => { const m = byId(id); return !!m && !isTerminal(m) && isFileMail(m) })
-  // 未完成的 IMAP 邮件分两路：
-  //   - pending: 正文未存（噪音过滤掉的），走 reprocess 重拉 IMAP → 入队
-  //   - indexed/processing: 正文已在 Redis，补回 ingest 队列即可
-  const pendingImapIds = ids.filter(id => {
-    const m = byId(id); return !!m && m.status === 'pending' && isImapMail(m)
-  })
-  const otherImapIds = ids.filter(id => {
-    const m = byId(id); return !!m && m.status !== 'pending' && !isTerminal(m) && isImapMail(m)
   })
 
   processing.value = true
   processLogs.value = []
   const promises: Promise<void>[] = []
 
-  if (pendingImapIds.length) {
+  if (parseIds.length) {
     promises.push(new Promise<void>((resolve) => {
-      mailsApi.reprocess(pendingImapIds, {
-        onProgress(d: any) { processLogs.value.push('[重拉] ' + (d.msg || JSON.stringify(d))) },
+      mailsApi.parseSelected(parseIds, {
+        onProgress(d: any) { processLogs.value.push(d.msg || JSON.stringify(d)) },
         onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[重拉] 错误: ' + m); resolve() },
-      })
-    }))
-  }
-
-  if (otherImapIds.length) {
-    promises.push(new Promise<void>((resolve) => {
-      mailsApi.ingest(null, {
-        onProgress(d: any) { processLogs.value.push('[IMAP] ' + (d.msg || JSON.stringify(d))) },
-        onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[IMAP] 错误: ' + m); resolve() },
-      }, otherImapIds)
-    }))
-  }
-  if (fileIds.length) {
-    promises.push(new Promise<void>((resolve) => {
-      mailsApi.parseSelected(fileIds, {
-        onProgress(d: any) { processLogs.value.push('[文件] ' + (d.msg || JSON.stringify(d))) },
-        onComplete() { resolve() },
-        onError(m: string) { processLogs.value.push('[文件] 错误: ' + m); resolve() },
+        onError(m: string) { processLogs.value.push('错误: ' + m); resolve() },
       })
     }))
   }
@@ -172,12 +157,12 @@ async function handleProcess() {
 }
 
 // ── Drawer ──
-function openDrawer(mode: 'fetch' | 'import') {
-  drawerMode.value = mode
+function openDrawer() {
+  showDrawer.value = true
 }
 
 function closeDrawer() {
-  drawerMode.value = null
+  showDrawer.value = false
 }
 
 // ── Data refresh ──
@@ -193,6 +178,7 @@ async function handleRefresh() {
 // 操作完成后刷新：自动切回"全部"让用户看到结果
 async function handleDrawerRefresh() {
   filter.value = 'all'
+  page.value = 1
   selectedIds.value = new Set()
   await refreshAll()
 }
@@ -233,10 +219,8 @@ function connectSSE() {
           detail: d.detail || '',
           timestamp: Date.now(),
         })
-        // Auto-refresh list and stats when a mail is processed
-        refreshList()
-        refreshStats()
-        refreshGraphStatus()
+        // 防抖刷新：大量邮件连续处理时不逐封触发 API 调用
+        scheduleRefresh()
       } catch {}
     })
 
@@ -336,6 +320,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   disconnectSSE()
+  if (refreshTimer) clearTimeout(refreshTimer)
 })
 </script>
 
@@ -364,14 +349,17 @@ onUnmounted(() => {
         <MailList
           :mails="visibleMails"
           :total="total"
+          :page="page"
+          :page-size="PAGE_SIZE"
           :filter="filter"
           :selected-ids="selectedIds"
           :kpi="kpi"
           :processing="processing"
-          @update:filter="(f: MailFilter) => { filter = f; selectedIds = new Set(); refreshList() }"
+          @update:filter="(f: MailFilter) => { filter = f; page = 1; selectedIds = new Set(); refreshList() }"
           @toggle-select="toggleSelect"
           @toggle-all="toggleAll"
           @process="handleProcess"
+          @go-page="(p: number) => goPage(p)"
         />
 
         <!-- Bottom bar -->
@@ -394,22 +382,23 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- Side: activity panel -->
+      <!-- Side: activity panel + job center -->
       <Transition name="panel-slide">
-        <ActivityPanel
-          v-if="sidePanelVisible"
-          :activities="activities"
-          :kpi="kpi"
-          :graph-status="gstatus"
-          :services="services"
-        />
+        <div v-if="sidePanelVisible" class="wb-side">
+          <JobCenter />
+          <ActivityPanel
+            :activities="activities"
+            :kpi="kpi"
+            :graph-status="gstatus"
+            :services="services"
+          />
+        </div>
       </Transition>
     </div>
 
     <!-- Import drawer -->
     <ImportDrawer
-      :open="drawerMode !== null"
-      :mode="drawerMode"
+      :open="showDrawer"
       @close="closeDrawer"
       @refresh="handleDrawerRefresh"
     />
@@ -492,6 +481,17 @@ onUnmounted(() => {
 
 .wb-refresh-btn {
   margin-left: auto;
+}
+
+.wb-side {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 340px;
+  min-width: 280px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  overflow-x: visible;
 }
 
 .wb-toggle-panel {

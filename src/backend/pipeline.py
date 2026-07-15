@@ -120,9 +120,16 @@ class Pipeline:
             dl_dir = Path(attach_root) / _safe(uid or forced_message_id or "file")
             parsed = parse_email(msg, download_dir=dl_dir)
 
-            # 文件邮件兜底：无 Message-ID 时用扫描阶段合成的 id
+            # 文件邮件兜底：无 Message-ID 时用扫描阶段合成的 id。
+            # 同时归一化尖括号：parse_email 可能产出 "<id>"，scan 阶段是无尖括号
+            # 的原始 id，若实质相同则统一用 forced_message_id 保持记录一致。
             if not parsed.message_id and forced_message_id:
                 parsed.message_id = forced_message_id
+            else:
+                _norm = (parsed.message_id or "").strip().strip("<>")
+                _forced = (forced_message_id or "").strip().strip("<>")
+                if _norm and _norm == _forced:
+                    parsed.message_id = forced_message_id
 
             # message_id 级兜底去重（UID 复用 / 跨 folder 同信时 UID 过滤会漏）
             if not skip_processed and cache.is_processed(parsed.message_id):
@@ -257,7 +264,7 @@ class Pipeline:
             while True:
                 if limit and i >= limit:
                     break
-                mail = cache.claim_pending_mail()   # 原子领取：多 worker 不会拿到同一封
+                mail = cache.claim_pending_mail_tracked()   # 原子领取+inflight 追踪
                 if mail is None:
                     break                            # 队列已被各 worker 取空
                 i += 1
@@ -290,9 +297,18 @@ class Pipeline:
                     mail_att_failed = 0
                     for att in mail.get("attachments", []):
                         apath = att.get("path", "")
+                        att_fn = att.get("filename", "")
                         if apath and Path(apath).exists():
-                            att_text = _parse_attachment(apath, att.get("filename", ""))
+                            cache.set_attachment_status(mid, att_fn, "parsing")
+                            att_text, degrade = _parse_attachment(apath, att_fn)
                             if att_text:
+                                if degrade:
+                                    cache.set_attachment_status(
+                                        mid, att_fn, "degraded", degrade)
+                                    logger.warning(
+                                        "附件解析降级 %s/%s: %s", mid, att_fn, degrade)
+                                else:
+                                    cache.set_attachment_status(mid, att_fn, "parsed")
                                 att_doc_id = f"{mid}:{att.get('filename', '')}"
                                 try:
                                     insert_mail(att_text, att_doc_id)
@@ -301,13 +317,17 @@ class Pipeline:
                                     # 仅成功入库的附件才允许清理源文件
                                     uploaded_paths.append(apath)
                                 except Exception as e:
-                                    # 附件失败不阻断正文入库，但必须计入失败、保留源文件供重试、显性上报，
-                                    # 绝不能像旧逻辑那样静默 warning 后仍按成功计数。
                                     mail_att_failed += 1
                                     stats["att_failed"] += 1
+                                    cache.set_attachment_status(
+                                        mid, att_fn, "failed", str(e)[:100])
                                     logger.error(
                                         "LightRAG attachment insert failed (%s): %s", att_doc_id, e)
-                                    log(f"  [{i}] ⚠ 附件入库失败：{att.get('filename', '')}")
+                                    log(f"  [{i}] ⚠ 附件入库失败：{att_fn}")
+                            else:
+                                # 解析失败（如缺库、格式不支持）直接跳过，不阻塞
+                                cache.set_attachment_status(mid, att_fn, "skipped", degrade or "解析失败")
+                                logger.debug("附件解析跳过 %s/%s: %s", mid, att_fn, degrade or "解析失败")
 
                     # 正文（及成功的附件）已入库，记录 doc_id → message_id 供证据归属
                     cache.mark_ingested(mid, doc_id=body_doc_id,
@@ -392,10 +412,17 @@ class Pipeline:
             att_doc_ids = []
             for att in mail.get("attachments", []):
                 apath = att.get("path", "")
+                att_fn = att.get("filename", "")
                 if apath and Path(apath).exists():
-                    att_text = _parse_attachment(apath, att.get("filename", ""))
+                    cache.set_attachment_status(message_id, att_fn, "parsing")
+                    att_text, degrade = _parse_attachment(apath, att_fn)
                     if att_text:
-                        att_doc_id = f"{message_id}:{att.get('filename', '')}"
+                        if degrade:
+                            cache.set_attachment_status(
+                                message_id, att_fn, "degraded", degrade)
+                        else:
+                            cache.set_attachment_status(message_id, att_fn, "parsed")
+                        att_doc_id = f"{message_id}:{att_fn}"
                         try:
                             insert_mail(att_text, att_doc_id)
                             att_doc_ids.append(att_doc_id)
@@ -403,7 +430,13 @@ class Pipeline:
                             uploaded_paths.append(apath)
                         except Exception as e:
                             stats["att_failed"] += 1
+                            cache.set_attachment_status(
+                                message_id, att_fn, "failed", str(e)[:100])
                             logger.error("LightRAG attachment insert failed (%s): %s", att_doc_id, e)
+                    else:
+                        # 解析失败直接跳过，不计入失败
+                        cache.set_attachment_status(message_id, att_fn, "skipped", degrade or "解析失败")
+                        logger.debug("附件解析跳过 %s/%s: %s", message_id, att_fn, degrade or "解析失败")
 
             # 3) 标记完成
             cache.mark_ingested(message_id, doc_id=doc_id if body else "",
@@ -494,14 +527,110 @@ class Pipeline:
             f"新增待解析 {stats['indexed']}")
         return stats
 
-    def parse_selected(self, message_ids: list[str], on_log=None) -> dict:
-        """Step 2：对选中的 indexed 邮件回原文件读正文（含附件），清洗入队后 ingest 向量化。
+    def run_scan(self, source: str, params: dict | None = None, on_log=None) -> dict:
+        """统一扫描入口：IMAP 拉表头 / 文件扫表头 → indexed 清单。
 
-        按源文件归组，PST/OST 每个文件只 open 一次。用户显式勾选的邮件不做噪音过滤。
+        source="imap": 用 fetch_headers 只拉 ENVELOPE 级元数据，不下载正文。
+        source="file":  复用 run_index_files 扫 .eml/.msg/.pst/.ost。
+
+        产出 indexed 邮件后，用户从清单勾选 → parse_selected → worker 建图。
+        """
+        log = on_log or (lambda m: logger.info(m))
+        params = params or {}
+
+        if source == "imap":
+            return self._run_scan_imap(params, log)
+        elif source == "file":
+            paths = params.get("paths", [])
+            return self.run_index_files(paths, on_log=on_log)
+        else:
+            log(f"未知来源类型: {source}")
+            return {"source": source, "scanned": 0, "indexed": 0}
+
+    def _run_scan_imap(self, params: dict, log) -> dict:
+        """IMAP header-only scan: 拉 ENVELOPE → store_indexed。"""
+        from src.backend.mail.imap_client import IMAPClient
+        from src.backend.storage.redis_cache import MailCache
+
+        folder = params.get("folder", "INBOX")
+        limit = params.get("limit")
+        since = params.get("since")
+        before = params.get("before")
+
+        if not self.account:
+            log("未配置邮箱账号")
+            return {"source": "imap", "scanned": 0, "indexed": 0}
+
+        client = IMAPClient(self.account)
+        cache = MailCache(self.account_id)
+        stats = {"source": "imap", "folder": folder, "scanned": 0, "indexed": 0}
+
+        try:
+            # 获取文件夹总量
+            client.select_folder(folder)
+            # 搜索 UID 范围
+            uids = client.search_uids(folder, since=since, before=before)
+            if limit:
+                uids = uids[-limit:]  # 取最新的 N 封
+
+            if not uids:
+                log(f"IMAP {folder}: 没有匹配的邮件")
+                return stats
+
+            log(f"IMAP {folder}: 扫描 {len(uids)} 封邮件的表头...")
+            stats["total"] = len(uids)
+
+            # 批量拉表头（每批 100）
+            batch_size = 100
+            indexed_uids = []
+            for i in range(0, len(uids), batch_size):
+                chunk = uids[i:i + batch_size]
+                headers = client.fetch_headers(chunk, folder)
+                for uid in chunk:
+                    hdr = headers.get(str(uid))
+                    if not hdr:
+                        continue
+                    stats["scanned"] += 1
+                    from src.backend.mail.sources.base import HeaderRecord
+                    rec = HeaderRecord(
+                        subject=hdr.get("subject", ""),
+                        from_addr=hdr.get("from_addr", ""),
+                        from_name="",
+                        date=hdr.get("date", ""),
+                        message_id=hdr.get("message_id", f"imap:{uid}"),
+                        folder=folder,
+                        has_attachment=False,
+                        locator={
+                            "source_type": "imap",
+                            "folder": folder,
+                            "uid": uid,
+                            "account_id": self.account_id,
+                        },
+                    )
+                    if cache.store_indexed(rec):
+                        stats["indexed"] += 1
+                        indexed_uids.append(uid)
+                if stats["scanned"] % 200 == 0 or (i + batch_size >= len(uids)):
+                    log(f"  已扫描 {stats['scanned']}/{stats['total']}，入库 {stats['indexed']}")
+
+        finally:
+            client.disconnect()
+            cache.close()
+
+        log(f"IMAP 扫描完成：{stats['indexed']}/{stats['total']} 封新邮件入库")
+        return stats
+
+    def parse_selected(self, message_ids: list[str], on_log=None) -> dict:
+        """Step 2：对选中的 indexed 邮件拉取正文（含附件），清洗入队后 ingest 向量化。
+
+        文件源（eml/msg/pst）按源文件归组，PST/OST 每个文件只 open 一次。
+        IMAP 源通过 IMAPClient.fetch_batch 按 folder 归组拉取。
+        用户显式勾选的邮件不做噪音过滤。
         """
         import json as _json
 
         from src.backend.mail.sources import open_reader
+        from src.backend.mail.imap_client import IMAPClient
         from src.backend.mail.cleaner import MailCleaner
         from src.backend.storage.redis_cache import MailCache
 
@@ -514,8 +643,10 @@ class Pipeline:
         attach_root = self.cfg.resolve_data_path("attachments")
 
         queued = 0
-        # 按 (源类型, 源文件) 归组
-        groups: dict[tuple[str, str], list[tuple[str, dict, str]]] = {}
+        # 按源分组：文件源按 (source_type, path)，IMAP 源按 folder
+        file_groups: dict[tuple[str, str], list[tuple[str, dict, str]]] = {}
+        imap_by_folder: dict[str, list[tuple[str, str, str]]] = {}  # folder → [(mid, uid, status)]
+
         try:
             for mid in message_ids or []:
                 state = cache.get_mail_state(mid)
@@ -527,10 +658,19 @@ class Pipeline:
                     locator = {}
                 if not locator:
                     continue
-                key = (locator.get("source_type", ""), locator.get("path", ""))
-                groups.setdefault(key, []).append((mid, locator, state.get("folder", "")))
+                stype = locator.get("source_type", "")
+                if stype == "imap":
+                    folder = locator.get("folder", "INBOX")
+                    uid = str(locator.get("uid", ""))
+                    if uid:
+                        imap_by_folder.setdefault(folder, []).append(
+                            (mid, uid, state.get("status", "indexed")))
+                else:
+                    key = (stype, locator.get("path", ""))
+                    file_groups.setdefault(key, []).append((mid, locator, state.get("folder", "")))
 
-            for (stype, spath), items in groups.items():
+            # ── 文件源：从本地文件读取正文 ──
+            for (stype, spath), items in file_groups.items():
                 log(f"解析 {Path(spath).name} 的 {len(items)} 封...")
                 reader = open_reader(stype, spath)
                 try:
@@ -553,6 +693,63 @@ class Pipeline:
                         reader.close()
                     except Exception:
                         pass
+
+            # ── IMAP 源：按状态区分处理 ──
+            #   indexed（待入库）：新邮件，直接 IMAP 拉正文。
+            #   failed（失败·可重试）：先查 Redis 缓存，有就直接入队（省一次 IMAP），没有再拉。
+            if imap_by_folder:
+                retry_from_cache = 0
+                uncached: dict[str, list[tuple[str, str]]] = {}  # folder → [(mid, uid)]
+
+                for folder, items in imap_by_folder.items():
+                    for mid, uid, status in items:
+                        if status == "failed":
+                            # 检查上次是否已拉过正文（缓存还在）
+                            cached_body = cache.get_mail(mid)
+                            last_error = (cache.get_mail_state(mid) or {}).get("error", "")
+                            if cached_body is not None:
+                                cache.r.sadd(cache._k("ingest_queue"), mid)
+                                cache.mark_processing(
+                                    mid, uid, folder,
+                                    cached_body.get("subject", ""),
+                                    cached_body.get("from_addr", ""),
+                                    cached_body.get("date", ""),
+                                )
+                                queued += 1
+                                retry_from_cache += 1
+                                subj = (cached_body.get("subject") or "(无主题)")[:50]
+                                reason = f"，上次失败原因: {last_error}" if last_error else ""
+                                log(f"  [{queued}] [缓存] {subj}{reason}")
+                            else:
+                                uncached.setdefault(folder, []).append((mid, uid))
+                        else:
+                            # indexed 等：直接拉 IMAP
+                            uncached.setdefault(folder, []).append((mid, uid))
+
+                if retry_from_cache:
+                    log(f"  ↳ {retry_from_cache} 封从缓存恢复，无需重复拉 IMAP")
+
+                if uncached:
+                    with IMAPClient(self.account) as client:
+                        for folder, items in uncached.items():
+                            uid_map = {uid: mid for mid, uid in items}
+                            uids = list(uid_map.keys())
+                            log(f"IMAP 拉取 {folder} 的 {len(uids)} 封...")
+                            try:
+                                for uid, msg in client.fetch_batch(uids, folder=folder):
+                                    mid = uid_map.get(str(uid), "")
+                                    parsed = self._store_fetched_mail(
+                                        uid, msg, folder, cache, cleaner, attach_root,
+                                        forced_message_id=mid, apply_noise_filter=False,
+                                        on_log=log,
+                                    )
+                                    if parsed is not None:
+                                        queued += 1
+                                        log(f"  [{queued}] {(parsed.subject or '(无主题)')[:50]}")
+                            except Exception as e:
+                                logger.error("IMAP 拉取失败 folder=%s: %s", folder, e)
+                                for mid, _uid in items:
+                                    cache.mark_failed(mid, str(e))
         finally:
             cache.close()
 
@@ -565,7 +762,14 @@ class Pipeline:
     # ══════════════════════════════════════════════
 
     def reprocess(self, message_ids: list[str], on_log=None) -> dict:
-        """强制重新处理指定邮件：重置状态 → 重新拉取正文 → LightRAG 重建。"""
+        """强制重新处理指定邮件：重置状态 → 重新拉取正文 → LightRAG 重建。
+
+        按当前状态分流：
+        - failed（失败·可重试）：先查 Redis 缓存，有就直接入队（省一次 IMAP）；没有再拉。
+        - 其他（pending/skipped）：重置后走 IMAP 拉取全文。
+        """
+        import json as _json
+
         from src.backend.storage.redis_cache import MailCache
         from src.backend.mail.imap_client import IMAPClient
         from src.backend.mail.cleaner import MailCleaner
@@ -580,33 +784,71 @@ class Pipeline:
 
         reset_n = 0
         requeued = 0
+        from_cache = 0
         try:
-            # 1) 重置状态，按 folder 归组待重拉的 uid
+            # 1) 分流：failed 先查缓存，其余走重置+重拉
             by_folder: dict[str, list[str]] = {}
             for mid in message_ids:
                 meta = cache.get_mail_state(mid)
                 if not meta:
                     continue
+                status = meta.get("status", "")
+
+                # 失败邮件：优先用缓存正文（上次可能已拉取成功只是后续步骤失败）
+                if status == "failed":
+                    cached_body = cache.get_mail(mid)
+                    last_error = meta.get("error_msg", "")
+                    if cached_body is not None:
+                        # 正文还在，直接重新入队
+                        cache.r.sadd(cache._k("ingest_queue"), mid)
+                        cache.mark_processing(
+                            mid,
+                            meta.get("uid", ""),
+                            meta.get("folder", "INBOX"),
+                            cached_body.get("subject", ""),
+                            cached_body.get("from_addr", ""),
+                            cached_body.get("date", ""),
+                        )
+                        requeued += 1
+                        from_cache += 1
+                        subj = (cached_body.get("subject") or "(无主题)")[:50]
+                        reason = f"，上次失败: {last_error}" if last_error else ""
+                        log(f"  [{requeued}] [缓存恢复] {subj}{reason}")
+                        continue
+
+                # 其他状态 / 缓存未命中 → 重置后走 IMAP 拉取
                 cache.reset_email(mid)
                 uid = meta.get("uid", "")
                 folder = meta.get("folder", "INBOX")
+                # uid 可能存于 source_locator 中（store_indexed 的顶层 uid 为空串）
+                if not uid:
+                    try:
+                        locator = _json.loads(meta.get("source_locator", "{}") or "{}")
+                        uid = str(locator.get("uid", ""))
+                    except Exception:
+                        pass
                 if uid:
                     by_folder.setdefault(folder, []).append(uid)
                 reset_n += 1
 
-            log(f"已重置 {reset_n} 封，重新拉取正文...")
+            if from_cache:
+                log(f"  ↳ {from_cache} 封从缓存恢复，无需重复拉 IMAP")
 
             # 2) 重新从 IMAP 拉这些 uid → 重新入队
             if by_folder:
+                log(f"已重置 {reset_n} 封，重新拉取正文...")
                 with IMAPClient(self.account) as client:
                     for folder, uids in by_folder.items():
+                        log(f"IMAP 拉取 {folder} 的 {len(uids)} 封...")
                         for uid, msg in client.fetch_batch(uids, folder=folder):
-                            if self._store_fetched_mail(uid, msg, folder,
-                                                        cache, cleaner, attach_root,
-                                                        skip_processed=True,
-                                                        apply_noise_filter=False,
-                                                        on_log=log) is not None:
+                            parsed = self._store_fetched_mail(uid, msg, folder,
+                                                              cache, cleaner, attach_root,
+                                                              skip_processed=True,
+                                                              apply_noise_filter=False,
+                                                              on_log=log)
+                            if parsed is not None:
                                 requeued += 1
+                                log(f"  [{requeued}] {(parsed.subject or '(无主题)')[:50]}")
             log(f"重新入队 {requeued} 封，待建图...")
         finally:
             cache.close()
@@ -620,43 +862,79 @@ def _safe(s: str) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "_", str(s))[:32]
 
 
-def _parse_attachment(filepath: str, filename: str) -> str:
-    """解析附件文本：优先 DeepDoc，回落 pypdf/docx。"""
+def _parse_attachment(filepath: str, filename: str,
+                     timeout: float | None = None,
+                     on_status=None) -> tuple[str, str]:
+    """解析附件文本：优先 DeepDoc，回落 pypdf/docx。
+
+    Returns (text, degrade_reason):
+      - degrade_reason="" → 满血 DeepDoc 解析
+      - degrade_reason="deepdoc_model_missing" → DeepDoc 模型缺失，已回落
+      - degrade_reason="deepdoc_error" → DeepDoc 异常，已回落
+      - degrade_reason="fallback" → 无 DeepDoc 支持此格式，直接回落
+    """
+    import signal
     ext = Path(filepath).suffix.lower()
+    degrade = ""
+
+    def _deepdoc_pdf():
+        from src.backend.knowledge.plugins.parser.pdf_parser import RAGFlowPdfParser
+        parser = RAGFlowPdfParser()
+        text_blocks, _ = parser(filepath, need_image=False, zoomin=3, return_html=False)
+        text = "\n".join(parser.remove_tag(t) for t in (text_blocks or []))
+        return text.strip()
+
+    def _deepdoc_docx():
+        from src.backend.knowledge.plugins.parser.docx_parser import DocxParser
+        parser = DocxParser()
+        text_blocks, _ = parser(filepath)
+        text = "\n".join(b if isinstance(b, str) else str(b) for b in (text_blocks or []))
+        return text.strip()
 
     # 尝试 DeepDoc（PDF: 布局+OCR+表格）
     if ext == ".pdf":
         try:
-            from src.backend.knowledge.plugins.parser.pdf_parser import RAGFlowPdfParser
-            parser = RAGFlowPdfParser()
-            text_blocks, _ = parser(filepath, need_image=False, zoomin=3, return_html=False)
-            text = "\n".join(parser.remove_tag(t) for t in (text_blocks or []))
-            if text.strip():
-                return text[:20000]
+            text = _deepdoc_pdf()
+            if text:
+                return text[:20000], ""
+        except FileNotFoundError as e:
+            # onnx 模型缺失（LFS 132 字节指针占位符）→ 显式标 degraded
+            degrade = "deepdoc_model_missing"
+            logger.warning("DeepDoc PDF model missing, degraded fallback for %s: %s", filename, e)
         except Exception as e:
-            logger.debug("DeepDoc PDF failed, fallback: %s", e)
+            degrade = "deepdoc_error"
+            logger.warning("DeepDoc PDF failed, degraded fallback for %s: %s", filename, e)
 
     if ext in (".docx", ".doc"):
         try:
-            from src.backend.knowledge.plugins.parser.docx_parser import DocxParser
-            parser = DocxParser()
-            text_blocks, _ = parser(filepath)
-            text = "\n".join(b if isinstance(b, str) else str(b) for b in (text_blocks or []))
-            if text.strip():
-                return text[:20000]
+            text = _deepdoc_docx()
+            if text:
+                return text[:20000], ""
+        except FileNotFoundError as e:
+            degrade = "deepdoc_model_missing"
+            logger.warning("DeepDoc Docx model missing, degraded fallback for %s: %s", filename, e)
         except Exception as e:
-            logger.debug("DeepDoc Docx failed, fallback: %s", e)
+            degrade = "deepdoc_error"
+            logger.warning("DeepDoc Docx failed, degraded fallback for %s: %s", filename, e)
+
+    if not degrade and ext in (".pdf", ".docx", ".doc"):
+        degrade = "fallback"
+
+    if on_status:
+        on_status("parsing")
 
     # 回落简单解析
     try:
         if ext == ".pdf":
             from pypdf import PdfReader
             reader = PdfReader(filepath)
-            return "\n".join(p.extract_text() or "" for p in reader.pages)[:10000]
+            text = "\n".join(p.extract_text() or "" for p in reader.pages)[:10000]
+            return text, degrade
         elif ext in (".docx", ".doc"):
             from docx import Document
             doc = Document(filepath)
-            return "\n".join(p.text for p in doc.paragraphs)[:10000]
+            text = "\n".join(p.text for p in doc.paragraphs)[:10000]
+            return text, degrade
         elif ext in (".xlsx", ".xls"):
             import openpyxl
             wb = openpyxl.load_workbook(filepath, data_only=True)
@@ -664,12 +942,13 @@ def _parse_attachment(filepath: str, filename: str) -> str:
             for ws in wb.worksheets:
                 for row in ws.iter_rows(values_only=True):
                     texts.append("\t".join(str(c or "") for c in row))
-            return "\n".join(texts)[:10000]
+            return "\n".join(texts)[:10000], ""
         elif ext in (".txt", ".md", ".csv", ".log"):
-            return Path(filepath).read_text(encoding="utf-8", errors="ignore")[:10000]
+            text = Path(filepath).read_text(encoding="utf-8", errors="ignore")[:10000]
+            return text, ""
     except Exception as e:
         logger.warning("附件解析失败 %s: %s", filename, e)
-    return ""
+    return "", "parse_error"
 
 
 def _cleanup_attachments(mail: dict, only_paths: list[str] | None = None):
