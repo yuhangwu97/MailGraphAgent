@@ -11,6 +11,7 @@ const props = defineProps<{
   selectedIds: Set<string>
   kpi: MailStats
   processing: boolean
+  loading: boolean
 }>()
 
 const emit = defineEmits<{
@@ -130,7 +131,11 @@ function failReason(m: MailItem): string {
 
     <!-- Table -->
     <div class="ml-table-wrap">
-      <table v-if="mails.length" class="ml-table">
+      <div v-if="loading" class="ml-loading">
+        <span class="ml-spinner"></span>
+        <span>加载中...</span>
+      </div>
+      <table v-else-if="mails.length" class="ml-table">
         <thead>
           <tr>
             <th class="col-cb"></th>
@@ -316,6 +321,31 @@ function failReason(m: MailItem): string {
   background: rgba(255,255,255,0.25);
   font-size: 0.68rem;
   font-weight: 700;
+}
+
+/* ── Loading ── */
+.ml-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  padding: 3rem;
+  color: var(--t4);
+  font-size: 0.82rem;
+}
+
+.ml-spinner {
+  width: 22px;
+  height: 22px;
+  border: 2.5px solid var(--border);
+  border-top-color: var(--p);
+  border-radius: 50%;
+  animation: ml-spin 0.7s linear infinite;
+}
+
+@keyframes ml-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* ── Table ── */

@@ -64,9 +64,6 @@ echo.
 echo [2/3] Starting Workers (x5)...
 start "MailGraph Worker 1" cmd /k "cd /d %ROOT% && set PYTHONPATH=%ROOT% && %ROOT%\.venv\Scripts\python.exe -m src.backend.worker"
 start "MailGraph Worker 2" cmd /k "cd /d %ROOT% && set PYTHONPATH=%ROOT% && %ROOT%\.venv\Scripts\python.exe -m src.backend.worker"
-start "MailGraph Worker 3" cmd /k "cd /d %ROOT% && set PYTHONPATH=%ROOT% && %ROOT%\.venv\Scripts\python.exe -m src.backend.worker"
-start "MailGraph Worker 4" cmd /k "cd /d %ROOT% && set PYTHONPATH=%ROOT% && %ROOT%\.venv\Scripts\python.exe -m src.backend.worker"
-start "MailGraph Worker 5" cmd /k "cd /d %ROOT% && set PYTHONPATH=%ROOT% && %ROOT%\.venv\Scripts\python.exe -m src.backend.worker"
 
 echo [3/3] Starting Frontend (port 5173)...
 start "MailGraph Frontend" cmd /k "cd /d %ROOT%\src\web && npm run dev"

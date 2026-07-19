@@ -126,7 +126,7 @@ def pending_mails(
 def list_all_mails(
     filter: str = Query("all", pattern="^(all|todo|done)$"),
     page: int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1, le=500),
+    page_size: int = Query(100, ge=1, le=1000),
     cache=Depends(get_cache),
 ):
     """统一邮件列表：所有状态合并、按日期倒序、分页。
@@ -148,7 +148,7 @@ def list_all_mails(
 @router.get("/done", response_model=PaginatedMailResponse)
 def done_mails(
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=500),
+    page_size: int = Query(20, ge=1, le=1000),
     cache=Depends(get_cache),
 ):
     if cache is None:
@@ -309,7 +309,7 @@ def browse_files(dir: str | None = Query(None, description="要浏览的目录�
 def indexed_mails(
     status: str = Query("pending", pattern="^(pending|done|all)$"),
     page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=500),
+    page_size: int = Query(50, ge=1, le=1000),
     cache=Depends(get_cache),
 ):
     """列出已索引邮件（IMAP 表头扫描 + 文件扫描统一入口）。
