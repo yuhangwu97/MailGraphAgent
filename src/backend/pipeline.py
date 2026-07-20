@@ -277,13 +277,18 @@ class Pipeline:
                     body = mail.get("cleaned_body") or ""
                     # 回信邮件：正文前注入会话线程上下文，让同线程邮件的实体在图上连起来
                     body = self._with_thread_context(cache, mail, body)
+
+                    # 附件名注入正文（不解析附件内容，只建立邮件↔附件名的关系）
+                    att_names = [a.get("filename", "") for a in mail.get("attachments", [])
+                                 if a.get("filename")]
+                    if att_names:
+                        body = (body or "(无正文)") + "\n\n[附件: " + ", ".join(att_names) + "]"
+
                     body_doc_id = ""
                     if body:
                         try:
                             body_doc_id = insert_mail(body, mid)
                         except Exception as e:
-                            # 正文入库失败绝不能假成功：标记 failed、出队、保留正文供重试，
-                            # 且不执行 mark_ingested（否则会 drop_body 丢正文并误报成功）。
                             stats["failed"] += 1
                             cache.mark_ingest_failed(
                                 mid, f"LightRAG body insert failed: {e}", drop_body=False)
@@ -291,85 +296,141 @@ class Pipeline:
                             log(f"  [{i}] ✗ {subj}: 正文入库失败，已标记 failed")
                             continue
 
-                    # 2) 附件 → DeepDoc 解析后也入 LightRAG
-                    uploaded_paths = []
-                    att_doc_ids = []
-                    mail_att_failed = 0
-                    for att in mail.get("attachments", []):
-                        apath = att.get("path", "")
-                        att_fn = att.get("filename", "")
-                        if apath and Path(apath).exists():
-                            cache.set_attachment_status(mid, att_fn, "parsing")
-                            att_text, degrade = _parse_attachment(apath, att_fn)
-                            if att_text:
-                                if degrade:
-                                    cache.set_attachment_status(
-                                        mid, att_fn, "degraded", degrade)
-                                    logger.warning(
-                                        "附件解析降级 %s/%s: %s", mid, att_fn, degrade)
-                                else:
-                                    cache.set_attachment_status(mid, att_fn, "parsed")
-                                att_doc_id = f"{mid}:{att.get('filename', '')}"
-                                try:
-                                    insert_mail(att_text, att_doc_id)
-                                    att_doc_ids.append(att_doc_id)
-                                    stats["attachments"] += 1
-                                    # 仅成功入库的附件才允许清理源文件
-                                    uploaded_paths.append(apath)
-                                except Exception as e:
-                                    mail_att_failed += 1
-                                    stats["att_failed"] += 1
-                                    cache.set_attachment_status(
-                                        mid, att_fn, "failed", str(e)[:100])
-                                    logger.error(
-                                        "LightRAG attachment insert failed (%s): %s", att_doc_id, e)
-                                    log(f"  [{i}] ⚠ 附件入库失败：{att_fn}")
-                            else:
-                                # 解析失败（如缺库、格式不支持）直接跳过，不阻塞
-                                cache.set_attachment_status(mid, att_fn, "skipped", degrade or "解析失败")
-                                logger.debug("附件解析跳过 %s/%s: %s", mid, att_fn, degrade or "解析失败")
-
-                    # 正文（及成功的附件）已入库，记录 doc_id → message_id 供证据归属
-                    cache.mark_ingested(mid, doc_id=body_doc_id,
-                                        att_doc_ids=att_doc_ids, drop_body=True)
-                    _cleanup_attachments(mail, only_paths=uploaded_paths)
+                    # 入库成功
+                    cache.mark_ingested(mid, doc_id=body_doc_id, drop_body=True)
                     stats["uploaded"] += 1
                     try:
                         publish_event("mail_processed", {
                             "message_id": mid,
                             "subject": mail.get("subject", ""),
                             "status": "done",
-                            "detail": f"正文 + {stats['attachments']} 附件已入库",
+                            "detail": "已入库",
                         })
                     except Exception:
                         pass
-                    if mail_att_failed:
-                        log(f"  [{i}] ⚠ {subj}（正文已入库，{mail_att_failed} 个附件失败，已保留待重试）")
-                    else:
-                        log(f"  [{i}] ✓ {subj}")
+                    log(f"  [{i}] ✓ {subj}")
                 except Exception as e:
                     stats["failed"] += 1
                     if mid:
                         cache.mark_ingest_failed(mid, str(e), drop_body=False)
-                    try:
-                        publish_event("mail_processed", {
-                            "message_id": mid,
-                            "subject": mail.get("subject", "(无主题)")[:50],
-                            "status": "failed",
-                            "detail": str(e)[:200],
-                        })
-                    except Exception:
-                        pass
-                    logger.error(f"  [{i}] ✗ {subj}: {e}")
         finally:
             cache.close()
 
-        done_msg = (f"完成：{stats['uploaded']}/{stats['total']} 封 "
-                    f"(附件 {stats['attachments']}，失败 {stats['failed']}")
-        if stats["att_failed"]:
-            done_msg += f"，附件失败 {stats['att_failed']}"
-        done_msg += ")"
+        done_msg = f"完成：{stats['uploaded']}/{stats['total']} 封，失败 {stats['failed']}"
         log(done_msg)
+        return stats
+
+    def run_ingest_batch(self, message_ids: list[str], on_log=None) -> dict:
+        """批量处理多封邮件入 LightRAG：一次拿锁、多封一起 ainsert。
+
+        每封邮件的正文/附件解析并发执行，只在实际写图时串行化。
+        相比逐个 run_ingest_one，吞吐量随批量大小线性提升。
+        """
+        from src.backend.knowledge.lightrag_wrapper import insert_mails_batch
+        from src.backend.storage.redis_cache import MailCache
+
+        log = on_log or (lambda m: logger.info(m))
+        cache = MailCache(self.account_id)
+
+        total = len(message_ids)
+        stats = {"total": total, "uploaded": 0, "failed": 0,
+                 "attachments": 0, "att_failed": 0, "skipped": 0,
+                 "batch": True}
+
+        # ── Phase 1：准备 — 所有邮件并行解析 ──
+        log(f"━━━ 批次开始：{total} 封邮件 ━━━")
+        pending: list[dict] = []  # [{message_id, subj, body, mail, docs: [(text, doc_id), ...]}]
+        batch_docs: list[tuple[str, str]] = []  # [(text, doc_id), ...]
+
+        for idx, mid in enumerate(message_ids, 1):
+            try:
+                removed = cache.r.srem(cache._k("ingest_queue"), mid)
+                if not removed:
+                    log(f"邮件 {mid[:16]}… 不在 ingest 队列中，跳过")
+                    stats["skipped"] += 1
+                    continue
+
+                mail = cache.get_mail(mid)
+                if not mail:
+                    cache.mark_ingest_failed(mid, "正文已过期", drop_body=False)
+                    log(f"邮件 {mid[:16]}… 正文已过期，标记 failed")
+                    stats["failed"] += 1
+                    continue
+
+                subj = (mail.get("subject") or "(无主题)")[:50]
+                entry = {"message_id": mid, "subj": subj, "mail": mail,
+                         "docs": []}
+
+                # 正文
+                body = mail.get("cleaned_body") or ""
+                body = self._with_thread_context(cache, mail, body)
+
+                # 附件名注入正文（不解析附件内容，只建立邮件↔附件名的关系）
+                att_names = [a.get("filename", "") for a in mail.get("attachments", [])
+                             if a.get("filename")]
+                if att_names:
+                    body = (body or "(无正文)") + "\n\n[附件: " + ", ".join(att_names) + "]"
+
+                if body:
+                    entry["docs"].append((body, mid))
+
+                pending.append(entry)
+                for text, doc_id in entry["docs"]:
+                    batch_docs.append((text, doc_id))
+                log(f"  [{idx}/{total}] {subj}")
+
+            except Exception as e:
+                log(f"  [{idx}/{total}] ✗ 准备失败: {e}")
+                logger.error("prepare failed for %s: %s", mid, e)
+                try:
+                    cache.mark_ingest_failed(mid, str(e), drop_body=False)
+                except Exception:
+                    pass
+                stats["failed"] += 1
+
+        # ── Phase 2：批量插入 — 一次拿锁 ──
+        if batch_docs:
+            try:
+                log(f"━━━ 开始写入：{len(batch_docs)} 篇文档（{len(pending)} 封邮件），等待 LightRAG 写锁...")
+                inserted = set(insert_mails_batch(batch_docs))
+                log(f"━━━ 写入完成：{len(inserted)} 篇入库")
+            except Exception as e:
+                logger.exception("batch insert failed")
+                # 全部标记失败
+                for entry in pending:
+                    try:
+                        cache.mark_ingest_failed(entry["message_id"], str(e), drop_body=False)
+                    except Exception:
+                        pass
+                    stats["failed"] += 1
+                return stats
+
+            # ── Phase 3：标记完成 ──
+            for entry in pending:
+                mid = entry["message_id"]
+                body_inserted = mid in inserted
+                try:
+                    cache.mark_ingested(mid,
+                                        doc_id=mid if body_inserted else "",
+                                        drop_body=True)
+                    stats["uploaded"] += 1
+                    try:
+                        publish_event("mail_processed", {
+                            "message_id": mid,
+                            "subject": entry["mail"].get("subject", ""),
+                            "status": "done",
+                            "detail": "正文已入库",
+                        })
+                    except Exception:
+                        pass
+                    log(f"  ✓ {entry['subj']}")
+                except Exception as e:
+                    cache.mark_ingest_failed(mid, str(e), drop_body=False)
+                    stats["failed"] += 1
+                    log(f"  ✗ {entry['subj']}: {e}")
+
+        log(f"批次完成：{stats['uploaded']}/{total} 成功，{stats['failed']} 失败，"
+            f"{stats['attachments']} 附件")
         return stats
 
     def run_ingest_one(self, message_id: str, on_log=None) -> dict:
@@ -394,65 +455,36 @@ class Pipeline:
                 return {"message_id": message_id, "status": "body_expired"}
 
             subj = (mail.get("subject") or "(无主题)")[:50]
-            stats = {"message_id": message_id, "attachments": 0, "att_failed": 0, "status": "ok"}
 
-            # 1) 正文 → LightRAG
+            # 正文 + 附件名注入（不解析附件内容）
             body = mail.get("cleaned_body") or ""
             body = self._with_thread_context(cache, mail, body)
+            att_names = [a.get("filename", "") for a in mail.get("attachments", [])
+                         if a.get("filename")]
+            if att_names:
+                body = (body or "(无正文)") + "\n\n[附件: " + ", ".join(att_names) + "]"
+
             if body:
                 try:
                     doc_id = insert_mail(body, message_id)
                 except Exception as e:
-                    cache.mark_ingest_failed(message_id, f"LightRAG body insert failed: {e}", drop_body=False)
-                    log(f"✗ {subj}: 正文入库失败")
+                    cache.mark_ingest_failed(message_id, f"LightRAG insert failed: {e}", drop_body=False)
+                    log(f"✗ {subj}: 入库失败")
                     return {"message_id": message_id, "status": "failed", "error": str(e)[:200]}
 
-            # 2) 附件
-            uploaded_paths = []
-            att_doc_ids = []
-            for att in mail.get("attachments", []):
-                apath = att.get("path", "")
-                att_fn = att.get("filename", "")
-                if apath and Path(apath).exists():
-                    cache.set_attachment_status(message_id, att_fn, "parsing")
-                    att_text, degrade = _parse_attachment(apath, att_fn)
-                    if att_text:
-                        if degrade:
-                            cache.set_attachment_status(
-                                message_id, att_fn, "degraded", degrade)
-                        else:
-                            cache.set_attachment_status(message_id, att_fn, "parsed")
-                        att_doc_id = f"{message_id}:{att_fn}"
-                        try:
-                            insert_mail(att_text, att_doc_id)
-                            att_doc_ids.append(att_doc_id)
-                            stats["attachments"] += 1
-                            uploaded_paths.append(apath)
-                        except Exception as e:
-                            stats["att_failed"] += 1
-                            cache.set_attachment_status(
-                                message_id, att_fn, "failed", str(e)[:100])
-                            logger.error("LightRAG attachment insert failed (%s): %s", att_doc_id, e)
-                    else:
-                        # 解析失败直接跳过，不计入失败
-                        cache.set_attachment_status(message_id, att_fn, "skipped", degrade or "解析失败")
-                        logger.debug("附件解析跳过 %s/%s: %s", message_id, att_fn, degrade or "解析失败")
-
-            # 3) 标记完成
             cache.mark_ingested(message_id, doc_id=doc_id if body else "",
-                                att_doc_ids=att_doc_ids, drop_body=True)
-            _cleanup_attachments(mail, only_paths=uploaded_paths)
-            log(f"✓ {subj}" + (f"（{stats['att_failed']} 附件失败）" if stats["att_failed"] else ""))
+                                drop_body=True)
+            log(f"✓ {subj}")
             try:
                 publish_event("mail_processed", {
                     "message_id": message_id,
                     "subject": mail.get("subject", ""),
                     "status": "done",
-                    "detail": "正文已入库",
+                    "detail": "已入库",
                 })
             except Exception:
                 pass
-            return stats
+            return {"message_id": message_id, "status": "ok"}
 
         except Exception as e:
             if message_id:
@@ -936,6 +968,9 @@ def _parse_attachment(filepath: str, filename: str,
             text = "\n".join(p.text for p in doc.paragraphs)[:10000]
             return text, degrade
         elif ext in (".xlsx", ".xls"):
+            if ext == ".xls":
+                # openpyxl 不支持旧 .xls，直接跳过
+                return "", "unsupported_format"
             import openpyxl
             wb = openpyxl.load_workbook(filepath, data_only=True)
             texts = []

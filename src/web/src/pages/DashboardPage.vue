@@ -45,15 +45,15 @@ onMounted(async () => {
 async function loadDashboard() {
   loading.value = true
   try {
-    const [stats, entRes] = await Promise.all([
+    const [stats, gStatus] = await Promise.all([
       mailsApi.stats(),
-      graphApi.entities(1, 500),
+      graphApi.status(),
     ])
     kpi.value = stats
-    const entities = entRes.entities || []
-    graphNodes.value = entities.length
-    projectCount.value = entities.filter((e: any) => etype(e) === 'project').length
-    contactCount.value = entities.filter((e: any) => PEOPLE_TYPES.includes(etype(e))).length
+    graphNodes.value = gStatus.graph.entities || 0
+    // 项目和联系人数量由 loadProjects 和实体统计补全
+    projectCount.value = 0
+    contactCount.value = 0
 
     await loadProjects(currentPage.value)
   } catch (e) {
@@ -68,15 +68,23 @@ async function loadProjects(page: number) {
     const res = await projectsApi.list(page, PAGE_SIZE)
     projects.value = res.projects
     totalProjects.value = res.total
+    projectCount.value = res.total  // 用 projects API 的 total，比从实体过滤准
     currentPage.value = res.page
   } catch (e) {
     console.error('Failed to load projects:', e)
   }
 }
 
+const pageLoading = ref(false)
+
 async function goToPage(page: number) {
   if (page < 1 || page > totalPages.value || page === currentPage.value) return
-  await loadProjects(page)
+  pageLoading.value = true
+  try {
+    await loadProjects(page)
+  } finally {
+    pageLoading.value = false
+  }
 }
 
 const filtered = computed(() => {
@@ -322,7 +330,10 @@ async function handleDelete(name: string) {
 
     <!-- Project grid + Pagination -->
     <template v-else>
-      <div class="project-grid">
+      <div class="project-grid" :class="{ 'grid-loading': pageLoading }">
+        <div v-if="pageLoading" class="grid-overlay">
+          <span class="ml-spinner"></span>
+        </div>
         <ProjectCard
           v-for="p in filtered"
           :key="p.name"
@@ -427,6 +438,34 @@ async function handleDelete(name: string) {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 0.85rem;
+  position: relative;
+}
+
+.grid-loading {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.grid-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+}
+
+.ml-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--border);
+  border-top-color: var(--p);
+  border-radius: 50%;
+  animation: ml-spin 0.7s linear infinite;
+}
+
+@keyframes ml-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* Pagination */

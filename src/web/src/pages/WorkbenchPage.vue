@@ -50,7 +50,7 @@ const processing = ref(false)
 const processLogs = ref<string[]>([])
 const loading = ref(false)
 
-const PAGE_SIZE = 200
+const PAGE_SIZE = 800
 const page = ref(1)
 
 // ── Debounced refresh ──
@@ -355,6 +355,7 @@ onUnmounted(() => {
           :selected-ids="selectedIds"
           :kpi="kpi"
           :processing="processing"
+          :loading="loading"
           @update:filter="(f: MailFilter) => { filter = f; page = 1; selectedIds = new Set(); refreshList() }"
           @toggle-select="toggleSelect"
           @toggle-all="toggleAll"

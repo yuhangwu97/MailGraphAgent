@@ -159,7 +159,7 @@ def get_projects_paginated(page: int = 1, page_size: int = 20) -> dict:
         "MATCH (n) WHERE n.entity_id IS NOT NULL AND n.entity_type = 'project' "
         "RETURN n.entity_id AS id, "
         "       coalesce(n.description, '') AS description "
-        "ORDER BY toLower(n.entity_id) "
+        "ORDER BY id(n) DESC "
         "SKIP $skip LIMIT $limit"
     )
 

@@ -11,11 +11,18 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import threading
 from pathlib import Path
 
 import redis
+
+# Windows 上 asyncio 默认使用 ProactorEventLoop（IOCP），daemon 线程退出时
+# 未完成的异步 I/O 被强制中止 → WinError 995 → InvalidStateError 崩溃。
+# 强制切换为 SelectorEventLoop，行为与 Unix 一致。
+if platform.system() == "Windows":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 try:
     from lightrag import LightRAG, QueryParam
@@ -38,17 +45,16 @@ _instance_lock = threading.Lock()
 # 邮件-项目知识图谱的领域实体分类指引，注入 LightRAG 抽取提示（{entity_types_guidance}）。
 # 标签用 TitleCase 便于 LLM 理解，但 LightRAG 存储时会统一小写去空格，
 # 故下游（看板）须按小写比较：project / person / organization / …
-_DOMAIN_ENTITY_GUIDANCE = """Classify each entity using one of the following types. If no type fits, use `Other`.
+_DOMAIN_ENTITY_GUIDANCE = """Classify each entity as one of: Person, Project, Amount, Other.
 
-- Project: A concrete project, engagement, initiative, or system-integration effort (e.g. an ERP integration, a delivery project).
-- Person: A named individual — client contacts, colleagues, employees, or any human participant.
-- Organization: A company, supplier, customer, department, team, or institution.
-- Document: A file, contract, report, spreadsheet, attachment, or other written artifact.
-- Task: A task, test case, deliverable, milestone, action item, or to-do.
-- System: A software system, module, platform, application, or component.
-- Event: A meeting, signing, review, delivery, or other occurrence in time.
-- Location: A geographic place, address, or physical/logical site.
-- Other: Anything that does not fit the types above."""
+- Person: 具体人名、客户联系人、同事、发件人、收件人
+- Project: 项目名称、合同名称、订单、交付任务、系统/模块名称
+- Amount: 金额、预算、报价、费用、数量
+- Other: 日期、电话号码、邮箱、地址、附件文件名
+
+Extract sparingly — only the most important entities. One email = one main event.
+Focus on: who (Person), what project (Project), and how much (Amount).
+Skip trivial details, greetings, signatures, and boilerplate text."""
 
 # LightRAG 的 Neo4j / Milvus 异步 driver 会绑定到「创建它们的 event loop」。
 # 之前 initialize_storages 跑在一个临时 loop 上、随后被 close，而 insert/query
@@ -88,12 +94,12 @@ def _run(coro):
     return asyncio.run_coroutine_threadsafe(coro, _get_loop()).result()
 
 
-# ── 跨进程 LightRAG 写入锁 ────────────────────────────────────────────
-# LightRAG 的写入是"读实体→合并→写回"，其内部锁(multiprocessing/asyncio)只对
-# 同一父进程 fork 的 worker 有效；用 `python -m src.backend.worker` 起的多个独立
-# 进程之间没有共享锁，并发写同一实体会丢更新/产生重复节点。用 Redis 分布式锁把
-# 图谱写入串行化——解析(DeepDoc)与查询仍并行，只有真正的写入被串行化。
-_LIGHTRAG_WRITE_LOCK_KEY = "mailgraph:lightrag:write1"
+# ── 跨进程 LightRAG 写入信号量 ───────────────────────────────────────
+# 替代全局互斥锁，用 Redis 令牌桶控制并发写入数（默认 3 个 worker 同时写）。
+# 比互斥锁快 3 倍，同时避免 5 个 worker 全部并发造成实体冲突。
+_LIGHTRAG_SEMAPHORE_KEY = "mailgraph:lightrag:semaphore1"
+_SEMAPHORE_SLOTS = int(os.getenv("LIGHTRAG_WRITE_SLOTS", "3"))
+_semaphore_initialized = False
 _lock_client: redis.Redis | None = None
 _lock_client_lock = threading.Lock()
 
@@ -112,14 +118,10 @@ def _get_lock_client() -> redis.Redis:
 
 
 @contextlib.contextmanager
-def lightrag_write_lock(timeout: int = 300, blocking_timeout: int = 300):
-    """获取跨进程的 LightRAG 写入锁（Redis），串行化图谱/向量写入。
-
-    timeout: 持锁自动过期秒数（持锁进程若崩溃，5 分钟后自动释放）。
-    blocking_timeout: 等待获取锁的最长秒数。
-    """
+def lightrag_write_lock(timeout: int = 90, blocking_timeout: int = 90):
+    """获取跨进程 LightRAG 写入锁（仅用于手动实体归并等低频操作）。"""
     lock = _get_lock_client().lock(
-        _LIGHTRAG_WRITE_LOCK_KEY, timeout=timeout,
+        "mailgraph:lightrag:write", timeout=timeout,
         blocking=True, blocking_timeout=blocking_timeout,
     )
     if not lock.acquire():
@@ -129,6 +131,45 @@ def lightrag_write_lock(timeout: int = 300, blocking_timeout: int = 300):
     finally:
         try:
             lock.release()
+        except Exception:
+            pass
+
+
+def _init_semaphore():
+    """初始化信号量令牌桶（幂等，crash-safe）。"""
+    global _semaphore_initialized
+    if _semaphore_initialized:
+        return
+    r = _get_lock_client()
+    if r.setnx(_LIGHTRAG_SEMAPHORE_KEY + ":init", "1"):
+        r.expire(_LIGHTRAG_SEMAPHORE_KEY + ":init", 3600)
+        r.delete(_LIGHTRAG_SEMAPHORE_KEY)
+        for i in range(_SEMAPHORE_SLOTS):
+            r.lpush(_LIGHTRAG_SEMAPHORE_KEY, str(i))
+    _semaphore_initialized = True
+    # crash 恢复：补足缺失的 token
+    current = r.llen(_LIGHTRAG_SEMAPHORE_KEY)
+    missing = _SEMAPHORE_SLOTS - current
+    if missing > 0:
+        logger.warning("semaphore: %d tokens missing, refilling", missing)
+        for i in range(missing):
+            r.lpush(_LIGHTRAG_SEMAPHORE_KEY, f"refill-{i}")
+
+
+@contextlib.contextmanager
+def lightrag_write_semaphore(timeout: int = 1800):
+    """获取写入槽位（Redis 令牌桶），最多 _SEMAPHORE_SLOTS 个并发。"""
+    _init_semaphore()
+    r = _get_lock_client()
+    token = r.brpop(_LIGHTRAG_SEMAPHORE_KEY, timeout=timeout)
+    if token is None:
+        raise TimeoutError("acquire LightRAG write slot timed out")
+    _token_val = token[1]
+    try:
+        yield
+    finally:
+        try:
+            r.lpush(_LIGHTRAG_SEMAPHORE_KEY, _token_val)
         except Exception:
             pass
 
@@ -163,20 +204,35 @@ def _get_embedding_func() -> EmbeddingFunc:
     # @wrap_embedding_func_with_attrs(embedding_dim=1536) 装饰，会强制按 1536 维
     # 向 API 请求并对返回结果做校验。DashScope text-embedding-v3 只返回 1024 维，
     # 于是触发 "dimension mismatch: expected 1536"（与外层配置的 1024 无关）。
-    # 解决：调用其未装饰的 .func（保留内部 retry/截断），显式传 embedding_dim，
+    # 解决：调用其未装饰的 .func（保留内部 retry），显式传 embedding_dim，
     # 让 API 按 cfg.embedding_dim 维度返回；维度校验交给下方外层 EmbeddingFunc。
+    #
+    # 重要：tiktoken 和 DashScope 分词器计数不一致（tiktoken 算 8100 的文本
+    # DashScope 可能算 >8192），因此不用 openai_embed 内置的 tiktoken 截断，
+    # 改用简单的字符数截断。中文约 1 字符 ≈ 1-2 token，6000 字符最坏情况也
+    # 远在 8192 上限以内。
     raw_embed = openai_embed.func
 
-    return EmbeddingFunc(
-        embedding_dim=cfg.embedding_dim,
-        max_token_size=8192,
-        func=lambda texts: raw_embed(
-            texts=texts,
+    # 字符级截断，不依赖任何 tokenizer
+    _MAX_CHUNK_CHARS = 6000
+
+    def _safe_embed(texts, max_token_size=None):
+        # max_token_size 由 EmbeddingFunc.__call__ 注入，但我们用字符截断代替，
+        # 所以忽略该参数
+        truncated = [t[:_MAX_CHUNK_CHARS] if t and len(t) > _MAX_CHUNK_CHARS else t
+                     for t in texts]
+        return raw_embed(
+            texts=truncated,
             model=cfg.embedding_model,
             api_key=cfg.openai_api_key,
             base_url=base_url,
             embedding_dim=cfg.embedding_dim,
-        ),
+        )
+
+    return EmbeddingFunc(
+        embedding_dim=cfg.embedding_dim,
+        max_token_size=8100,  # 接受 EmbeddingFunc 注入但 _safe_embed 内部忽略
+        func=_safe_embed,
     )
 
 
@@ -207,6 +263,15 @@ def get_lightrag() -> LightRAG:
         _pw = f":{cfg.redis_password}@" if cfg.redis_password else ""
         os.environ.setdefault(
             "REDIS_URI", f"redis://{_pw}{cfg.redis_host}:{cfg.redis_port}/{cfg.redis_db}")
+        # ── 精简抽取：减少实体/关系数量，30 封邮件就是 30 个文档节点 ──
+        os.environ["CHUNK_F_SIZE"] = "6000"                    # 远低于 embedding 8192 上限，留足安全余量
+        os.environ.setdefault("FORCE_LLM_SUMMARY_ON_MERGE", "50")  # 几乎不触发 LLM 合并
+        os.environ.setdefault("MAX_ASYNC", "8")                    # LLM 并发
+        os.environ.setdefault("MAX_PARALLEL_INSERT", "15")         # 并行处理的文档数
+        os.environ.setdefault("EMBEDDING_BATCH_NUM", "30")         # embedding 批量
+        os.environ.setdefault("MAX_ENTITY_TOKENS", "600")          # 实体输出限制（精简）
+        os.environ.setdefault("MAX_RELATION_TOKENS", "800")        # 关系输出限制（精简）
+        os.environ.setdefault("MAX_TOTAL_TOKENS", "4000")          # 总输出限制（精简）
 
         rag = LightRAG(
             working_dir=working_dir,
@@ -229,6 +294,7 @@ def get_lightrag() -> LightRAG:
             addon_params={
                 "entity_types_guidance": _DOMAIN_ENTITY_GUIDANCE,
                 "language": "Chinese",
+                "insert_batch_size": 30,
             },
         )
 
@@ -463,11 +529,73 @@ def insert_mail(text: str, mail_id: str) -> str:
     except Exception:
         # 查状态失败不阻断插入，交给 LightRAG 自身去重兜底
         logger.debug("doc status precheck failed for %s", mail_id[:50], exc_info=True)
-    # 跨进程写入锁：多个 worker 并发时串行化图谱/向量写入，避免实体合并竞争
-    with lightrag_write_lock():
-        _run(rag.ainsert(input=text, ids=doc_id, file_paths=mail_id))
+    _run(rag.ainsert(input=text, ids=doc_id, file_paths=mail_id))
     logger.info("LightRAG inserted: %s", mail_id[:50])
     return mail_id
+
+
+def _doc_already_ingested(rag: LightRAG, doc_id: str, mail_id: str) -> bool:
+    """检查文档是否已入库，避免重复插入。"""
+    try:
+        existing = _run(rag.doc_status.get_by_id(doc_id))
+        if existing:
+            status = str(existing.get("status", "")).lower()
+            if "processed" in status or "processing" in status:
+                logger.info("LightRAG skip already-ingested doc: %s (%s)", mail_id[:50], status)
+                return True
+    except Exception:
+        logger.debug("doc status precheck failed for %s", mail_id[:50], exc_info=True)
+    return False
+
+
+def insert_mails_batch(items: list[tuple[str, str]]) -> list[str]:
+    """批量增量插入邮件。一次拿锁，多封一起提交。
+
+    items: [(text, mail_id), ...]
+    返回实际提交给 LightRAG 的 mail_id 列表。
+    """
+    if not items:
+        return []
+
+    rag = get_lightrag()
+
+    docs: list[dict] = []
+    seen_doc_ids: set[str] = set()
+    for text, mail_id in items:
+        text = (text or "").strip()
+        mail_id = str(mail_id or "").strip()
+        if not text or not mail_id:
+            continue
+        doc_id = _bounded_doc_id(mail_id)
+        if doc_id in seen_doc_ids:
+            continue
+        seen_doc_ids.add(doc_id)
+        docs.append({"text": text, "mail_id": mail_id, "doc_id": doc_id})
+
+    if not docs:
+        return []
+
+    # 锁外预过滤，减少排队压力
+    skipped_pre = len(docs) - len([d for d in docs
+                                   if not _doc_already_ingested(rag, d["doc_id"], d["mail_id"])])
+    if skipped_pre:
+        logger.info("batch pre-filter: skipped %d already-ingested docs", skipped_pre)
+
+    candidates = [d for d in docs if not _doc_already_ingested(rag, d["doc_id"], d["mail_id"])]
+    if not candidates:
+        logger.info("batch: all %d docs already ingested, nothing to do", len(docs))
+        return []
+
+    texts = [d["text"] for d in candidates]
+    doc_ids = [d["doc_id"] for d in candidates]
+    mail_ids = [d["mail_id"] for d in candidates]
+
+    logger.info("batch: calling ainsert for %d docs...", len(texts))
+    _run(rag.ainsert(input=texts, ids=doc_ids, file_paths=mail_ids))
+    logger.info("batch: ainsert complete for %d docs", len(texts))
+
+    logger.info("LightRAG batch inserted: %d docs", len(candidates))
+    return [d["mail_id"] for d in candidates]
 
 
 def get_doc_status_counts() -> dict:

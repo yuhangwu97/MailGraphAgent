@@ -107,7 +107,6 @@ services:
     container_name: mailgraph-neo4j
     environment:
       - NEO4J_AUTH=neo4j/mailgraph2024
-      - NEO4J_PLUGINS=["apoc"]
     ports:
       - "7474:7474"
       - "7687:7687"

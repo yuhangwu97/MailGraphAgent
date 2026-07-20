@@ -12,16 +12,21 @@ const typeCounts = ref<Record<string, number>>({})
 const refreshing = ref(false)
 const building = ref(false)
 const buildLogs = ref<string[]>([])
+const totalEntities = ref(0)
+const totalRelations = ref(0)
 
 async function loadGraph() {
   refreshing.value = true
   try {
-    const [entRes, relRes] = await Promise.all([
-      graphApi.entities(1, 500),
-      graphApi.relationships(1, 1000),
+    const [entRes, relRes, gStatus] = await Promise.all([
+      graphApi.entities(1, 200),
+      graphApi.relationships(1, 500),
+      graphApi.status(),
     ])
     entities.value = entRes.entities || []
     relationships.value = relRes.relationships || []
+    totalEntities.value = gStatus.graph.entities || 0
+    totalRelations.value = gStatus.graph.relationships || 0
 
     const counts: Record<string, number> = {}
     for (const e of entities.value) {
@@ -62,12 +67,13 @@ onMounted(loadGraph)
     <div class="graph-toolbar">
       <div class="toolbar-left">
         <h2 class="toolbar-title">🕸️ 关系图谱</h2>
-        <span class="toolbar-sub">全局关系可视化 · 大屏模式</span>
+        <span class="toolbar-sub">全局关系可视化 · 画布采样 200 节点，上方为真实总数</span>
       </div>
       <div class="toolbar-center">
         <div class="stat-pills-inline">
           <span class="stat-pill-mini">节点 <b>{{ shownEntities.length }}</b></span>
-          <span class="stat-pill-mini">关系 <b>{{ shownRelationships.length }}</b></span>
+          <span class="stat-pill-mini">实体 <b>{{ totalEntities.toLocaleString() }}</b></span>
+          <span class="stat-pill-mini">关系 <b>{{ totalRelations.toLocaleString() }}</b></span>
         </div>
       </div>
       <div class="toolbar-right">
